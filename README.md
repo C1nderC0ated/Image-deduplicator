@@ -545,6 +545,30 @@ taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---
 
+## License
+
+[MIT](LICENSE). Use it, change it, ship it; just keep the copyright
+notice.
+
+One clause is worth reading rather than skimming, because this tool moves
+your files: the software is provided **as is, without warranty**. It is
+built to be careful — nothing is deleted without a list you edited
+yourself, and everything goes to the recycle bin or trash rather than
+being erased — but the guarantees end at the license text. Keep backups
+of anything you cannot replace.
+
+Third-party dependencies — Pillow and NumPy, plus optionally OpenCV,
+PyTorch, Hugging Face Transformers and pillow-heif — are installed from
+PyPI under their own licenses, and none of their code is bundled here.
+
+One nuance if you ever ship a *frozen bundle* rather than source: a few
+of those wheels embed binaries under copyleft terms
+(`opencv-python-headless` carries LGPL-2.1 FFmpeg, `pillow-heif` carries
+GPL-2.0 x265). That constrains a redistributed binary. It does not
+constrain this source release, which ships no one else's code.
+
+---
+
 *The pipeline never deletes on its own — the human holds the list, the
 script holds the trash, and the trash holds everything else. Built with
 Claude, 2026.*
