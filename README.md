@@ -73,15 +73,29 @@ Generated at run time, next to your images:
   Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively — never a
   permanent delete on any of them.
 - **Python 3.9+** (tested on 3.14). No admin rights, no installer.
-- Packages, by stage (`py -3` on Windows, `python3` elsewhere):
+- Packages, by stage:
 
-| Stage | Needs | Install |
-|-------|-------|---------|
-| Collect | Pillow | `py -3 -m pip install --user pillow` |
-| Collect (HEIC/HEIF phone photos) | pillow-heif *(optional)* | `py -3 -m pip install --user pillow-heif` |
-| Analyze | Pillow + numpy | `py -3 -m pip install --user numpy` |
-| Analyze (crop detection) | OpenCV *(recommended)* | `py -3 -m pip install --user opencv-python-headless` |
-| Embed | torch + transformers | see below |
+| Stage | Needs |
+|-------|-------|
+| Collect | Pillow |
+| Collect (HEIC/HEIF phone photos) | pillow-heif *(optional)* |
+| Analyze | Pillow + numpy |
+| Analyze (crop detection) | OpenCV *(recommended)* |
+| Embed | torch + transformers |
+
+  By hand on Windows that is
+  `py -3 -m pip install --user pillow numpy opencv-python-headless`, and
+  the same with `python3` on a Linux distro that permits it.
+
+  **Several no longer permit it, and Arch is one of them.** Arch, Debian
+  12+, Ubuntu 23.04+, Fedora 38+ and Homebrew all mark their Python as
+  *externally managed* ([PEP 668](https://peps.python.org/pep-0668/)), and
+  pip refuses to install into it at all. `--user` is refused too — that is
+  the part that catches people out — and so is `pip uninstall`. There, the
+  install **must** go into a virtual environment. `./imgdedup.sh setup`
+  detects this, offers to create one beside the toolkit, and installs into
+  it; every launcher then prefers that `.venv` over the system Python
+  automatically, so nothing else changes.
 
 **Easiest: let the toolkit install it.** Setup detects your GPU
 (NVIDIA / AMD / Intel), asks which PyTorch build you want, shows the exact
@@ -448,7 +462,7 @@ very machine.
   detects this, ignores the broken torchvision and carries on via Pillow —
   **nothing in this toolkit needs torchvision** — but clean it up:
   `pip uninstall torchvision`, or reinstall the matched pair with
-  `pip install --user --force-reinstall torch torchvision --index-url
+  `pip install --force-reinstall torch torchvision --index-url
   https://download.pytorch.org/whl/cu132`. Rule of thumb: torch and
   torchvision must be reinstalled together, always.
 - **Embedding runs on the CPU although I have an Nvidia GPU.** Almost
@@ -456,7 +470,7 @@ very machine.
   (`2.x.y+cpu`) — and no setting can route a `+cpu` build to a GPU. The
   doctor and the embedder both name the fix:
   `pip uninstall torch` then
-  `pip install --user torch --index-url https://download.pytorch.org/whl/cu132`.
+  `pip install torch --index-url https://download.pytorch.org/whl/cu132`.
   Only the **Embed** stage uses the GPU at all; Collect and Analyze on CPU
   is correct, not a bug.
 - **A tool picked a Python that "has" a package, yet imports fail — or the
@@ -470,13 +484,16 @@ very machine.
   clean folder. If the run lists stale `Recycle-Duplicates.*` / list files
   from an earlier pass, delete them; they no longer describe reality.
 - **`pip install torch` says "no matching distribution" on Python 3.14.**
-  You are on the `cu121` index; it has no 3.14 wheels. Use `cu128` (or
-  `/cpu`).
+  You are on the `cu121` index; it has no 3.14 wheels. Use `cu132` (or
+  `/cpu`). These suffixes move — `cu128` became `cu132` — so prefer the
+  setup helper, which reads the current list from the index instead of
+  trusting a number written here.
 - **Embed refuses to run: "built with a different model".** Deliberate —
   vectors from different models are not comparable. Re-run with the old
   `--model`, or move/delete the embeddings file to start fresh.
 - **The run says OpenCV is missing.** Crop detection degrades to what CLIP
-  alone can see. `pip install --user opencv-python-headless` fixes it.
+  alone can see. `pip install opencv-python-headless` fixes it (on a
+  distro-managed Python, `./imgdedup.sh setup` — see PEP 668 above).
 - **HEIC/HEIF files show as unreadable.** Install `pillow-heif`, then
   re-run Collect with `--resume` — only those files are re-read.
 - **Analyze is slow on a huge library.** It prints per-stage times, so you
@@ -540,7 +557,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.2f** (2026-08-07). Full history, including every bug and what it
+**v4.2.1** (2026-08-07). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

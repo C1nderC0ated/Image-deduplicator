@@ -82,10 +82,24 @@ def default_mirror_dir():
 
 MIRROR_DIR = default_mirror_dir()
 
+def _hint(pkg, exe=None):
+    """How to install PKG here. Routed through _setup (stdlib-only) because
+    '--user' is refused outright on a distro-managed Python - Arch, Debian
+    12+, Fedora 38+ - where a virtual environment is the way through."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from _setup import pip_hint
+        return pip_hint(pkg, exe)
+    except Exception:
+        return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
+
+
 try:
     from PIL import Image, ImageOps
 except ImportError:
-    print('Pillow missing:  python -m pip install --user pillow')
+    print('Pillow missing:  ' + _hint('pillow'))
     sys.exit(2)
 
 HEIF_OK = False
@@ -142,15 +156,15 @@ except ImportError as exc:
     import importlib.util
     if importlib.util.find_spec('transformers') is None:
         print('transformers is not installed for this Python:')
-        print('  "' + sys.executable + '" -m pip install --user transformers')
+        print('  ' + _hint('transformers'))
     else:
         print('transformers is installed but could not be loaded:')
         print('  ' + type(exc).__name__ + ': ' + str(exc)[:200])
         print('')
         print('If that mentions a DLL or an entry point, a compiled package no')
         print('longer matches the installed torch. Reinstall the pair together:')
-        print('  "' + sys.executable + '" -m pip install --user --force-reinstall '
-              'torch torchvision --index-url https://download.pytorch.org/whl/cu132')
+        print('  ' + _hint('--force-reinstall torch torchvision --index-url '
+                           'https://download.pytorch.org/whl/cu132'))
     sys.exit(2)
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
@@ -202,19 +216,18 @@ def torch_build():
 
 def _install_hint(vendors):
     """The right reinstall line for the hardware actually present."""
-    exe = sys.executable
     if 'NVIDIA' in vendors:
-        return ('    "%s" -m pip install --user torch '
-                '--index-url https://download.pytorch.org/whl/cu132' % exe)
+        return '    ' + _hint('torch --index-url '
+                              'https://download.pytorch.org/whl/cu132')
     if 'AMD' in vendors:
         if os.name == 'nt':
             return ('    AMD ships ROCm wheels for Windows on Python 3.12 only;'
                     ' run:  python _setup.py')
-        return ('    "%s" -m pip install --user torch '
-                '--index-url https://download.pytorch.org/whl/rocm7.2' % exe)
+        return '    ' + _hint('torch --index-url '
+                              'https://download.pytorch.org/whl/rocm7.2')
     if 'Intel' in vendors:
-        return ('    "%s" -m pip install --user torch '
-                '--index-url https://download.pytorch.org/whl/xpu' % exe)
+        return '    ' + _hint('torch --index-url '
+                              'https://download.pytorch.org/whl/xpu')
     return '    python _setup.py   (picks the right build for this machine)'
 
 
@@ -489,9 +502,9 @@ def main():
         print('         marginally slower preprocessing). To clean it up, either:')
         print('           "' + sys.executable + '" -m pip uninstall torchvision')
         print('         (this tool never needs it), or reinstall the matched pair:')
-        print('           "' + sys.executable + '" -m pip install --user '
-              '--force-reinstall torch torchvision \\')
-        print('              --index-url https://download.pytorch.org/whl/cu132')
+        print('           ' + _hint('--force-reinstall torch torchvision '
+                                    '--index-url '
+                                    'https://download.pytorch.org/whl/cu132'))
         print('')
 
     device = resolve_device(args.device)

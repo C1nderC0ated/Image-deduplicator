@@ -69,15 +69,33 @@ for _s in (sys.stdout,):
     except Exception:
         pass
 
+def _hint(pkg):
+    """How to install PKG on THIS machine.
+
+    Routed through _setup so there is one answer instead of five, and so it
+    can be wrong in only one place. Hard-coding '--user' is actively wrong
+    on a distro-managed Python (Arch, Debian 12+, Fedora 38+): pip refuses
+    it outright, and the way forward there is a virtual environment.
+    _setup is stdlib-only, so this works before numpy or Pillow exist."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from _setup import pip_hint
+        return pip_hint(pkg)
+    except Exception:
+        return '"%s" -m pip install --user %s' % (sys.executable, pkg)
+
+
 try:
     import numpy as np
 except ImportError:
-    print('numpy is required:  python -m pip install --user numpy')
+    print('numpy is required:  ' + _hint('numpy'))
     sys.exit(2)
 try:
     from PIL import Image
 except ImportError:
-    print('Pillow is required:  python -m pip install --user pillow')
+    print('Pillow is required:  ' + _hint('pillow'))
     sys.exit(2)
 
 _HAVE_CV2 = False
@@ -622,7 +640,11 @@ def compute_nccs(TH, pairs, workers):
         return {}
     try:
         import cv2
-    except ImportError:
+    except Exception:
+        # Exception, not ImportError, to match the module-level guard: a cv2
+        # that imports and THEN fails (numpy ABI mismatch, missing libGL)
+        # raises something else entirely, and crashing here would be worse
+        # than losing the crop tier.
         return {p: 0.0 for p in pairs}
 
     grays = {}
@@ -871,6 +893,143 @@ def _sweep_reference(C, cut):
     return ref
 
 
+def cv2_fallback_tests():
+    """Every OpenCV-free path, exercised on a machine that HAS OpenCV.
+
+    This suite exists because absdiff_mean once shipped with its fallback
+    calling itself - infinite recursion on every machine without OpenCV -
+    and nothing here noticed. The rest of the suite runs where cv2 IS
+    installed, so the fallback branch was simply never entered. A test that
+    cannot reach a supported configuration is not covering it.
+
+    Two switches are needed, and neither alone is enough:
+        _cv2 = None                module global; reaches absdiff_mean and
+                                   imdecode_rgb (and everything built on it)
+        sys.modules['cv2'] = None  makes a later `import cv2` raise
+                                   ImportError; reaches compute_nccs, which
+                                   imports cv2 locally and would otherwise
+                                   go on scoring happily while you believed
+                                   you had taken OpenCV away
+    """
+    global _cv2
+    print('OpenCV-free fallbacks')
+    if _cv2 is None:
+        print('  [SKIP] OpenCV is absent here - nothing to compare against')
+        return True
+
+    ok = True
+
+    def case(name, fn, extra=''):
+        """fn is a thunk, not a value, so a check that RAISES is reported as
+        a failure instead of killing the run. That matters here more than
+        elsewhere: the regression this suite was written for (absdiff_mean
+        recursing into itself) throws rather than returning a wrong number,
+        and a suite that dies on the first one hides every later check."""
+        nonlocal ok
+        try:
+            good, why = bool(fn()), extra
+        except Exception as exc:
+            good, why = False, '%s: %s' % (type(exc).__name__, exc)
+        print('  [%s] %s%s' % ('PASS' if good else 'FAIL', name,
+                               '' if good else '   (%s)' % why))
+        ok = ok and good
+
+    rng = np.random.default_rng(20260807)
+
+    def enc(a):
+        # PNG, not JPEG: lossless, so the two decoders must agree EXACTLY
+        # and any difference is a real defect rather than codec noise.
+        b = io.BytesIO()
+        Image.fromarray(a).save(b, 'PNG')
+        return b.getvalue()
+
+    base = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    shifted = np.roll(base, 1, axis=0)
+    recs = [{'tb': base64.b64encode(enc(rng.integers(
+                 0, 256, (32, 32, 3), dtype=np.uint8))).decode(),
+             'tw': 32, 'th': 32} for _ in range(6)]
+    sq = rng.integers(0, 256, (40, 40, 3), dtype=np.uint8)
+    TH_sq = [sq, np.ascontiguousarray(np.rot90(sq, 1))]
+
+    # reference values, taken WITH OpenCV
+    ref_ad = absdiff_mean(base, shifted)
+    ref_img = imdecode_rgb(enc(base))
+    ref_sig = decode_signatures(recs, 3)
+    ref_or = oriented_mad(TH_sq, 0, 1)
+
+    had = 'cv2' in sys.modules
+    saved_mod, saved_cv2 = sys.modules.get('cv2'), _cv2
+    try:
+        _cv2 = None
+        sys.modules['cv2'] = None
+
+        case('absdiff_mean falls back instead of recursing',
+             lambda: np.isfinite(absdiff_mean(base, shifted)))
+        case('absdiff_mean fallback agrees with cv2',
+             lambda: abs(absdiff_mean(base, shifted) - ref_ad) < 1e-3)
+        case('absdiff_mean scores identical inputs exactly 0',
+             lambda: absdiff_mean(base, base.copy()) == 0.0)
+        view = base.transpose(1, 0, 2)          # deliberately non-contiguous
+        case('absdiff_mean accepts a non-contiguous view',
+             lambda: np.isfinite(absdiff_mean(view, view.copy())))
+
+        case('imdecode_rgb fallback is byte-identical to cv2',
+             lambda: np.array_equal(imdecode_rgb(enc(base)), ref_img))
+        case('imdecode_rgb fallback keeps uint8 HxWx3',
+             lambda: imdecode_rgb(enc(base)).dtype == np.uint8
+             and imdecode_rgb(enc(base)).shape == base.shape)
+        red = np.zeros((8, 8, 3), np.uint8)
+        red[..., 0] = 255
+        # a BGR slip would pass every shape check and corrupt every signature
+        case('imdecode_rgb fallback returns RGB, not BGR',
+             lambda: tuple(int(v) for v in imdecode_rgb(enc(red))[0, 0])
+             == (255, 0, 0))
+
+        case('decode_signatures matches the cv2 result exactly',
+             lambda: np.array_equal(decode_signatures(recs, 3), ref_sig))
+
+        pre = ThumbStore(recs, budget=10 ** 9, workers=2)
+        lazy = ThumbStore(recs, cap=64, budget=1, workers=2)
+        case('ThumbStore preloads when the budget allows',
+             lambda: pre.preloaded)
+        case('ThumbStore goes lazy on a tight budget',
+             lambda: not lazy.preloaded)
+        case('both ThumbStore branches decode identically',
+             lambda: all(np.array_equal(pre[i], lazy[i])
+                         for i in range(len(recs))))
+
+        # a LABEL flip matters more than numeric drift: it renames the match
+        case('oriented_mad picks the same orientation without cv2',
+             lambda: oriented_mad(TH_sq, 0, 1)[1] == ref_or[1])
+        case('oriented_mad score agrees with cv2',
+             lambda: abs(oriented_mad(TH_sq, 0, 1)[0] - ref_or[0]) < 1e-3)
+
+        # the one that _cv2 = None alone would NOT have covered
+        pairs = [(0, 1), (0, 2)]
+        case('compute_nccs degrades to zeros rather than raising',
+             lambda: set(compute_nccs(pre, pairs, 2)) == set(pairs)
+             and all(v == 0.0 for v in compute_nccs(pre, pairs, 2).values()))
+        case('compute_nccs still short-circuits on an empty pair list',
+             lambda: compute_nccs(pre, [], 2) == {})
+    except Exception as exc:
+        # anything unguarded above (a constructor, say) still lands as a
+        # reported failure rather than a traceback that skips the restore
+        case('fallback suite ran to completion', lambda: False,
+             '%s: %s' % (type(exc).__name__, exc))
+    finally:
+        _cv2 = saved_cv2
+        if had:
+            sys.modules['cv2'] = saved_mod
+        else:
+            sys.modules.pop('cv2', None)
+
+    # If the restore leaked, every test after this one runs degraded and
+    # silently means something else.
+    case('OpenCV is restored afterwards',
+         lambda: _cv2 is not None and __import__('cv2') is not None)
+    return ok
+
+
 def self_test():
     ok = True
 
@@ -1018,6 +1177,11 @@ def self_test():
     print('  [%s] BLAS sweep == brute force on %d pairs (%d candidates)'
           % ('PASS' if sweep_ok else 'FAIL', 72 * 71 // 2, len(ref)))
     ok = ok and sweep_ok
+
+    print('')
+    # called first, then ANDed - the reverse would short-circuit the whole
+    # fallback suite away the moment anything above it failed
+    ok = cv2_fallback_tests() and ok
 
     print('Self-test: ' + ('ALL PASS' if ok else 'FAILURES'))
     return 0 if ok else 1
@@ -1686,7 +1850,7 @@ def main():
     try:
         import cv2  # noqa: F401
         _HAVE_CV2 = True
-    except ImportError:
+    except Exception:       # see compute_nccs: importable-but-broken counts
         _HAVE_CV2 = False
 
     if args.self_test:
@@ -1849,7 +2013,7 @@ def main():
     if not _HAVE_CV2:
         print('  NOTE: OpenCV is not installed, so crop detection is limited to what')
         print('        CLIP alone can see. For the full crop tier:')
-        print('          python -m pip install --user opencv-python-headless')
+        print('          ' + _hint('opencv-python-headless'))
 
     # score: exact pixel difference for every candidate pair (threaded), then
     # crop-containment only for the pairs whose tier B decision needs it.

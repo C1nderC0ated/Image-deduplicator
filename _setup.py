@@ -295,13 +295,112 @@ def missing_packages(st, want_embed=True):
     return need
 
 
+# -------------------------------------------------- externally managed --
+# PEP 668. A distro-managed Python carries a marker file, and pip REFUSES to
+# install into it:
+#     error: externally-managed-environment
+# The trap is that --user does NOT exempt you - pip rejects that too, which
+# is exactly how this script used to dead-end on Arch: it appended --user
+# because it saw no venv, pip refused, and setup printed "pip exited 1"
+# with no way forward. Arch, Debian 12+, Ubuntu 23.04+, Fedora 38+ and
+# Homebrew all ship the marker. A venv is exempt by design, so that is the
+# route offered first.
+
+def in_venv():
+    # Deliberately pip's own test (running_under_virtualenv), because pip is
+    # the thing that will accept or refuse. $VIRTUAL_ENV is NOT part of it
+    # and must not be added: an activated venv exports that variable, but the
+    # interpreter actually running can still be the system one, and then pip
+    # refuses while we would have believed ourselves exempt.
+    return sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+
+
+def em_marker():
+    """Path to the PEP 668 marker, or None if pip may install here."""
+    if in_venv():
+        return None
+    try:
+        import sysconfig
+        p = os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
+    except Exception:
+        return None
+    return p if os.path.isfile(p) else None
+
+
+def distro_advice():
+    """The distro's OWN words, read from the marker. PEP 668 defines it as an
+    INI file with an [externally-managed] section and an Error key, and that
+    is the text pip prints. Quoting it beats guessing: it is written by
+    whoever marked this interpreter, so it names the right package manager
+    even on a distro this script has never heard of."""
+    p = em_marker()
+    if not p:
+        return ''
+    try:
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read(p, encoding='utf-8')
+        return cp.get('externally-managed', 'Error', fallback='').strip()
+    except Exception:
+        return ''
+
+
+def distro_packages():
+    """(install command, {our name: distro name}) for the running distro, or
+    None if unrecognised. Only the three CPU packages are mapped: torch and
+    transformers are either absent from the official repos or far enough
+    behind PyPI that pointing someone at them would be unkind."""
+    try:
+        with open('/etc/os-release', encoding='utf-8', errors='replace') as f:
+            osr = dict(ln.rstrip('\n').split('=', 1) for ln in f if '=' in ln)
+    except OSError:
+        return None
+    ident = (osr.get('ID', '') + ' ' + osr.get('ID_LIKE', '')).lower().replace('"', '')
+    table = (
+        (('arch', 'manjaro', 'endeavouros'), 'sudo pacman -S',
+         {'pillow': 'python-pillow', 'numpy': 'python-numpy',
+          'opencv': 'python-opencv'}),
+        (('debian', 'ubuntu'), 'sudo apt install',
+         {'pillow': 'python3-pil', 'numpy': 'python3-numpy',
+          'opencv': 'python3-opencv'}),
+        (('fedora', 'rhel', 'centos'), 'sudo dnf install',
+         {'pillow': 'python3-pillow', 'numpy': 'python3-numpy',
+          'opencv': 'python3-opencv'}),
+        (('opensuse', 'suse'), 'sudo zypper install',
+         {'pillow': 'python3-Pillow', 'numpy': 'python3-numpy',
+          'opencv': 'python3-opencv'}),
+    )
+    for keys, cmd, names in table:
+        if any(k in ident for k in keys):
+            return cmd, names
+    return None
+
+
+def pip_hint(pkg, exe=None):
+    """The install line to PRINT for this interpreter. Kept here so the four
+    stage scripts do not each hard-code advice that is wrong on Arch."""
+    exe = exe or sys.executable
+    if em_marker():
+        return ('this Python is managed by your distribution, so pip will '
+                'refuse.\n       Run the setup helper instead:  '
+                './imgdedup.sh setup')
+    if in_venv():
+        return '"%s" -m pip install %s' % (exe, pkg)
+    return '"%s" -m pip install --user %s' % (exe, pkg)
+
+
 # ------------------------------------------------------------ installing --
-def pip_base(exe=None):
+def pip_base(exe=None, break_system=False):
     cmd = [exe or sys.executable, '-m', 'pip', 'install']
-    # --user is invalid inside a venv, and pip errors out rather than
-    # ignoring it. sys.prefix != sys.base_prefix is the venv signal.
-    if sys.prefix == sys.base_prefix and not os.environ.get('VIRTUAL_ENV'):
-        cmd.append('--user')
+    if in_venv():
+        return cmd                 # a venv owns itself; no flag wanted
+    if em_marker():
+        # Reaching here means the venv and distro routes were shown and the
+        # user chose this one deliberately - never add the flag silently.
+        if break_system:
+            cmd.append('--break-system-packages')
+        return cmd
+    cmd.append('--user')
     return cmd
 
 
@@ -324,6 +423,111 @@ def show_and_run(cmd, assume_yes, what):
         print('  OK.')
         return True
     print('  pip exited %d - nothing else was attempted.' % rc)
+    return False
+
+
+def venv_python(path):
+    """The interpreter inside a venv, on either platform's layout."""
+    for rel in (os.path.join('bin', 'python'),
+                os.path.join('Scripts', 'python.exe')):
+        p = os.path.join(path, rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def offer_managed_routes(need, args):
+    """Explain PEP 668 and let the user pick a way forward.
+
+    Returns True if the caller should go on to install with pip into THIS
+    interpreter (i.e. the user knowingly chose --break-system-packages), and
+    False when everything that is going to happen already has."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    venv_dir = os.path.join(here, '.venv')
+    dp = distro_packages()
+
+    print('')
+    print('  This Python is managed by your distribution (PEP 668):')
+    print('    ' + (em_marker() or ''))
+    print('  pip will refuse to install into it. Note that --user does NOT')
+    print('  exempt you - pip rejects that too, which catches most people out.')
+    print('  (pip blocks uninstall the same way, so removing a package that')
+    print('  came from your package manager also has to go through it.)')
+    advice = distro_advice()
+    if advice:
+        print('')
+        print('  Your distribution\'s own words:')
+        for ln in advice.splitlines():
+            if ln.strip():
+                print('    | ' + ln.rstrip())
+    print('')
+    print('  1) Make a virtual environment for this toolkit    [recommended]')
+    print('       "%s" -m venv "%s"' % (sys.executable, venv_dir))
+    print('     Self-contained, needs no root, touches nothing your package')
+    print('     manager owns, and imgdedup.sh prefers it automatically.')
+    routes = ['1']
+    if dp:
+        pm, names = dp
+        mapped = [names[p] for p in need if p in names]
+        if mapped:
+            routes.append('2')
+            print('')
+            print('  2) Install from your package manager instead')
+            print('       %s %s' % (pm, ' '.join(mapped)))
+            rest = [p for p in need if p not in names]
+            if rest:
+                print('     Does not cover %s - that still wants a venv.'
+                      % ', '.join(rest))
+    routes.append('3')
+    print('')
+    print('  3) Install into the system Python anyway')
+    print('       pip install --break-system-packages ...')
+    print('     The exact thing your distro is trying to prevent: pip and')
+    print('     your package manager can then disagree about the same files.')
+    print('')
+
+    if args.yes:
+        choice = '1'          # never pick 3 unattended - it can break a system
+        print('  --yes: taking the recommended route (1).')
+    else:
+        try:
+            choice = input('  Choose [%s, default 1]: '
+                           % '/'.join(routes)).strip() or '1'
+        except EOFError:
+            choice = '1'
+
+    if choice == '2' and '2' in routes:
+        print('')
+        print('  Nothing installed. Run the command above, then re-run setup.')
+        return False
+    if choice == '3':
+        print('')
+        print('  Proceeding with --break-system-packages, as chosen.')
+        return True
+    if choice != '1':
+        print('')
+        print('  Not a listed choice - nothing installed.')
+        return False
+
+    print('')
+    print('  Creating %s' % venv_dir)
+    if subprocess.call([sys.executable, '-m', 'venv', venv_dir]) != 0:
+        print('')
+        print('  venv creation failed. On Debian/Ubuntu this usually means')
+        print('  the python3-venv package is missing; add it and try again.')
+        return False
+    vpy = venv_python(venv_dir)
+    if not vpy:
+        print('  The venv was created but holds no interpreter - stopping.')
+        return False
+    print('  OK. Re-running setup inside it:')
+    print('    "%s" "%s"' % (vpy, os.path.abspath(__file__)))
+    subprocess.call([vpy, os.path.abspath(__file__)]
+                    + (['--yes'] if args.yes else [])
+                    + (['--offline'] if args.offline else []))
+    print('')
+    print('  From now on the toolkit uses that venv - imgdedup.sh looks for')
+    print('  .venv beside itself before falling back to the system Python.')
     return False
 
 
@@ -378,9 +582,20 @@ def main():
     if args.check:
         return 1
 
+    # PEP 668 distros refuse pip outright; ask before doing anything.
+    breaksys = False
+    if em_marker():
+        if not offer_managed_routes(need, args):
+            return 0
+        breaksys = True
+
     plain = [p for p in need if p != 'torch']
-    if plain:
-        show_and_run(pip_base() + plain, args.yes, ', '.join(plain))
+    # The return value used to be discarded, so a refused install still fell
+    # through to "return 0" below and the launcher reported success having
+    # installed nothing - which is how Arch failed silently.
+    if plain and not show_and_run(pip_base(break_system=breaksys) + plain,
+                                  args.yes, ', '.join(plain)):
+        return 1
 
     if 'torch' not in need:
         return 0
@@ -407,11 +622,13 @@ def main():
             print('  Not a listed choice - nothing installed.')
             return 1
     print('  -> %s' % pick.label)
-    if not show_and_run(pip_base() + pick.args, args.yes, 'torch (%s)' % pick.key):
+    if not show_and_run(pip_base(break_system=breaksys) + pick.args, args.yes,
+                        'torch (%s)' % pick.key):
         return 1
     if st.get('transformers', 'ERR') in ('ERR', 'EMPTY') \
             and 'transformers' not in plain:
-        show_and_run(pip_base() + ['transformers'], args.yes, 'transformers')
+        show_and_run(pip_base(break_system=breaksys) + ['transformers'],
+                     args.yes, 'transformers')
 
     after = installed_state()
     flav2, desc2 = torch_flavour(after)

@@ -70,11 +70,26 @@ if sys.version_info < (3, 9):
     print("This script needs Python 3.9 or newer.")
     sys.exit(2)
 
+def _hint(pkg):
+    """How to install PKG here. Routed through _setup (stdlib-only, so it
+    imports before Pillow exists) because '--user' is refused outright on a
+    distro-managed Python - Arch, Debian 12+, Fedora 38+ - where the answer
+    is a virtual environment instead."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from _setup import pip_hint
+        return pip_hint(pkg)
+    except Exception:
+        return '"%s" -m pip install --user %s' % (sys.executable, pkg)
+
+
 try:
     from PIL import Image, ImageOps
 except ImportError:
     print("Pillow is not installed for this Python interpreter.")
-    print("Fix:  python -m pip install --user pillow")
+    print("Fix:  " + _hint('pillow'))
     sys.exit(2)
 
 HEIF_OK = False
@@ -471,7 +486,7 @@ def main():
         if n_heif:
             print('NOTE: ' + str(n_heif) + ' HEIC/HEIF/AVIF files present but the codec')
             print('      is not installed; they will be listed as unreadable.')
-            print('      Fix:  python -m pip install --user pillow-heif')
+            print('      Fix:  ' + _hint('pillow-heif'))
     workers = args.workers if args.workers > 0 else default_workers()
     print('Reading files (hash + thumbnail, %d worker%s). Progress below;'
           % (workers, '' if workers == 1 else 's'))

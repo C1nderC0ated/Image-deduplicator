@@ -24,7 +24,10 @@
 #
 #  Interpreter order, most trusted first:
 #     1. $IMGDEDUP_PYTHON     explicit override, always wins
-#     2. python3 / python on PATH, newest usable first
+#     2. .venv beside this script - what setup creates on distros whose
+#        Python is externally managed (Arch, Debian 12+, Fedora 38+), where
+#        pip refuses to install into the system interpreter at all
+#     3. python3 / python on PATH, newest usable first
 #  Every candidate is probed FUNCTIONALLY (it must import and call into the
 #  package, not merely name it) - a package whose files were deleted but
 #  whose directory survived still imports as an empty namespace package,
@@ -80,6 +83,18 @@ if [ -n "${IMGDEDUP_PYTHON:-}" ]; then
         printf '[WARN] IMGDEDUP_PYTHON=%s cannot run this stage; trying others.\n' \
                "$IMGDEDUP_PYTHON" >&2
     fi
+fi
+# A .venv beside this script is how setup gets out of a PEP 668 distro,
+# where pip will not touch the system Python. Prefer it over anything on
+# PATH: it is the environment we populated on purpose.
+if [ -z "$PYCMD" ]; then
+    for v in "$HERE/.venv/bin/python" "$HERE/.venv/Scripts/python.exe"; do
+        [ -x "$v" ] || continue
+        if "$v" -c "$PROBE" >/dev/null 2>&1; then
+            PYCMD=$v
+            break
+        fi
+    done
 fi
 if [ -z "$PYCMD" ]; then
     for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 \

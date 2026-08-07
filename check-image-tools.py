@@ -32,6 +32,26 @@ for _s in (sys.stdout,):
 IS_WIN = os.name == 'nt'
 SHOW = ['PIL', 'numpy', 'torch', 'torchvision', 'transformers', 'pillow_heif']
 
+
+def _hint(pkg, exe=None):
+    """How to install PKG, phrased for the machine this is running on.
+
+    Routed through _setup so the advice lives in one place. Hard-coding
+    '--user' is wrong on a distro-managed Python (Arch, Debian 12+, Fedora
+    38+): pip refuses it, and the answer there is a virtual environment.
+    Caveat worth knowing: the check inspects THIS interpreter, while `exe`
+    may be a different one. On a machine where every system Python is
+    managed - the normal case - that lands right; running the doctor from
+    inside a venv about a system interpreter is the corner it can miss."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from _setup import pip_hint
+        return pip_hint(pkg, exe)
+    except Exception:
+        return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
+
 PROBE = r'''
 import json, sys
 o = {'v': '%d.%d.%d' % sys.version_info[:3], 'exe': sys.executable,
@@ -248,9 +268,9 @@ def main():
                 print('         here (the usual aftermath of a torch reinstall). Fix:')
                 print('           "%s" -m pip uninstall torchvision' % exe)
                 print('         (nothing in this toolkit needs it), or reinstall the pair:')
-                print('           "%s" -m pip install --user --force-reinstall '
-                      'torch torchvision --index-url '
-                      'https://download.pytorch.org/whl/cu132' % exe)
+                print('           ' + _hint(
+                    '--force-reinstall torch torchvision --index-url '
+                    'https://download.pytorch.org/whl/cu132', exe))
         print('')
 
     print('  ' + '=' * 64)
@@ -261,8 +281,7 @@ def main():
         print('       %s' % (best_collect[2].get('exe') or best_collect[0][0]))
     else:
         print('  collect-image-inventory.py  -> no interpreter has a working Pillow.')
-        print('       Fix:  %s -m pip install --user pillow'
-              % ('py -3' if IS_WIN else 'python3'))
+        print('       Fix:  ' + _hint('pillow'))
     print('')
     if best_embed:
         print('  embed-images.py             -> USE: %s' % best_embed[1])
@@ -318,13 +337,15 @@ def main():
             print('')
             print('     Install into: %s (Python %s)' % (pick[1], pick[2]['v']))
             print('       CPU only:')
-            print('         "%s" -m pip install --user torch '
-                  '--index-url https://download.pytorch.org/whl/cpu' % exe)
+            print('         ' + _hint('torch --index-url '
+                                      'https://download.pytorch.org/whl/cpu',
+                                      exe))
             print('       NVIDIA GPU (CUDA):')
-            print('         "%s" -m pip install --user torch '
-                  '--index-url https://download.pytorch.org/whl/cu132' % exe)
+            print('         ' + _hint('torch --index-url '
+                                      'https://download.pytorch.org/whl/cu132',
+                                      exe))
             print('       Then, either way:')
-            print('         "%s" -m pip install --user transformers' % exe)
+            print('         ' + _hint('transformers', exe))
             if pick[2]['v'].startswith('3.14'):
                 print('')
                 print('     NOTE: on Python 3.14 the cu121 index has NO wheels.')

@@ -3,7 +3,64 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2f — 2026-08-07 (current)
+## v4.2.1 — 2026-08-07 (current)
+
+**Installation was impossible on Arch, and the test suite could not see
+the configuration it was breaking.** Both found by a tester on a real
+machine rather than by anything here.
+
+- **`setup` now works on distro-managed Python.** Arch, Debian 12+,
+  Ubuntu 23.04+, Fedora 38+ and Homebrew mark their interpreter
+  *externally managed* ([PEP 668](https://peps.python.org/pep-0668/)) and
+  pip refuses to install into it. `pip_base()` was appending `--user` on
+  exactly that path, on the assumption that `--user` is exempt. It is not
+  — pip rejects it identically, and blocks `pip uninstall` too (verified
+  against pip 26.2.1's own source, not from memory). Setup dead-ended
+  with `pip exited 1` and no way forward.
+  It now detects the marker and offers three routes, defaulting to the
+  one that works: **a virtual environment beside the toolkit**, created
+  and populated for you. `--break-system-packages` is offered but never
+  taken silently — it is the thing the distro is actively preventing.
+  Rather than guess package names, it quotes the marker's own `Error`
+  text, so the advice is the distro's, and is right on distros this
+  script has never heard of.
+- **Every launcher now prefers that `.venv`.** Without this the fix would
+  install into an environment no stage ever used.
+- **`in_venv()` matches pip's own test.** The first version also accepted
+  `$VIRTUAL_ENV`, which an activated venv exports even while the
+  interpreter actually running is the system one — we would have believed
+  ourselves exempt exactly where pip refuses.
+- **A failed base install no longer reports success.** The return value of
+  the first `pip install` was discarded, so a refusal fell through to
+  `return 0` and the launcher printed "Setup finished" having installed
+  nothing. That is *how* Arch failed silently.
+- **The 17 printed `pip install --user ...` hints** across the four stage
+  scripts were all wrong on those distros. They now route through one
+  helper that knows the difference.
+- **A `cv2` that imports and then fails** (numpy ABI mismatch, missing
+  libGL) crashed `compute_nccs`, which caught only `ImportError` while
+  the module-level guard caught `Exception`. Widened to match.
+
+### Tests: the OpenCV-free path is now actually covered
+
+The `absdiff_mean` recursion below shipped because **every test here runs
+where OpenCV is installed**, so the fallback branch was unreachable — a
+suite cannot cover a configuration it never enters. There are now 16
+checks that take OpenCV away and compare against the real thing.
+
+Two switches are needed and neither alone is enough: `_cv2 = None` reaches
+`absdiff_mean` and `imdecode_rgb`, but `compute_nccs` imports `cv2`
+*locally* and keeps scoring happily — only `sys.modules['cv2'] = None`
+reaches it. A test setting just the first would have proved nothing about
+the crop tier.
+
+Validated by mutation, as everything else here is: reintroducing the
+recursion produces 6 failures, swapping the Pillow fallback to BGR
+produces 3, and making `compute_nccs` raise produces 1 — with no
+traceback in any case, because a check that raises is reported as a
+failure rather than killing the run and hiding every check after it.
+
+## v4.2f — 2026-08-07
 
 **Faster and lighter, with the precision-affecting parts left off by
 default.** Everything was measured before and after; nothing here is a
