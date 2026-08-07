@@ -87,10 +87,17 @@ fi
 # A .venv beside this script is how setup gets out of a PEP 668 distro,
 # where pip will not touch the system Python. Prefer it over anything on
 # PATH: it is the environment we populated on purpose.
+#
+# For `setup` alone the probe is tightened to require pip. setup's whole
+# job is installing, a venv without pip cannot install anything, and the
+# ordinary probe ('import sys') would happily accept one - trapping every
+# later run inside the very environment that needs repairing.
+VPROBE=$PROBE
+[ "$CMD" = setup ] && VPROBE='import sys, pip'
 if [ -z "$PYCMD" ]; then
     for v in "$HERE/.venv/bin/python" "$HERE/.venv/Scripts/python.exe"; do
         [ -x "$v" ] || continue
-        if "$v" -c "$PROBE" >/dev/null 2>&1; then
+        if "$v" -c "$VPROBE" >/dev/null 2>&1; then
             PYCMD=$v
             break
         fi

@@ -87,6 +87,20 @@ try:
 except Exception as e:
     o['embed_ok'] = False
     o['embed_err'] = type(e).__name__ + ': ' + str(e)[:110]
+# pip is packaged separately from Python on most Linux distros, so an
+# interpreter can be perfectly good and still have no way to install
+# anything. venv matters for the same reason: where pip is missing but
+# ensurepip is present, a virtual environment is the way to get one.
+try:
+    import pip
+    o['pip'] = str(getattr(pip, '__version__', '?'))
+except Exception:
+    o['pip'] = None
+try:
+    import venv, ensurepip           # noqa: F401
+    o['venv'] = True
+except Exception:
+    o['venv'] = False
 print('@@' + json.dumps(o))
 '''
 
@@ -223,6 +237,18 @@ def main():
         print('    Python %s  (%d-bit)%s'
               % (info['v'], info.get('bits', 0),
                  '  free-threaded' if info.get('ft') else ''))
+        # pip is packaged separately from Python on most Linux distros, so a
+        # perfectly healthy interpreter can still have no way to install
+        # anything - worth saying plainly rather than letting it surface
+        # later as "No module named pip".
+        if info.get('pip'):
+            print('      [ok   ] %-13s %s' % ('pip', info['pip']))
+        elif info.get('venv'):
+            print('      [MISS ] %-13s not installed - but venv is, so a '
+                  'virtual environment can supply one' % 'pip')
+        else:
+            print('      [MISS ] %-13s not installed, and venv is missing too'
+                  % 'pip')
         mods = info.get('mods', {})
         for name in SHOW:
             val = mods.get(name, 'ERR:not probed')

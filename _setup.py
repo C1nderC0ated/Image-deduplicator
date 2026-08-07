@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -345,17 +346,143 @@ def distro_advice():
         return ''
 
 
+def _distro_id():
+    """ID plus ID_LIKE from /etc/os-release, lowercased. Empty off Linux."""
+    try:
+        with open('/etc/os-release', encoding='utf-8', errors='replace') as f:
+            osr = dict(ln.rstrip('\n').split('=', 1) for ln in f if '=' in ln)
+    except OSError:
+        return ''
+    return (osr.get('ID', '') + ' ' + osr.get('ID_LIKE', '')).lower().replace('"', '')
+
+
+def module_ok(mod, exe=None):
+    """Can EXE import MOD? Asked by running it rather than by inspecting
+    paths - the same functional-probe habit as the rest of the toolkit,
+    for the same reason: a gutted package still imports as an empty
+    namespace package."""
+    exe = exe or sys.executable
+    try:
+        return subprocess.call(
+            [exe, '-c', 'import ' + mod],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    except Exception:
+        return False
+
+
+def pip_version(exe=None):
+    """pip's version, or None when this interpreter has none.
+
+    pip is NOT part of Python on most Linux distros. Arch splits it into
+    python-pip, Debian into python3-pip, and a venv built --without-pip has
+    none at all. Unchecked, the first install dies with "No module named
+    pip", which reads like a broken toolkit rather than a missing system
+    package - so ask first and name the package."""
+    exe = exe or sys.executable
+    try:
+        out = subprocess.check_output([exe, '-m', 'pip', '--version'],
+                                      stderr=subprocess.STDOUT, timeout=60)
+        txt = out.decode('utf-8', 'replace').strip()
+        bits = txt.split()
+        return bits[1] if len(bits) > 1 and bits[0] == 'pip' else (txt[:40] or '?')
+    except Exception:
+        return None
+
+
+def venv_usable(exe=None):
+    """Can this interpreter actually build a working venv? `venv` alone is
+    not enough - `ensurepip` is what puts pip INSIDE the new environment,
+    and Debian famously splits both out into python3-venv. When it is
+    present, a venv is a way to get pip on a machine that has none."""
+    return module_ok('venv', exe) and module_ok('ensurepip', exe)
+
+
+# Packages providing pip and the venv machinery. None means "already inside
+# the base python package here". Checked against each distro's own package
+# database rather than recalled, because three of the four are unobvious:
+#   Arch      venv AND ensurepip (with its bundled wheel) are in `python`,
+#             so `pacman -S python` alone can build a venv WITH pip in it.
+#   Debian    the classic trap, and narrower than usually told: the venv
+#             module itself is in the base python3; python3-venv adds only
+#             ensurepip plus the wheels. So `python3 -m venv` imports fine
+#             and then dies with "ensurepip is not available".
+#   Fedora    venv and ensurepip are in python3-libs, which hard-Requires
+#             the pip wheel package - so venv works standalone there too.
+#   openSUSE  has NO plain python3-pip. The packages are version-flavoured
+#             (python314-pip), hence the %(v)s below.
+BOOTSTRAP = (
+    (('arch', 'manjaro', 'endeavouros'), 'sudo pacman -S',
+     {'pip': 'python-pip', 'venv': None}),
+    (('debian', 'ubuntu'), 'sudo apt install',
+     {'pip': 'python3-pip', 'venv': 'python3-venv'}),
+    (('fedora', 'rhel', 'centos'), 'sudo dnf install',
+     {'pip': 'python3-pip', 'venv': None}),
+    (('opensuse', 'suse'), 'sudo zypper install',
+     {'pip': 'python%(v)s-pip', 'venv': None}),
+)
+
+
+def bootstrap_hint(what):
+    """The command that installs pip ('pip') or the venv machinery ('venv')
+    on this distro, or None when we cannot say."""
+    ident = _distro_id()
+    for keys, pm, names in BOOTSTRAP:
+        if any(k in ident for k in keys):
+            pkg = names.get(what)
+            if not pkg:
+                return None
+            if '%(v)s' in pkg:
+                pkg = pkg % {'v': '%d%d' % sys.version_info[:2]}
+            return '%s %s' % (pm, pkg)
+    return None
+
+
+def report_no_pip(can_venv):
+    """Explain a missing pip in terms of the thing the user has to install,
+    and say whether the venv route can still rescue the run."""
+    print('')
+    print('  pip is not available to this Python.')
+    print('    %s -m pip  ->  No module named pip' % sys.executable)
+    print('')
+    # Same symptom, different causes - say the one that actually applies
+    # rather than explaining Linux packaging to someone on Windows.
+    if in_venv():
+        print('  This is a virtual environment built without pip')
+        print('  (python -m venv --without-pip), so it never had one.')
+    elif _distro_id():
+        print('  That is normal on Linux: pip is packaged separately from')
+        print('  Python itself, so a base install genuinely has none.')
+    else:
+        print('  pip is normally bundled with Python here, so it was either')
+        print('  deselected during installation or removed afterwards.')
+        print('  Re-running the Python installer and ticking pip fixes it.')
+    cmd = bootstrap_hint('pip')
+    if cmd:
+        print('')
+        print('  On this distro:')
+        print('    %s' % cmd)
+    if can_venv:
+        print('')
+        print('  A virtual environment brings its own pip, so setup can')
+        print('  still continue without touching anything system-wide.')
+    else:
+        vcmd = bootstrap_hint('venv')
+        print('')
+        print('  The venv module is missing too, so there is no way around')
+        print('  it from here - install the package above first.')
+        if vcmd:
+            print('  This distro splits that out as well:')
+            print('    %s' % vcmd)
+
+
 def distro_packages():
     """(install command, {our name: distro name}) for the running distro, or
     None if unrecognised. Only the three CPU packages are mapped: torch and
     transformers are either absent from the official repos or far enough
     behind PyPI that pointing someone at them would be unkind."""
-    try:
-        with open('/etc/os-release', encoding='utf-8', errors='replace') as f:
-            osr = dict(ln.rstrip('\n').split('=', 1) for ln in f if '=' in ln)
-    except OSError:
+    ident = _distro_id()
+    if not ident:
         return None
-    ident = (osr.get('ID', '') + ' ' + osr.get('ID_LIKE', '')).lower().replace('"', '')
     table = (
         (('arch', 'manjaro', 'endeavouros'), 'sudo pacman -S',
          {'pillow': 'python-pillow', 'numpy': 'python-numpy',
@@ -461,11 +588,26 @@ def offer_managed_routes(need, args):
             if ln.strip():
                 print('    | ' + ln.rstrip())
     print('')
-    print('  1) Make a virtual environment for this toolkit    [recommended]')
-    print('       "%s" -m venv "%s"' % (sys.executable, venv_dir))
-    print('     Self-contained, needs no root, touches nothing your package')
-    print('     manager owns, and imgdedup.sh prefers it automatically.')
-    routes = ['1']
+    # Do not recommend a route this machine cannot take. Debian 12 with
+    # python3-pip installed but python3-venv missing is an entirely ordinary
+    # state, and it is exactly the machine PEP 668 forces down this path.
+    can_venv = venv_usable()
+    routes = []
+    if can_venv:
+        routes.append('1')
+        print('  1) Make a virtual environment for this toolkit  [recommended]')
+        print('       "%s" -m venv "%s"' % (sys.executable, venv_dir))
+        print('     Self-contained, needs no root, touches nothing your')
+        print('     package manager owns, and imgdedup.sh prefers it')
+        print('     automatically.')
+    else:
+        print('  1) Make a virtual environment           [NOT POSSIBLE YET]')
+        print('     This Python cannot build one: the venv/ensurepip modules')
+        print('     are missing, which is how Debian and Ubuntu package it.')
+        vcmd = bootstrap_hint('venv')
+        if vcmd:
+            print('     Install that first, then re-run setup:')
+            print('       %s' % vcmd)
     if dp:
         pm, names = dp
         mapped = [names[p] for p in need if p in names]
@@ -486,15 +628,22 @@ def offer_managed_routes(need, args):
     print('     your package manager can then disagree about the same files.')
     print('')
 
+    default = '1' if can_venv else ('2' if '2' in routes else '3')
     if args.yes:
-        choice = '1'          # never pick 3 unattended - it can break a system
-        print('  --yes: taking the recommended route (1).')
+        # never pick 3 unattended - it can break a package-managed system
+        choice = '1' if can_venv else '2'
+        print('  --yes: taking route %s.' % choice)
     else:
         try:
-            choice = input('  Choose [%s, default 1]: '
-                           % '/'.join(routes)).strip() or '1'
+            choice = input('  Choose [%s, default %s]: '
+                           % ('/'.join(routes), default)).strip() or default
         except EOFError:
-            choice = '1'
+            choice = default
+    if choice == '1' and not can_venv:
+        print('')
+        print('  That route is not available until the venv module is')
+        print('  installed - nothing was done.')
+        return False
 
     if choice == '2' and '2' in routes:
         print('')
@@ -509,17 +658,60 @@ def offer_managed_routes(need, args):
         print('  Not a listed choice - nothing installed.')
         return False
 
+    return create_venv_and_rerun(args)
+
+
+def create_venv_and_rerun(args):
+    """Build .venv beside the toolkit and re-run setup inside it. Always
+    returns False: whatever was going to be installed has been, by the
+    child process, and the caller must not carry on installing here."""
+    venv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '.venv')
+    existed = os.path.isdir(venv_dir)
+
+    def give_up(msg):
+        """Abandon a half-built venv, and take it with us.
+
+        A stub venv is worse than none at all: `python -m venv` writes the
+        interpreter and pyvenv.cfg BEFORE provisioning pip, so an aborted
+        run leaves something that looks like a working environment and has
+        no way to install anything. The launchers prefer a .venv beside
+        them over any Python on PATH, so leaving it would let one failed
+        setup capture every later run - including the setup meant to fix
+        it. Only ever remove what this call created."""
+        print('')
+        print('  ' + msg)
+        vcmd = bootstrap_hint('venv')
+        if vcmd:
+            print('  This distro packages that separately:')
+            print('    %s' % vcmd)
+        else:
+            print('  On Debian/Ubuntu this usually means python3-venv is')
+            print('  missing; add it and try again.')
+        if not existed and os.path.isdir(venv_dir):
+            try:
+                shutil.rmtree(venv_dir)
+                print('')
+                print('  Removed the half-built %s, so the launchers will'
+                      % venv_dir)
+                print('  not prefer it over a working Python.')
+            except OSError as exc:
+                print('')
+                print('  Could NOT remove %s (%s).' % (venv_dir, exc))
+                print('  Delete it by hand: while it exists the launchers')
+                print('  will keep choosing it.')
+        return False
+
     print('')
     print('  Creating %s' % venv_dir)
     if subprocess.call([sys.executable, '-m', 'venv', venv_dir]) != 0:
-        print('')
-        print('  venv creation failed. On Debian/Ubuntu this usually means')
-        print('  the python3-venv package is missing; add it and try again.')
-        return False
+        return give_up('venv creation failed.')
     vpy = venv_python(venv_dir)
     if not vpy:
-        print('  The venv was created but holds no interpreter - stopping.')
-        return False
+        return give_up('The venv was created but holds no interpreter.')
+    if pip_version(vpy) is None:
+        return give_up('The venv was created WITHOUT pip, so nothing can be '
+                       'installed into it (ensurepip was unavailable).')
     print('  OK. Re-running setup inside it:')
     print('    "%s" "%s"' % (vpy, os.path.abspath(__file__)))
     subprocess.call([vpy, os.path.abspath(__file__)]
@@ -544,6 +736,11 @@ def main():
     print('  ' + '-' * 62)
     print('  Python %d.%d.%d  (%s)'
           % (sys.version_info[:3] + (sys.executable,)))
+    # pip ships separately from Python on most distros, so establish that it
+    # exists before anything tries to run it.
+    pipv, can_venv = pip_version(), venv_usable()
+    print('  pip %-12s venv %s' % (pipv or 'MISSING',
+                                   'ok' if can_venv else 'MISSING'))
 
     gpus = detect_gpus()
     vendors = set(v for v, _ in gpus)
@@ -581,6 +778,27 @@ def main():
     print('  Missing: ' + ', '.join(need))
     if args.check:
         return 1
+
+    # No pip at all is a different failure from pip refusing: name the
+    # missing package rather than letting "No module named pip" surface.
+    if pipv is None:
+        report_no_pip(can_venv)
+        if not can_venv:
+            return 1
+        if args.yes:
+            ans = 'y'
+        else:
+            print('')
+            try:
+                ans = input('  Create the virtual environment now? [Y/n]: '
+                            ).strip().lower() or 'y'
+            except EOFError:
+                ans = 'y'
+        if ans not in ('y', 'yes'):
+            print('  Nothing installed.')
+            return 1
+        create_venv_and_rerun(args)
+        return 0
 
     # PEP 668 distros refuse pip outright; ask before doing anything.
     breaksys = False

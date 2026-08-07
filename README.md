@@ -97,6 +97,17 @@ Generated at run time, next to your images:
   it; every launcher then prefers that `.venv` over the system Python
   automatically, so nothing else changes.
 
+  **`pip` may not be there at all**, which is a different problem with a
+  different fix. It is packaged separately from Python on most distros —
+  `python-pip` on Arch, `python3-pip` on Debian/Ubuntu, `python314-pip`
+  and friends on openSUSE — so a base install has none, and every pip
+  command simply reports `No module named pip`. Setup and
+  `./imgdedup.sh doctor` both check and name the package. Where pip is
+  missing but `venv` works, a virtual environment supplies its own, so the
+  venv route fixes both problems at once. Debian and Ubuntu are the
+  exception worth knowing: they split `ensurepip` into `python3-venv`, so
+  `python3 -m venv` imports and *then* fails until that package is added.
+
 **Easiest: let the toolkit install it.** Setup detects your GPU
 (NVIDIA / AMD / Intel), asks which PyTorch build you want, shows the exact
 pip command and waits for a yes — it never installs anything silently:
@@ -557,7 +568,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.2.1** (2026-08-07). Full history, including every bug and what it
+**v4.2.2** (2026-08-08). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

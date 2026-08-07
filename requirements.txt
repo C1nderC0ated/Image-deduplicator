@@ -5,6 +5,25 @@
 #     Windows        Check-Image-Tools.bat   (offers setup when something is missing)
 #     Linux / macOS  ./imgdedup.sh setup
 #
+# PREREQUISITES - these are not in the list below, because they are what
+# RUNS the list below. Neither is guaranteed to come with Python:
+#
+#   pip    Packaged separately on most Linux distros. Without it every
+#          command here fails with "No module named pip", which looks like
+#          a broken toolkit rather than a missing system package.
+#            Arch            sudo pacman -S python-pip
+#            Debian/Ubuntu   sudo apt install python3-pip
+#            Fedora          sudo dnf install python3-pip
+#
+#   venv   Required, not optional, on Arch, Debian 12+, Ubuntu 23.04+,
+#          Fedora 38+ and Homebrew: those mark their Python externally
+#          managed (PEP 668) and pip refuses to install into it at all, so
+#          a virtual environment is the only route. Debian splits it out:
+#            sudo apt install python3-venv
+#          Where pip is missing but venv works, a venv supplies its own pip.
+#
+#   Check both, per interpreter:   ./imgdedup.sh doctor
+#
 # Minimal (Collect only):
 pillow>=10.0.0
 

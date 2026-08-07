@@ -3,7 +3,55 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.1 — 2026-08-07 (current)
+## v4.2.2 — 2026-08-08 (current)
+
+**pip itself is now checked before anything tries to use it.** It is not
+part of Python on most Linux distros — Arch splits it into `python-pip`,
+Debian into `python3-pip` — so a base install genuinely has none, and
+every command the toolkit printed would have died with `No module named
+pip`, which reads like a broken toolkit rather than a missing system
+package.
+
+- **Setup reports pip and venv** beside the Python version, and stops with
+  the distro's package name rather than letting the failure surface later.
+  Where pip is missing but `venv` works, it offers the venv route instead:
+  `ensurepip` carries a bundled pip wheel, so a fresh environment gets its
+  own pip even where the system has none. That is exactly why Arch works.
+- **The doctor reports pip per interpreter**, in the same `[ok]` / `[MISS]`
+  style as everything else. An interpreter can be perfectly healthy and
+  still have no way to install anything.
+- **`requirements.txt` names both as prerequisites**, since they are what
+  *runs* the rest of the file rather than anything in it.
+
+Three defects found while verifying, each worth more than the feature:
+
+- **A half-built venv is now removed.** `python -m venv` writes the
+  interpreter and `pyvenv.cfg` *before* provisioning pip, so an abort left
+  something that looked like a working environment and could install
+  nothing. The launchers prefer a `.venv` beside them over any Python on
+  PATH — so one failed setup would have captured every later run,
+  including the setup meant to repair it. Only ever removes what that call
+  created; a pre-existing `.venv` is never touched, and there is a test
+  for both. `setup`'s launcher probe now requires `pip` as well, so a
+  hand-made pip-less venv cannot trap it either.
+- **The venv route is no longer recommended where it cannot be taken.**
+  Debian 12 with `python3-pip` present but `python3-venv` absent is an
+  ordinary state, and precisely the machine PEP 668 forces down that path.
+  Setup recommended — and under `--yes` auto-selected — a route the
+  machine could not follow. Note the split is narrower than usually told:
+  the `venv` module is in the base `python3`; `python3-venv` adds only
+  `ensurepip` and the wheels, so `python3 -m venv` imports fine and *then*
+  fails.
+- **openSUSE has no `python3-pip`.** The packages are version-flavoured
+  (`python314-pip`). Every distro name here was checked against that
+  distro's own package database rather than recalled, which is how this
+  one was caught.
+
+Also: the missing-pip explanation no longer tells a Windows user that
+their situation is "normal on Linux" — same symptom, three different
+causes, and it now names the one that applies.
+
+## v4.2.1 — 2026-08-07
 
 **Installation was impossible on Arch, and the test suite could not see
 the configuration it was breaking.** Both found by a tester on a real
