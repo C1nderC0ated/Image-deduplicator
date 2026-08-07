@@ -33,24 +33,37 @@ IS_WIN = os.name == 'nt'
 SHOW = ['PIL', 'numpy', 'torch', 'torchvision', 'transformers', 'pillow_heif']
 
 
-def _hint(pkg, exe=None):
-    """How to install PKG, phrased for the machine this is running on.
+def _hint(pkg, exe=None, info=None):
+    """How to install PKG into EXE, phrased for that interpreter.
 
     Routed through _setup so the advice lives in one place. Hard-coding
     '--user' is wrong on a distro-managed Python (Arch, Debian 12+, Fedora
     38+): pip refuses it, and the answer there is a virtual environment.
-    Caveat worth knowing: the check inspects THIS interpreter, while `exe`
-    may be a different one. On a machine where every system Python is
-    managed - the normal case - that lands right; running the doctor from
-    inside a venv about a system interpreter is the corner it can miss."""
+
+    `info` is the probe result for `exe`, and it carries that interpreter's
+    own answers to "am I in a venv" and "am I externally managed". Passing
+    them is what keeps the advice honest: this used to be inferred from the
+    interpreter *running the doctor*, which since the launchers began
+    preferring a .venv is almost never the one being advised about. On Arch
+    that printed a plain `pip install` for the system Python - a command it
+    refuses outright with error: externally-managed-environment."""
     try:
         d = os.path.dirname(os.path.abspath(__file__))
         if d not in sys.path:
             sys.path.insert(0, d)
         from _setup import pip_hint
-        return pip_hint(pkg, exe)
+        info = info or {}
+        return pip_hint(pkg, exe, is_venv=info.get('in_venv'),
+                        is_managed=info.get('managed'))
     except Exception:
         return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
+
+
+def _installable(info):
+    """Can pip install into the interpreter this probe result describes?
+    A venv always owns itself; otherwise a PEP 668 marker means no."""
+    return bool(info.get('in_venv')) or not info.get('managed')
+
 
 PROBE = r'''
 import json, sys
@@ -101,6 +114,21 @@ try:
     o['venv'] = True
 except Exception:
     o['venv'] = False
+# The two facts that decide whether pip may install here, asked of THIS
+# interpreter rather than of whichever one is running the doctor. The two
+# are routinely different - the launcher prefers a .venv while the advice
+# is about a system Python - and reading them off the wrong side is how a
+# command pip refuses gets printed as the fix.
+# Read them together, never 'managed' alone: inside a venv sysconfig still
+# points at the base stdlib, so a venv on Arch reports managed=True while
+# pip installs into it happily. in_venv wins; see _installable in this file.
+o['in_venv'] = sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+try:
+    import os as _os, sysconfig as _sc
+    o['managed'] = _os.path.isfile(
+        _os.path.join(_sc.get_path('stdlib'), 'EXTERNALLY-MANAGED'))
+except Exception:
+    o['managed'] = False
 print('@@' + json.dumps(o))
 '''
 
@@ -149,6 +177,24 @@ def candidates():
             seen.add(key)
             found.append((cmd, label))
 
+    # In launcher order, because the verdict is first-match-wins and its whole
+    # job is to predict what the launchers will actually pick:
+    #   IMGDEDUP_PYTHON  ->  .venv beside the toolkit  ->  PATH
+    # The .venv was previously invisible here. It is not on PATH and the
+    # launchers exec it directly rather than activating it, so $VIRTUAL_ENV -
+    # the only venv this ever looked at - is unset. On any PEP 668 distro that
+    # is exactly where setup puts every package, so the doctor would report
+    # "nothing can load torch + transformers" about a machine whose very next
+    # `./imgdedup.sh embed` runs fine.
+    override = os.environ.get('IMGDEDUP_PYTHON')
+    if override:
+        add([override], 'IMGDEDUP_PYTHON')
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in (os.path.join('.venv', 'bin', 'python'),
+                os.path.join('.venv', 'Scripts', 'python.exe')):
+        p = os.path.join(here, rel)
+        if os.path.exists(p):
+            add([p], 'toolkit .venv (what the launchers use)')
     if not IS_WIN:
         # No `py` launcher off Windows. Interpreters live on PATH under
         # versioned names, and pyenv / deadsnakes / Homebrew installs are
@@ -296,7 +342,7 @@ def main():
                 print('         (nothing in this toolkit needs it), or reinstall the pair:')
                 print('           ' + _hint(
                     '--force-reinstall torch torchvision --index-url '
-                    'https://download.pytorch.org/whl/cu132', exe))
+                    'https://download.pytorch.org/whl/cu132', exe, info))
         print('')
 
     print('  ' + '=' * 64)
@@ -362,17 +408,23 @@ def main():
             exe = pick[2].get('exe') or pick[0][0]
             print('')
             print('     Install into: %s (Python %s)' % (pick[1], pick[2]['v']))
-            print('       CPU only:')
-            print('         ' + _hint('torch --index-url '
-                                      'https://download.pytorch.org/whl/cpu',
-                                      exe))
-            print('       NVIDIA GPU (CUDA):')
-            print('         ' + _hint('torch --index-url '
-                                      'https://download.pytorch.org/whl/cu132',
-                                      exe))
-            print('       Then, either way:')
-            print('         ' + _hint('transformers', exe))
-            if pick[2]['v'].startswith('3.14'):
+            if not _installable(pick[2]):
+                # No pip command can succeed against this interpreter, so the
+                # per-GPU menu below would be three identical copies of the
+                # same refusal under headings that promise commands.
+                print('       ' + _hint('torch', exe, pick[2]))
+            else:
+                print('       CPU only:')
+                print('         ' + _hint('torch --index-url '
+                                          'https://download.pytorch.org/whl/cpu',
+                                          exe, pick[2]))
+                print('       NVIDIA GPU (CUDA):')
+                print('         ' + _hint('torch --index-url '
+                                          'https://download.pytorch.org/whl/cu132',
+                                          exe, pick[2]))
+                print('       Then, either way:')
+                print('         ' + _hint('transformers', exe, pick[2]))
+            if _installable(pick[2]) and pick[2]['v'].startswith('3.14'):
                 print('')
                 print('     NOTE: on Python 3.14 the cu121 index has NO wheels.')
                 print('           Use cu132 above, not cu121.')
