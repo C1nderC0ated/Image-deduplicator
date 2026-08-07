@@ -29,6 +29,15 @@ embeddings, 15/20 without, zero false positives):
   ~1e-6, and they move in the *more accurate* direction — absdiff's mean
   accumulates in float64 where the old path accumulated in float32. No tier
   verdict changed in measurement.
+  **Fixed same day, after release:** this edit also replaced the
+  OpenCV-free fallback with a call to the function itself, so Analyze died
+  with `RecursionError` on any machine without OpenCV — a configuration
+  `requirements.txt` explicitly calls optional. Nothing caught it because
+  the self-test runs where OpenCV is installed, so the fallback branch was
+  never entered. The numpy path is restored and now checked against
+  `cv2.absdiff` on identical, random, off-by-one and full-range inputs
+  (agreement to 1e-4); an AST sweep of every module confirmed no other
+  function was left calling itself the same way.
 - Luma comparison folded into one matmul and one mean (it was three
   multiply-adds per channel and two means).
 

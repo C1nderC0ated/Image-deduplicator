@@ -103,7 +103,7 @@ def absdiff_mean(A, B):
     verdict changes either way."""
     if _cv2 is not None:
         return float(_cv2.absdiff(A, B).mean())
-    return absdiff_mean(A, B)
+    return float(np.abs(A.astype(np.float32) - B.astype(np.float32)).mean())
 
 
 def imdecode_rgb(raw):
