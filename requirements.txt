@@ -1,0 +1,48 @@
+# Image Inventorization - package requirements, by stage.
+#
+# EASIEST: don't use this file. Run the setup helper - it detects your GPU,
+# picks the right PyTorch build, shows every command and asks before running:
+#     Windows        Check-Image-Tools.bat   (offers setup when something is missing)
+#     Linux / macOS  ./imgdedup.sh setup
+#
+# Minimal (Collect only):
+pillow>=10.0.0
+
+# Analyze stage:
+numpy>=1.24.0
+# Crop-containment detection in Analyze (the "ncc" tier). Recommended:
+opencv-python-headless>=4.8.0
+
+# Optional - HEIC/HEIF phone photos in Collect (AVIF works natively on Pillow 12+):
+# pillow-heif>=1.0.0
+
+# Semantic stage (Embed) - transformers from PyPI, torch installed SEPARATELY
+# because the right build depends on your hardware. Pick ONE:
+#
+#   CPU only (always works):
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   NVIDIA GPU (CUDA):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu132
+#   AMD GPU on LINUX (ROCm):
+#     pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+#   Intel GPU (XPU):
+#     pip install torch --index-url https://download.pytorch.org/whl/xpu
+#
+#   These version suffixes MOVE - cu128 became cu132, rocm6.4 became rocm7.2.
+#   The setup helper reads the current list from download.pytorch.org instead
+#   of trusting a number written here, so prefer it over copying these lines.
+#
+#   AMD GPU on WINDOWS: not from PyPI. AMD publishes ROCm wheels directly at
+#   repo.radeon.com, and ONLY for Python 3.12 (they are full-ABI cp312 wheels,
+#   so 3.13/3.14 cannot load them - this is AMD's build matrix, not a setting).
+#   Install Python 3.12 alongside, run setup with it, and point just the Embed
+#   stage at it via IMGDEDUP_PYTHON. See README, "AMD GPUs".
+#
+#   torchvision is NOT needed by anything here, and a stale one breaks
+#   transformers - do not install it "just in case".
+#
+#   Installed the CPU build by mistake (version shows "+cpu")? Uninstall first:
+#     pip uninstall torch
+#   then install from the right index - a +cpu wheel can never use a GPU.
+#
+transformers>=4.43.0

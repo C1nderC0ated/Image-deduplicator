@@ -1,0 +1,27 @@
+# Line endings are load-bearing in this repo, so they are pinned rather than
+# left to each clone's core.autocrlf.
+#
+# A shell script checked out with CRLF fails on Linux with
+#   bad interpreter: /bin/sh^M
+# which would break the POSIX launcher for anyone cloning on Windows and
+# running on Linux (or through WSL). Python is pinned to LF for the same
+# reason - a CRLF shebang line breaks `./collect-image-inventory.py`.
+#
+# The .bat files are the opposite case: cmd.exe is happiest with CRLF, and
+# the launchers are shipped ASCII+CRLF deliberately.
+
+*           text=auto eol=lf
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+.gitignore  text eol=lf
+
+*.bat       text eol=crlf
+
+# Never normalise binary-ish things if any are added later.
+*.png       binary
+*.jpg       binary
+*.webp      binary
+*.jsonl     binary

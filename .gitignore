@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Everything the pipeline GENERATES next to your images. These normally land
+# in the scanned folder, not here - but they do end up in this directory if
+# you ever point the tools at the toolkit folder itself, and none of it
+# belongs in version control: inventories embed absolute paths and base64
+# thumbnails of your pictures, and the recycler embeds a deletion manifest.
+image-inventory*.jsonl
+image-embeddings*.jsonl
+*-report.html
+*-list.txt
+Recycle-Duplicates*.py
+Recycle-Duplicates*.bat
+Recycle-Duplicates*.sh
+
+# Local interpreter pins / virtualenvs
+.venv/
+venv/
+
+# Editors and OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
