@@ -53,8 +53,8 @@ def _hint(pkg, exe=None, info=None):
             sys.path.insert(0, d)
         from _setup import pip_hint
         info = info or {}
-        return pip_hint(pkg, exe, in_venv=info.get('in_venv'),
-                        managed=info.get('managed'))
+        return pip_hint(pkg, exe, is_venv=info.get('in_venv'),
+                        is_managed=info.get('managed'))
     except Exception:
         return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
 

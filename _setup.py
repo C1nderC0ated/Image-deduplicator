@@ -503,24 +503,26 @@ def distro_packages():
     return None
 
 
-def pip_hint(pkg, exe=None, in_venv=None, managed=None):
+def pip_hint(pkg, exe=None, is_venv=None, is_managed=None):
     """The install line to PRINT for EXE. Kept here so the four stage scripts
     do not each hard-code advice that is wrong on Arch.
 
-    A caller that is advising about a DIFFERENT interpreter than the one
-    running must pass that interpreter's own `in_venv` / `managed` answers -
-    the doctor gets them from its per-interpreter probe. Without them this
-    falls back to introspecting the running process, which is right for the
-    stage scripts (they only ever advise about themselves) and wrong for the
-    doctor, whose launcher hands it a .venv while the advice is about a
-    system Python. That mismatch printed a bare `pip install` on Arch, which
-    pip refuses with error: externally-managed-environment."""
+    A caller advising about a DIFFERENT interpreter than the one running must
+    pass that interpreter's own answers - the doctor reads them off its
+    per-interpreter probe. Omit both and this introspects the running process
+    instead, which is right for the stage scripts (they only ever advise about
+    themselves) and wrong for the doctor, whose launcher hands it a .venv while
+    the advice is about a system Python. That mismatch printed a bare
+    `pip install` on Arch, which pip refuses: externally-managed-environment.
+
+    Named is_venv/is_managed rather than in_venv/managed so the parameters do
+    not shadow the module functions of those names, which the fallback calls."""
     exe = exe or sys.executable
-    if in_venv is None and managed is None:
-        in_venv, managed = globals()['in_venv'](), bool(em_marker())
-    if in_venv:
+    if is_venv is None and is_managed is None:
+        is_venv, is_managed = in_venv(), bool(em_marker())
+    if is_venv:
         return '"%s" -m pip install %s' % (exe, pkg)      # a venv owns itself
-    if managed:
+    if is_managed:
         return ('this Python is managed by your distribution, so pip will '
                 'refuse.\n       Run the setup helper instead:  '
                 './imgdedup.sh setup')
