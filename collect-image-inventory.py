@@ -47,6 +47,7 @@ import glob
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -130,8 +131,35 @@ warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 # not the size at which Pillow gets suspicious.
 HUGE_PX = 80_000_000
 
-EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tif', '.tiff',
-        '.heic', '.heif', '.avif'}
+# Every one of these is decoded by Pillow itself - no extra dependency, and
+# nothing here can turn into "unreadable" noise just for being listed.
+# Chosen from Image.EXTENSION rather than from memory.
+EXTS = {
+    # the common photo and web formats
+    '.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.apng', '.webp', '.gif',
+    '.bmp', '.dib', '.tif', '.tiff',
+    # phone and modern codecs
+    '.heic', '.heif', '.hif', '.avif',
+    # Targa: Warcraft 3 and a great many older games screenshot to .tga,
+    # and .icb/.vda/.vst are the same container under other names
+    '.tga', '.icb', '.vda', '.vst',
+    # game and desktop assets
+    '.dds', '.ico', '.cur', '.icns',
+    # design and print
+    '.psd', '.jp2', '.j2k', '.jpf', '.jpx',
+    # netpbm and other plain formats that tools still emit
+    '.ppm', '.pgm', '.pbm', '.pnm', '.pcx', '.sgi', '.qoi',
+}
+
+# Pillow will also open .pdf, .eps, .fits, .grib, .mpeg and friends. They are
+# left out deliberately: scanning a photo library for weather data and
+# PostScript finds no duplicates and plenty of noise.
+#
+# Camera RAW (.cr2 .nef .arw .dng .orf .rw2) is NOT here because Pillow
+# cannot decode it - verified, none are registered. It needs rawpy/libraw,
+# and a real design decision besides: a RAW carries an embedded JPEG
+# preview, so "is this a duplicate" has two different answers depending on
+# which of the two you mean.
 SKIP_DIRS = {'.git', '.venv', 'venv', '__pycache__', 'node_modules',
              '$recycle.bin', 'system volume information', '_inventory',
              # Linux/macOS equivalents. The trash ones matter: without them a
@@ -199,6 +227,44 @@ def exif_str(v):
     if isinstance(v, bytes):
         v = v.decode('ascii', 'replace')
     return str(v).replace('\x00', '').strip()[:120]
+
+
+def thumb_size(w, h, box):
+    """The size Image.thumbnail would pick, without calling it.
+
+    Lifted from Pillow's own implementation (round_aspect and all) because
+    make_thumb must RESIZE into a new image rather than thumbnail the
+    source in place. Thumbnailing in place mutates the open ImageFile, and
+    the later save() then calls _ensure_mutable() -> load(), at which point
+    a lazy plugin re-decodes at full resolution into a buffer that is now
+    128px - pillow_heif raises `ValueError: tile cannot extend outside
+    image` and the file is dropped from the inventory as unreadable. That
+    hit every multi-frame HEIC, i.e. iPhone bursts and Live Photos.
+
+    Copying before thumbnailing also fixes it, but costs a full-resolution
+    duplicate of every already-RGB image - which is exactly the allocation
+    the in-place exif_transpose was added to avoid. Resizing costs nothing
+    and is byte-identical; self_test pins that against Pillow directly, so
+    if this ever drifts from the real implementation a test fails instead
+    of every thumbnail quietly moving.
+
+    Returns None when the image is already within the box, which is
+    thumbnail()'s no-op case.
+    """
+    x, y = box
+    if x >= w and y >= h:
+        return None
+
+    def round_aspect(number, key):
+        return max(min(math.floor(number), math.ceil(number), key=key), 1)
+
+    aspect = w / h
+    if x / y >= aspect:
+        x = round_aspect(y * aspect, key=lambda n: abs(aspect - n / y))
+    else:
+        y = round_aspect(x / aspect,
+                         key=lambda n: 0 if n == 0 else abs(aspect - x / n))
+    return x, y
 
 
 FRAME_SAMPLES = 5
@@ -399,7 +465,10 @@ def make_thumb(im, thumb_px, fast=False):
         im2 = bg
     if im2.mode != 'RGB':
         im2 = im2.convert('RGB')
-    im2.thumbnail((thumb_px, thumb_px), Image.LANCZOS)
+    # resize, not thumbnail: see thumb_size. Same pixels, and it never
+    # mutates the open file.
+    _t = thumb_size(im2.width, im2.height, (thumb_px, thumb_px))
+    im2 = im2.resize(_t, Image.LANCZOS, reducing_gap=2.0) if _t else im2.copy()
     bj = io.BytesIO()
     im2.save(bj, 'JPEG', quality=78)
     best, flag = bj.getvalue(), ''

@@ -1258,6 +1258,40 @@ def self_test():
           % ('PASS' if sweep_ok else 'FAIL', 72 * 71 // 2, len(ref)))
     ok = ok and sweep_ok
 
+    # The collector resizes into a new image instead of thumbnailing the
+    # open file in place, using its own copy of Pillow's size arithmetic.
+    # That is what stops a lazy plugin re-decoding at full resolution and
+    # dropping the file (every multi-frame HEIC hit this). Pin the copy
+    # against the real thing, so a Pillow change surfaces here rather than
+    # as every thumbnail quietly moving.
+    print('')
+    print('Collector thumbnail sizing')
+    try:
+        import importlib.util
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'collect-image-inventory.py')
+        _s = importlib.util.spec_from_file_location('_col_sz', _p)
+        _c = importlib.util.module_from_spec(_s)
+        _s.loader.exec_module(_c)
+        shapes = [(800, 600), (600, 800), (1000, 1000), (1920, 1080),
+                  (333, 777), (2000, 137), (100, 90), (1, 500), (128, 128)]
+        bad = []
+        for w, h in shapes:
+            for box in (128, 256):
+                want = Image.new('RGB', (w, h))
+                want.thumbnail((box, box), Image.LANCZOS)
+                got = _c.thumb_size(w, h, (box, box)) or (w, h)
+                if tuple(want.size) != tuple(got):
+                    bad.append('%dx%d@%d: pillow=%s ours=%s'
+                               % (w, h, box, want.size, got))
+        print('  [%s] thumb_size matches Image.thumbnail on %d shapes%s'
+              % ('PASS' if not bad else 'FAIL', len(shapes) * 2,
+                 '' if not bad else '   ' + '; '.join(bad[:2])))
+        ok = ok and not bad
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
     # fallback suite away the moment anything above it failed
