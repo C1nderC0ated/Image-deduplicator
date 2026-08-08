@@ -39,7 +39,7 @@ Options:
 
 EXIF orientation is applied before embedding - the same correction the
 collector applies to thumbnails - and the output header records it as
-"pre": "exif". Version history lives in CHANGES.md.
+"pre": see PRE_TAG below. Version history lives in CHANGES.md.
 """
 import argparse
 import base64
@@ -188,6 +188,17 @@ except ImportError as exc:
     sys.exit(2)
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# Stamped into the output header as "pre", and checked on resume. Bump this
+# whenever preprocessing changes what the model actually sees, so a resumed
+# file cannot silently mix two populations of vectors.
+#   exif      EXIF orientation applied before embedding
+#   +pil      the Pillow image processor asked for BY NAME. Previously
+#             CLIPImageProcessor resolved to the torchvision backend wherever
+#             torchvision happened to be installed, and the two resample
+#             differently - so the same images could embed differently on two
+#             machines. Also covers the high-bit-depth rescale below.
+PRE_TAG = 'exif+pil'
 
 
 def default_workers():
@@ -497,14 +508,34 @@ def main():
             print('  Re-run %s --fp16, or move the file aside to start fresh.'
                   % ('with' if prev_prec == 'fp16' else 'without'))
             sys.exit(2)
-        if done and prev_pre != 'exif':
+        if done and prev_pre != PRE_TAG:
             print('')
-            print('  [WARN] The existing vectors predate the EXIF-orientation fix:')
-            print('         they were computed on un-rotated pixels, new ones are')
-            print('         rotation-corrected first (same correction the collector')
-            print('         applies to thumbnails). Only images that carry an EXIF')
-            print('         orientation tag are affected. For a fully consistent')
-            print('         file, move/delete it and re-embed from scratch.')
+            if prev_pre == 'exif':
+                # Everything under 'exif' had the orientation fix already;
+                # what changed since is the preprocessing backend and the
+                # handling of high-bit-depth sources.
+                print('  [WARN] The existing vectors predate two preprocessing')
+                print('         changes. Both are conditional, which is why this')
+                print('         is a warning and not a stop:')
+                print('')
+                print('         - The image processor is now asked for by name')
+                print('           (CLIPImageProcessorPil). Where torchvision was')
+                print('           installed, the old code silently used its backend')
+                print('           instead, and the two resample differently. If this')
+                print('           file was built on a machine without torchvision,')
+                print('           nothing changed at all.')
+                print('         - 16-bit and float images used to clip to a white')
+                print('           square; they are now rescaled properly. Only')
+                print('           affects those sources.')
+            else:
+                print('  [WARN] The existing vectors predate the EXIF-orientation fix:')
+                print('         they were computed on un-rotated pixels, new ones are')
+                print('         rotation-corrected first (same correction the collector')
+                print('         applies to thumbnails). Only images that carry an EXIF')
+                print('         orientation tag are affected.')
+            print('')
+            print('         For a fully consistent file, move/delete it and')
+            print('         re-embed from scratch.')
             print('')
     todo = [r for r in recs if r['sha'] not in done]
     if not todo:
@@ -561,6 +592,19 @@ def main():
                         # intact while skipping most of the decode work.
                         im.draft(None, (draft_px, draft_px))
                     im = ImageOps.exif_transpose(im)
+                    # See make_thumb in collect-image-inventory.py: Pillow
+                    # CLIPS high-bit-depth data at 255 rather than rescaling
+                    # it, turning every 16-bit image into a white square.
+                    # The collector and the embedder must agree here, or the
+                    # pixel score and the CLIP vector describe different
+                    # pictures.
+                    if im.mode in ('I;16', 'I;16L', 'I;16B', 'I;16N'):
+                        im = im.point(lambda v: v * (1 / 257)).convert('L')
+                    elif im.mode in ('I', 'F'):
+                        lo, hi = im.getextrema()
+                        span = (hi - lo) or 1
+                        im = im.point(
+                            lambda v: (v - lo) * (255.0 / span)).convert('L')
                     if im.mode == 'P' and isinstance(
                             im.info.get('transparency'), bytes):
                         # See make_thumb in collect-image-inventory.py: a
@@ -660,7 +704,7 @@ def main():
                 real_dim = int(v16.shape[1])
                 if not header_written:
                     f.write(json.dumps({'schema': 'img-emb/1', 'model': args.model,
-                                        'dim': real_dim, 'root': root, 'pre': 'exif',
+                                        'dim': real_dim, 'root': root, 'pre': PRE_TAG,
                                         'prec': 'fp16' if use_half else 'fp32',
                                         'started': int(time.time() * 1000)}) + '\n')
                     header_written = True

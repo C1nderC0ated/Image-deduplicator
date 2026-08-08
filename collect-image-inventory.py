@@ -181,14 +181,37 @@ def make_thumb(im, thumb_px, fast=False):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
     im2 = ImageOps.exif_transpose(im)
+    # High-bit-depth images must be RESCALED, not converted. Pillow's
+    # I;16 -> L path CLIPS at 255, so every pixel above 1/257 of full scale
+    # becomes pure white and a 16-bit photo thumbnails to a near-solid white
+    # square. That is not merely ugly. Measured: two unrelated 16-bit images
+    # both go 99.7% white, score MAD 0.71 against a Tier A gate of 4.0, and
+    # are reported as duplicates of each other - a false DELETE
+    # recommendation, which is the one outcome this tool must never produce.
+    # The same pair as 8-bit scores 72.3 and is correctly rejected.
+    #
+    # 1/257, not 1/256: 257 is 65535/255, and it is what makes a 16-bit
+    # image byte-identical to its own 8-bit export (verified, max diff 0),
+    # so the two are correctly recognised as the same picture.
+    if im2.mode in ('I;16', 'I;16L', 'I;16B', 'I;16N'):
+        im2 = im2.point(lambda v: v * (1 / 257)).convert('L')
+    elif im2.mode in ('I', 'F'):
+        # 32-bit int and float carry no defined range, so normalise by what
+        # is actually in the image rather than assuming one.
+        lo, hi = im2.getextrema()
+        span = (hi - lo) or 1
+        im2 = im2.point(lambda v: (v - lo) * (255.0 / span)).convert('L')
     if im2.mode == 'P' and isinstance(im2.info.get('transparency'), bytes):
         # A palette image whose tRNS is a byte ARRAY (per-entry alpha, not a
         # single transparent index) makes Pillow warn on every convert().
         # Going via RGBA is exactly what it asks for, and it is pixel-
         # identical here - verified, because RGBA->RGB keeps the palette
-        # colours and only drops the alpha channel RGB has no room for. Left
-        # alone it is one warning PER IMAGE, which buries the real output of
-        # a 36k-image scan.
+        # colours and only drops the alpha channel RGB has no room for.
+        # Cosmetic only: CPython dedupes warnings by (message, category,
+        # module, lineno), so it is ONE line per run rather than one per
+        # image - measured, after an earlier version of this comment claimed
+        # otherwise. pngquant/TinyPNG output hits it constantly, so it is
+        # still worth removing.
         im2 = im2.convert('RGBA')
     if im2.mode != 'RGB':
         im2 = im2.convert('RGB')

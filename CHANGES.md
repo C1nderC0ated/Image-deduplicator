@@ -3,7 +3,70 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.2 — 2026-08-08 (current)
+## v4.2.3 — 2026-08-09 (current)
+
+**A false DELETE recommendation, which is the one thing this tool must
+never produce.** Found while investigating two harmless-looking warnings.
+
+- **16-bit and float images were destroyed, then called duplicates of each
+  other.** Pillow's `I;16 -> RGB` path *clips* at 255 instead of rescaling,
+  so every pixel above 1/257 of full scale became pure white and a 16-bit
+  photo thumbnailed to a near-solid white square — Photoshop/Krita exports,
+  depth maps, scientific TIFFs, AI-upscaler output.
+  That is not merely an ugly thumbnail. Measured: two *visibly different*
+  16-bit images both went 99.7% white and scored **MAD 0.71 against a Tier
+  A gate of 4.0** — reported as automatic duplicates, one of them offered
+  up for deletion. The identical pair as 8-bit scores 72.3 and is correctly
+  rejected.
+  Now rescaled before conversion. `1/257`, not `1/256`, because 257 is
+  65535/255 and it makes a 16-bit image **byte-identical to its own 8-bit
+  export** (verified, max diff 0). After the fix the two different images
+  score 72.29 — *exactly* the 8-bit number — and a 16-bit image against its
+  own 8-bit twin scores 0.0000. So this removes a false positive **and**
+  recovers a true positive the tool had been missing. 32-bit int and float
+  carry no defined range, so those normalise by the image's own extrema.
+- **`pre` is now a named constant, `exif+pil`.** Changing the image
+  processor (below) altered what the model sees wherever torchvision was
+  installed, and the header still said `exif` — so a resumed embeddings
+  file could have quietly mixed two vector populations, the exact trap the
+  model and precision guards exist to prevent. Kept a WARN rather than a
+  STOP because both changes are *conditional*: no torchvision means no
+  difference at all, and the rescale only touches high-bit-depth sources.
+  That matches how the EXIF change was handled; the precision guard stops
+  because it affects every vector.
+
+Two warnings that fired on ordinary input and pointed at nothing useful:
+
+- **Palette transparency.** A PNG whose tRNS is a byte array (per-entry
+  alpha) made Pillow warn on every `convert()`. Going via RGBA is what it
+  asks for and is pixel-identical — measured, since RGBA→RGB keeps the
+  palette colours and drops only the alpha channel RGB has no room for.
+  pngquant and TinyPNG output hits this constantly. Worth noting the first
+  version of this fix's own comment claimed one warning *per image*; CPython
+  dedupes by (message, category, module, lineno), so it is one line per run.
+  The comment now says so.
+- **torchvision.** transformers printed `CLIPImageProcessor requires
+  torchvision (not installed); falling back to CLIPImageProcessorPil` and
+  then returned that class regardless — verified, both paths construct the
+  identical object. Asked for by name now. Deliberately unconditional
+  rather than preferring the torchvision backend where it exists: the two
+  resample differently, and vectors that depend on which optional package a
+  machine happens to have are not comparable across machines.
+
+### Windows launchers
+
+- **`_pick-python.bat` now sees a `.venv`**, which `imgdedup.sh` already
+  did. Setup offers the venv route whenever pip is missing, and that is not
+  gated on platform — so on a Windows Python with broken pip it could
+  install everything into a `.venv` every `.bat` then refused to look at,
+  reporting those same packages missing while the fix sat on disk.
+  Ordered *below* the `py` launcher, unlike Linux: a PEP 668 distro forces
+  everything into the venv so it must win there, while on Windows `py` is
+  the idiomatic entry point. Verified against real `cmd.exe`.
+- **The doctor branches on platform too.** It was hard-coding the Linux
+  order, which made its label "what the launchers use" false on Windows.
+
+## v4.2.2 — 2026-08-08
 
 **pip itself is now checked before anything tries to use it.** It is not
 part of Python on most Linux distros — Arch splits it into `python-pip`,
