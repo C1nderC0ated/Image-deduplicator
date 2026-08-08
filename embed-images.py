@@ -197,10 +197,6 @@ Image.MAX_IMAGE_PIXELS = 300_000_000
 # different class and still raises.
 warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 
-# Matches collect-image-inventory.py. Above this, a non-JPEG image is
-# shrunk during decode rather than materialised at full size.
-HUGE_PX = 80_000_000
-
 # Stamped into the output header as "pre", and checked on resume. Bump this
 # whenever preprocessing changes what the model actually sees, so a resumed
 # file cannot silently mix two populations of vectors.
@@ -212,10 +208,7 @@ HUGE_PX = 80_000_000
 #             machines. Also covers the high-bit-depth rescale below.
 #   +flat     transparent pixels composited onto white instead of having
 #             their alpha silently dropped.
-#   +big      images at or above HUGE_PX are reduced during decode instead
-#             of being materialised at full size. Affects ONLY those; every
-#             ordinary image is untouched.
-PRE_TAG = 'exif+pil+flat+big'
+PRE_TAG = 'exif+pil+flat'
 
 
 def default_workers():
@@ -550,11 +543,14 @@ def main():
                 print('         - Transparent pixels are composited onto white')
                 print('           rather than having their alpha dropped, so a')
                 print('           cut-out now embeds as what you actually see.')
-            if prev_pre in (None, '', 'exif', 'exif+pil', 'exif+pil+flat'):
-                print('         - Images at or above %d MP are shrunk during'
-                      % (HUGE_PX // 1_000_000))
-                print('           decode to keep memory down. Nothing smaller')
-                print('           is touched.')
+            if prev_pre == 'exif+pil+flat+big':
+                # Shortlived tag: for one commit, images >= 80 MP were
+                # shrunk during decode. That is gone - the memory saving now
+                # comes from changes that alter no pixels at all - so those
+                # vectors differ only for images that large.
+                print('         - Images at or above 80 MP were shrunk during')
+                print('           decode; they no longer are, so only images')
+                print('           that big embed differently.')
             print('')
             print('         Every one of these is conditional on the images')
             print('         involved, which is why this warns instead of')
@@ -616,22 +612,10 @@ def main():
                         # for ~4x the model input keeps resampling quality
                         # intact while skipping most of the decode work.
                         im.draft(None, (draft_px, draft_px))
-                    elif (draft_px and im.mode not in ('P', 'PA')
-                          and im.size[0] * im.size[1] >= HUGE_PX):
-                        # Non-JPEG has no libjpeg draft mode, so a 144 Mpx
-                        # PNG is decoded whole - 1135 MB per worker,
-                        # measured. reduce() on the way out of the decoder
-                        # halves that. Gated on size for the same reason as
-                        # the collector: reduce-then-resample is not
-                        # identical to resampling alone, so ordinary images
-                        # are left exactly as they were and only the ones
-                        # that risk running out of memory take the change.
-                        k = 1
-                        while max(im.size) // (k * 2) >= draft_px:
-                            k *= 2
-                        if k > 1:
-                            im = im.reduce(k)
-                    im = ImageOps.exif_transpose(im)
+                    # See make_thumb: exif_transpose copies the whole image
+                    # even with no orientation tag. in_place skips that and
+                    # returns None, so the call is bare.
+                    ImageOps.exif_transpose(im, in_place=True)
                     # See make_thumb in collect-image-inventory.py: Pillow
                     # CLIPS high-bit-depth data at 255 rather than rescaling
                     # it, turning every 16-bit image into a white square.
@@ -651,9 +635,11 @@ def main():
                     # describing different pictures.
                     if (im.mode in ('RGBA', 'LA', 'PA', 'La')
                             or 'transparency' in im.info):
-                        rgba = im.convert('RGBA')
-                        bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
-                        im = Image.alpha_composite(bg, rgba)
+                        # One buffer instead of three - see make_thumb.
+                        rgba = im if im.mode == 'RGBA' else im.convert('RGBA')
+                        bg = Image.new('RGB', rgba.size, (255, 255, 255))
+                        bg.paste(rgba, (0, 0), rgba)
+                        im = bg
                     im = im.convert('RGB')
                     px = proc(images=im, return_tensors='pt')['pixel_values'][0]
                 return r, px, None, rel

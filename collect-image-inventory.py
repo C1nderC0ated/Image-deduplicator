@@ -204,34 +204,18 @@ def exif_str(v):
 def make_thumb(im, thumb_px, fast=False):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
-    # Shrink very large images on the way out of the decoder, before
-    # anything makes a full-size copy of them. Measured on this box:
-    # a 144 Mpx PNG peaked at 1135 MB and now peaks at 590 MB (-48%, and
-    # 1.5x faster); 64 Mpx went 522 -> 286 MB. That peak is per worker, so
-    # the default eight-way fan-out is what turns a folder of 12k textures
-    # into a MemoryError. JPEG already escapes this via im.draft() in
-    # process_one, which decodes at 1/8 in libjpeg; PNG/TIFF/WebP/BMP have
-    # no equivalent, so this is their version of it.
+    # exif_transpose ends in `return image.copy()` even when the image has
+    # NO orientation tag - a full-resolution duplicate of the whole thing,
+    # for nothing. That copy is the single largest avoidable allocation in
+    # this function. Skipping it: a 144 Mpx PNG peaks 1183 -> 607 MB, 36
+    # Mpx 318 -> 174 MB, and the output is BYTE-IDENTICAL, so no stored
+    # thumbnail moves and no threshold is needed.
     #
-    # GATED ON SIZE ON PURPOSE. reduce() then LANCZOS is not identical to
-    # LANCZOS alone - measured at up to MAD 1.18 on sharp/UI content, which
-    # is a third of the Tier A budget of 4.0. Applying it everywhere would
-    # shift every stored thumbnail to save memory on images that were never
-    # a problem. Above HUGE_PX the trade flips: those are rare, and the
-    # alternative for them is running out of memory and being dropped from
-    # the report entirely.
-    #
-    # Palette modes are excluded because reduce() would average palette
-    # INDICES, which is meaningless - and at one byte per pixel they are
-    # the least of the memory problem anyway.
-    if (im.size[0] * im.size[1] >= HUGE_PX
-            and im.mode not in ('P', 'PA')):
-        k = 1
-        while max(im.size) // (k * 2) >= thumb_px * 4:
-            k *= 2
-        if k > 1:
-            im = im.reduce(k)
-    im2 = ImageOps.exif_transpose(im)
+    # in_place returns None, hence the bare call. It mutates the caller's
+    # image, which is safe here: make_thumb is the last thing process_one
+    # does with it.
+    ImageOps.exif_transpose(im, in_place=True)
+    im2 = im
     # High-bit-depth images must be RESCALED, not converted. Pillow's
     # I;16 -> L path CLIPS at 255, so every pixel above 1/257 of full scale
     # becomes pure white and a 16-bit photo thumbnails to a near-solid white
@@ -273,9 +257,18 @@ def make_thumb(im, thumb_px, fast=False):
     # "should be converted to RGBA images" warning asks for.
     if (im2.mode in ('RGBA', 'LA', 'PA', 'La')
             or 'transparency' in im2.info):
-        rgba = im2.convert('RGBA')
-        bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
-        im2 = Image.alpha_composite(bg, rgba)
+        # Three full-resolution buffers used to live in these three lines:
+        # convert('RGBA') copies even when the image is ALREADY RGBA,
+        # Image.new allocates a second, and alpha_composite returns a
+        # third. A 144 Mpx RGBA peaked at 2911 MB. Pasting the image
+        # through its own alpha as a mask, straight onto an RGB
+        # background, does the whole job in one - and is bit-exact, which
+        # was checked across all 256 alphas x 256 colours rather than
+        # sampled. Combined with the transpose fix: 2911 -> 1183 MB.
+        rgba = im2 if im2.mode == 'RGBA' else im2.convert('RGBA')
+        bg = Image.new('RGB', rgba.size, (255, 255, 255))
+        bg.paste(rgba, (0, 0), rgba)
+        im2 = bg
     if im2.mode != 'RGB':
         im2 = im2.convert('RGB')
     im2.thumbnail((thumb_px, thumb_px), Image.LANCZOS)
