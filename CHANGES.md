@@ -3,7 +3,44 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.3 — 2026-08-09 (current)
+## v4.2.4 — 2026-08-09 (current)
+
+**Transparent images are composited, not flattened by accident.**
+`convert('RGB')` discards the alpha band and keeps whatever RGB happens to
+sit *under* transparent pixels — colour no human has ever seen, because
+every viewer paints those pixels as background.
+
+Measured before: two cut-outs a human sees as identical (same black
+square, transparent background, junk RGB of `(255,0,0,0)` vs `(0,255,0,0)`
+underneath) scored **MAD 146** against each other and were never reported
+as duplicates. The same artwork saved once transparent and once flattened
+onto white missed each other the same way — a headline use case for a
+deduplicator, silently failing on the difference between two invisible
+backgrounds.
+
+After: both pairs score **0.0000**. Composited onto white, because that is
+what viewers and file managers flatten onto.
+
+Two properties worth stating, both verified rather than assumed:
+
+- **Fully-opaque images are byte-unchanged.** Compositing an alpha=255
+  image over anything returns that image, so ordinary screenshots and PNG
+  exports keep the exact pixels they already had. An opaque RGBA and the
+  same pixels as RGB thumbnail identically.
+- **It subsumes the palette-transparency fix.** Going via RGBA is precisely
+  what Pillow's "should be converted to RGBA images" warning asks for, so
+  that branch collapsed into this one. Confirmed silent for byte-array
+  tRNS, integer tRNS and LA.
+
+`pre` becomes `exif+pil+flat`, and the resume warning is now cumulative —
+it names exactly which changes a given file predates, so an ancient file
+is told all three and a nearly-current one only what actually differs.
+
+**This changes stored thumbnails and vectors for any image with
+transparency.** If you have inventories or embeddings covering such
+images, re-run without `--resume` rather than mixing.
+
+## v4.2.3 — 2026-08-09
 
 **A false DELETE recommendation, which is the one thing this tool must
 never produce.** Found while investigating two harmless-looking warnings.

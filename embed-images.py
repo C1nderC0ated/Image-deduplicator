@@ -198,7 +198,9 @@ Image.MAX_IMAGE_PIXELS = 300_000_000
 #             torchvision happened to be installed, and the two resample
 #             differently - so the same images could embed differently on two
 #             machines. Also covers the high-bit-depth rescale below.
-PRE_TAG = 'exif+pil'
+#   +flat     transparent pixels composited onto white instead of having
+#             their alpha silently dropped.
+PRE_TAG = 'exif+pil+flat'
 
 
 def default_workers():
@@ -509,33 +511,36 @@ def main():
                   % ('with' if prev_prec == 'fp16' else 'without'))
             sys.exit(2)
         if done and prev_pre != PRE_TAG:
+            # Cumulative: name every change the existing file predates, so a
+            # very old file is told all of them and a nearly-current one is
+            # told only what actually differs.
             print('')
-            if prev_pre == 'exif':
-                # Everything under 'exif' had the orientation fix already;
-                # what changed since is the preprocessing backend and the
-                # handling of high-bit-depth sources.
-                print('  [WARN] The existing vectors predate two preprocessing')
-                print('         changes. Both are conditional, which is why this')
-                print('         is a warning and not a stop:')
-                print('')
-                print('         - The image processor is now asked for by name')
+            print('  [WARN] Those vectors were built with different preprocessing')
+            print('         (%s, this run uses %s):'
+                  % (prev_pre or 'an unrecorded version', PRE_TAG))
+            print('')
+            if not prev_pre:
+                print('         - EXIF orientation is applied before embedding now,')
+                print('           matching the thumbnails. Affects only images that')
+                print('           carry an orientation tag.')
+            if prev_pre in (None, '', 'exif'):
+                print('         - The image processor is asked for by name')
                 print('           (CLIPImageProcessorPil). Where torchvision was')
-                print('           installed, the old code silently used its backend')
-                print('           instead, and the two resample differently. If this')
-                print('           file was built on a machine without torchvision,')
-                print('           nothing changed at all.')
+                print('           installed the old code quietly used ITS backend,')
+                print('           and the two resample differently. Built on a')
+                print('           machine without torchvision, nothing changed.')
                 print('         - 16-bit and float images used to clip to a white')
-                print('           square; they are now rescaled properly. Only')
-                print('           affects those sources.')
-            else:
-                print('  [WARN] The existing vectors predate the EXIF-orientation fix:')
-                print('         they were computed on un-rotated pixels, new ones are')
-                print('         rotation-corrected first (same correction the collector')
-                print('         applies to thumbnails). Only images that carry an EXIF')
-                print('         orientation tag are affected.')
+                print('           square; they are rescaled properly now.')
+            if prev_pre in (None, '', 'exif', 'exif+pil'):
+                print('         - Transparent pixels are composited onto white')
+                print('           rather than having their alpha dropped, so a')
+                print('           cut-out now embeds as what you actually see.')
             print('')
-            print('         For a fully consistent file, move/delete it and')
-            print('         re-embed from scratch.')
+            print('         Every one of these is conditional on the images')
+            print('         involved, which is why this warns instead of')
+            print('         stopping - unlike the model and precision checks,')
+            print('         which change every vector. For a fully consistent')
+            print('         file, move or delete it and re-embed from scratch.')
             print('')
     todo = [r for r in recs if r['sha'] not in done]
     if not todo:
@@ -605,12 +610,15 @@ def main():
                         span = (hi - lo) or 1
                         im = im.point(
                             lambda v: (v - lo) * (255.0 / span)).convert('L')
-                    if im.mode == 'P' and isinstance(
-                            im.info.get('transparency'), bytes):
-                        # See make_thumb in collect-image-inventory.py: a
-                        # byte-array tRNS warns on every convert(), and the
-                        # RGBA hop it asks for is pixel-identical.
-                        im = im.convert('RGBA')
+                    # See make_thumb in collect-image-inventory.py: alpha is
+                    # composited onto white, not dropped. The two must agree
+                    # exactly, or the pixel score and the CLIP vector are
+                    # describing different pictures.
+                    if (im.mode in ('RGBA', 'LA', 'PA', 'La')
+                            or 'transparency' in im.info):
+                        rgba = im.convert('RGBA')
+                        bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+                        im = Image.alpha_composite(bg, rgba)
                     im = im.convert('RGB')
                     px = proc(images=im, return_tensors='pt')['pixel_values'][0]
                 return r, px, None, rel

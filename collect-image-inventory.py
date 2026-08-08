@@ -201,18 +201,30 @@ def make_thumb(im, thumb_px, fast=False):
         lo, hi = im2.getextrema()
         span = (hi - lo) or 1
         im2 = im2.point(lambda v: (v - lo) * (255.0 / span)).convert('L')
-    if im2.mode == 'P' and isinstance(im2.info.get('transparency'), bytes):
-        # A palette image whose tRNS is a byte ARRAY (per-entry alpha, not a
-        # single transparent index) makes Pillow warn on every convert().
-        # Going via RGBA is exactly what it asks for, and it is pixel-
-        # identical here - verified, because RGBA->RGB keeps the palette
-        # colours and only drops the alpha channel RGB has no room for.
-        # Cosmetic only: CPython dedupes warnings by (message, category,
-        # module, lineno), so it is ONE line per run rather than one per
-        # image - measured, after an earlier version of this comment claimed
-        # otherwise. pngquant/TinyPNG output hits it constantly, so it is
-        # still worth removing.
-        im2 = im2.convert('RGBA')
+    # Alpha must be COMPOSITED, not dropped. convert('RGB') discards the
+    # alpha band and keeps whatever RGB happens to sit under transparent
+    # pixels - colour no human has ever seen, because every viewer paints
+    # those pixels as background. Measured: two cut-outs that look identical
+    # (same black square, transparent background, junk RGB of (255,0,0,0)
+    # vs (0,255,0,0) underneath) scored MAD 146 against each other and were
+    # never reported as duplicates. The same artwork saved once transparent
+    # and once flattened onto white missed each other the same way - a
+    # headline use case for a deduplicator.
+    #
+    # White, because that is what viewers and file managers flatten onto,
+    # and it must match embed-images.py exactly or the pixel score and the
+    # CLIP vector end up describing different pictures.
+    #
+    # Fully-opaque RGBA is untouched: compositing an alpha=255 image over
+    # anything returns that image, so ordinary screenshots and PNG exports
+    # keep the pixels they already had. This also subsumes the old
+    # palette-transparency hop - going via RGBA is exactly what Pillow's
+    # "should be converted to RGBA images" warning asks for.
+    if (im2.mode in ('RGBA', 'LA', 'PA', 'La')
+            or 'transparency' in im2.info):
+        rgba = im2.convert('RGBA')
+        bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+        im2 = Image.alpha_composite(bg, rgba)
     if im2.mode != 'RGB':
         im2 = im2.convert('RGB')
     im2.thumbnail((thumb_px, thumb_px), Image.LANCZOS)
