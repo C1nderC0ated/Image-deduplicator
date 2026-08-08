@@ -201,6 +201,49 @@ def exif_str(v):
     return str(v).replace('\x00', '').strip()[:120]
 
 
+FRAME_SAMPLES = 5
+
+
+def frame_signature(im):
+    """A compact fingerprint of an animation BEYOND its first frame.
+
+    The thumbnail is frame 0 only, which makes every animation that starts
+    the same look identical. Measured: two entirely different GIFs sharing
+    a first frame score MAD 0.0000 and were reported as automatic
+    duplicates - and a still extracted from a GIF matched the GIF itself
+    just as perfectly. This is the signal that tells them apart.
+
+    Five samples rather than two, because GIF seeking is a REPLAY from
+    frame 0, not random access: measured 2.6 ms to reach frame 1 and 128 ms
+    to reach frame 119 of the same file. Once the walk to the last frame is
+    paid for, extra samples along the way are nearly free - K=4 and K=8
+    both measured 112 ms on a 120-frame GIF - so sampling generously costs
+    nothing over sampling meanly.
+
+    8x8 greyscale per frame: 64 bytes, so five frames add ~440 base64
+    characters against a 128px thumbnail's few KB. Stills return '' and pay
+    nothing at all.
+    """
+    n = int(getattr(im, 'n_frames', 1) or 1)
+    if n < 2:
+        return ''
+    want = sorted({int(round(t * (n - 1) / (FRAME_SAMPLES - 1)))
+                   for t in range(FRAME_SAMPLES)})
+    out = bytearray()
+    try:
+        for idx in want:
+            im.seek(idx)
+            out += im.convert('L').resize((8, 8), Image.BILINEAR).tobytes()
+    except Exception:
+        return ''                 # unseekable: say nothing rather than guess
+    finally:
+        try:
+            im.seek(0)            # every later step expects frame 0
+        except Exception:
+            pass
+    return base64.b64encode(bytes(out)).decode('ascii')
+
+
 def truncated(data):
     """True when the container itself says bytes are missing.
 
@@ -410,6 +453,11 @@ def process_one(full, rel, thumb_px, fast=False):
         # inverts what that field is for.
         if getattr(im, 'is_animated', False) and im.format != 'MPO':
             rec['anim'] = int(getattr(im, 'n_frames', 2))
+            # Only animations pay for this, and only once. Must run before
+            # make_thumb, which transposes in place.
+            fs = frame_signature(im)
+            if fs:
+                rec['fsig'] = fs
 
         # JPEG quality fingerprint: sum of the luma quantization table.
         # Lower = finer quantization = higher quality / less recompressed.

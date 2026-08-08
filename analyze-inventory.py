@@ -722,6 +722,65 @@ def quality_key(recs, i):
     return (r['w'] * r['h'], r['b'], -r.get('qsum', 10 ** 9))
 
 
+def anim_compatible(ra, rb):
+    """False when two records cannot be the same picture BECAUSE of motion.
+
+    The collector thumbnails frame 0 only, so an animation is invisible to
+    every pixel test here. Measured: a still extracted from a GIF and the
+    GIF itself score MAD 0.0000, and two entirely different animations that
+    happen to share a first frame also score 0.0000. Both were being
+    reported as automatic duplicates, and deleting the animation to keep
+    the still throws away every frame after the first.
+
+    README has promised this guard since `anim` was introduced ("the frame
+    count is recorded so a still never silently 'duplicates' an
+    animation"). The field was recorded and never read, so the promise was
+    not kept. It is now.
+
+    Differing frame counts are treated as different animations. That can
+    cost a real match - an optimiser which drops duplicate frames changes
+    the count - but such a pair is not discarded, it falls through to the
+    review tier. Missing a duplicate leaves both files on disk; a false one
+    puts a file on a delete list, and only one of those is recoverable.
+    """
+    a, b = ra.get('anim'), rb.get('anim')
+    if bool(a) != bool(b):
+        return False
+    if a and b and a != b:
+        return False
+    return frames_agree(ra, rb)
+
+
+# 8-bit grey levels. Deliberately looser than the Tier A pixel gate of 4.0:
+# these are 8x8 grids of frames that were resampled independently, and GIF
+# palette quantisation alone moves them a little. It only has to separate
+# "the same animation" from "a different one", which is a wide gap.
+FRAME_CUT = 12.0
+
+
+def frames_agree(ra, rb):
+    """Do two animations still match once you look past frame 0?
+
+    Returns True when there is nothing to compare - one side has no
+    sampled frames, or they were sampled at different lengths - because
+    silence here must not manufacture a duplicate OR destroy one. The
+    frame-count check above already separates animations of different
+    lengths; this catches the harder case, two animations of the SAME
+    length that begin identically and then diverge.
+    """
+    fa, fb = ra.get('fsig'), rb.get('fsig')
+    if not fa or not fb:
+        return True
+    try:
+        A = np.frombuffer(base64.b64decode(fa), dtype=np.uint8)
+        B = np.frombuffer(base64.b64decode(fb), dtype=np.uint8)
+    except Exception:
+        return True
+    if A.size != B.size or A.size == 0:
+        return True
+    return float(np.abs(A.astype(np.float32) - B.astype(np.float32)).mean()) <= FRAME_CUT
+
+
 def shown_dims(r):
     """(w, h) as the picture actually appears, not as the file stores it.
 
@@ -2075,7 +2134,8 @@ def main():
     for t, (i, j) in enumerate(cand):
         m = mads[t]
         c = cos_of(i, j)
-        is_dup = (m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos)
+        is_dup = ((m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos)
+                  and anim_compatible(recs[i], recs[j]))
         if is_dup:
             uf_a.union(i, j)
         elif m <= args.tier_b_mad:

@@ -3,7 +3,47 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.7 — 2026-08-09 (current)
+## v4.3 — 2026-08-09 (current)
+
+**Animations are compared as animations.** Until now the collector
+thumbnailed frame 0 and nothing else ever looked further, which made every
+animation that starts the same indistinguishable. Measured on real GIFs,
+all three scoring a perfect MAD 0.0000:
+
+| pair | before | now |
+|---|---|---|
+| two **different** animations, same first frame | reported as duplicates | not auto-deleted |
+| a **still** lifted out of a GIF, vs the GIF | reported as duplicates | not auto-deleted |
+| the same animation re-encoded | duplicates | duplicates *(unchanged)* |
+
+The first two were false delete recommendations, and the second one is
+worse than it looks: keeping the still and dropping the GIF discards every
+frame after the first.
+
+- **Five frames are sampled across the whole animation** and stored as an
+  8x8 grey fingerprint each. Five rather than two because GIF seeking is a
+  *replay from frame 0*, not random access — 2.6 ms to reach frame 1 and
+  128 ms to reach frame 119 of the same file. Once the walk to the end is
+  paid for, extra samples along the way are nearly free (K=4 and K=8 both
+  measured 112 ms on a 120-frame GIF), so sampling generously costs nothing
+  over sampling meanly.
+- **Only animations pay.** A 30-frame GIF costs 33 ms including the scan —
+  less than a 900×900 still at 38 ms. Stills store no fingerprint at all.
+  The fingerprint is ~440 base64 characters against a thumbnail of several
+  KB.
+- **`anim` is finally read.** README has promised since the field existed
+  that "the frame count is recorded so a still never silently 'duplicates'
+  an animation". The field was recorded and never looked at, so the promise
+  was not kept. It is now, and the README says what the code actually does.
+- Animations of **differing frame counts** are no longer eligible for
+  automatic deletion against each other. That can cost a real match when an
+  optimiser drops duplicate frames — but such a pair goes to the review
+  tier rather than vanishing. Missing a duplicate leaves both files on
+  disk; a false one puts a file on a delete list.
+
+Video is out of scope, and deliberately so — see the README.
+
+## v4.2.7 — 2026-08-09
 
 **Dual-camera phone photos are treated as the JPEGs they are.** A `.jpg`
 from a phone with two lenses or a depth sensor carries a multi-picture

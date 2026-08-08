@@ -541,8 +541,29 @@ very machine.
   nothing then nominates those pairs for scoring. On a 20-case truth set
   of known same-picture transformations the pipeline finds **20/20 with
   embeddings, 15/20 without** — run the semantic stage.
-- **Animated GIF/WebP** are compared by first frame; the frame count is
-  recorded so a still never silently "duplicates" an animation.
+- **Animated GIF/WebP/APNG** are compared by **five frames sampled across
+  the whole animation**, not just the first. Frame 0 alone is not enough:
+  two entirely different animations that happen to start the same score a
+  perfect pixel match, and so does a still lifted out of a GIF. Both were
+  being reported as automatic duplicates. An animation and a still are now
+  never auto-deleted against each other, nor are two animations whose
+  frames diverge — those go to the review tier instead of a delete list.
+  Only animations pay for the scan: a 30-frame GIF costs about as much as
+  one 900×900 photo, and the frame fingerprint adds ~440 characters beside
+  a thumbnail of several KB.
+- **Video is out of scope**, and not only because decoding it is expensive.
+  A GIF is an image file Pillow already opens, so extending to it cost one
+  seek loop. Video would need a decoder this toolkit does not have —
+  OpenCV's wheels bundle FFmpeg, but OpenCV is *optional* here, so video
+  would either become a hard dependency or work only sometimes, which is
+  worse than not working. The deeper problem is that the pixel-plus-CLIP
+  model does not describe video: the same clip in two containers, at two
+  frame rates, from a resolution ladder, or trimmed a second differently is
+  the same video and would score as unrelated. And the safety model does
+  not survive the trip — the whole design rests on you *seeing* a thumbnail
+  of each file before approving a deletion, which one still frame of a
+  ten-minute video cannot give you. Deduplicating video properly is a
+  different tool, not a flag on this one.
 - **Unicode-safe** — paths in Cyrillic, Japanese, emoji, typographic
   quotes, non-printable characters; each of those became a test case after
   breaking something once.
@@ -568,7 +589,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.2.7** (2026-08-09). Full history, including every bug and what it
+**v4.3** (2026-08-09). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---
