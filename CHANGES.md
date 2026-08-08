@@ -3,7 +3,35 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.6 — 2026-08-09 (current)
+## v4.2.7 — 2026-08-09 (current)
+
+**Dual-camera phone photos are treated as the JPEGs they are.** A `.jpg`
+from a phone with two lenses or a depth sensor carries a multi-picture
+header, so Pillow returns an `MpoImageFile` with `format='MPO'` and
+`is_animated=True`. Two consequences, on exactly the libraries this tool
+is pointed at:
+
+- **The libjpeg draft fast path was silently lost.** It was gated on
+  `format == 'JPEG'`, so every MPO decoded at full resolution. Measured on
+  a 3000px frame: 750x750 drafted versus 3000x3000 undrafted — **16x the
+  pixels**, and 0.120s -> 0.061s per file. Fixed in both the collector and
+  the embedder.
+  This does move MPO thumbnails (UI content MAD 2.25), and that was worth
+  checking rather than assuming, because a similar shift was rejected one
+  version ago. Here it goes the right way: an MPO and an ordinary JPEG
+  export of the *same photo* previously scored 1.87 against each other
+  because only one of them was drafted, and now score **0.80** — the pair a
+  deduper most needs to match got 2.3x tighter. The earlier rejection was
+  of a change that moved thumbnails away from everything for no gain; this
+  one moves them toward their own twin.
+- **`anim` was set on ordinary still photos.** MPO frames are the second
+  lens or a depth capture of the same instant, not animation, so recording
+  `anim: 2` inverted what that field means. Excluded now.
+
+`fmt` still reports `MPO`, which is what the file actually is. Plain JPEG
+records are byte-identical.
+
+## v4.2.6 — 2026-08-09
 
 **Partial files are now named as partial** — and the obvious way to do
 that was measured, found dangerous, and rejected.

@@ -607,7 +607,11 @@ def main():
             full = os.path.join(root, *rel.split('/'))
             try:
                 with Image.open(full) as im:
-                    if draft_px and im.format == 'JPEG':
+                    # 'MPO' as well - see process_one in the collector: a
+                    # phone's dual-camera .jpg is a JPEG that Pillow
+                    # relabels, and gating on 'JPEG' alone silently gave up
+                    # the fast path on it.
+                    if draft_px and im.format in ('JPEG', 'MPO'):
                         # libjpeg can decode at 1/2, 1/4, 1/8 scale; asking
                         # for ~4x the model input keeps resampling quality
                         # intact while skipping most of the decode work.

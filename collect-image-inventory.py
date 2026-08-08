@@ -402,7 +402,13 @@ def process_one(full, rel, thumb_px, fast=False):
         # and is known BEFORE the decode that might run out of memory.
         if rec['w'] * rec['h'] >= HUGE_PX:
             rec['huge'] = round(rec['w'] * rec['h'] / 1e6, 1)
-        if getattr(im, 'is_animated', False):
+        # MPO is excluded deliberately. A .jpg from a dual-camera or
+        # 3D-capable phone carries a multi-picture header, so Pillow returns
+        # an MpoImageFile with is_animated=True and n_frames=2 - but those
+        # frames are the second lens or a depth capture of the SAME instant,
+        # not an animation. Recording anim=2 for an ordinary still photo
+        # inverts what that field is for.
+        if getattr(im, 'is_animated', False) and im.format != 'MPO':
             rec['anim'] = int(getattr(im, 'n_frames', 2))
 
         # JPEG quality fingerprint: sum of the luma quantization table.
@@ -453,7 +459,12 @@ def process_one(full, rel, thumb_px, fast=False):
             if isinstance(ori, int) and ori != 1:
                 rec['ori'] = ori
 
-        if im.format == 'JPEG':
+        # MPO too: it IS a JPEG underneath, and Pillow only relabels it
+        # because of the multi-picture header. Gating on 'JPEG' alone meant
+        # every dual-camera phone photo - exactly the libraries this tool
+        # is pointed at - decoded at full resolution. Measured on a 3000px
+        # frame: 750x750 drafted vs 3000x3000 undrafted, 16x the pixels.
+        if im.format in ('JPEG', 'MPO'):
             im.draft(None, (thumb_px * 4, thumb_px * 4))
         flag, tw, th, b64 = make_thumb(im, thumb_px, fast)
         rec['tw'], rec['th'], rec['tb'] = tw, th, b64
