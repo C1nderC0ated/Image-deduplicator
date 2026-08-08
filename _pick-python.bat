@@ -11,8 +11,18 @@ rem           PICK_ERR     1 when nothing matched, 0 otherwise
 rem
 rem  Order, most trusted first:
 rem     1. %IMGDEDUP_PYTHON%      explicit override, always wins
-rem     2. py -3.14 .. -3.9       the launcher, newest first
-rem     3. python                 whatever is on PATH
+rem     2. .venv beside this file - what setup builds when it has to make
+rem        one. Rare on Windows (that is usually the PEP 668 route, and
+rem        Windows has no marker) but reachable here too: setup offers the
+rem        venv whenever pip is MISSING and venv works, which is not gated
+rem        on platform. Without this step setup could install every package
+rem        into a .venv the launchers then refused to look at, and every
+rem        later run reported those same packages missing.
+rem     3. py -3.14 .. -3.9       the launcher, newest first
+rem     4. python                 whatever is on PATH
+rem
+rem  This mirrors imgdedup.sh, deliberately: the doctor reports one order
+rem  for both platforms, so the two launchers must agree or it is lying.
 rem
 rem  Every probe passed in here must be FUNCTIONAL - it has to call into
 rem  the package, not just name it: a gutted install (folders survive,
@@ -26,10 +36,20 @@ set "_PP_PROBE=%~1"
 set "PYTHON_CMD="
 set "PICK_ERR=1"
 
-if not defined IMGDEDUP_PYTHON goto :pp_launcher
+if not defined IMGDEDUP_PYTHON goto :pp_venv
 "%IMGDEDUP_PYTHON%" -c "%_PP_PROBE%" >nul 2>&1
-if errorlevel 1 goto :pp_launcher
+if errorlevel 1 goto :pp_venv
 set "PYTHON_CMD="%IMGDEDUP_PYTHON%""
+goto :pp_done
+
+rem %~dp0 is THIS file's folder - the toolkit folder - and already ends in
+rem a backslash. It is not the caller's directory, which is what we want:
+rem the .venv sits beside the scripts, not beside whatever was dropped.
+:pp_venv
+if not exist "%~dp0.venv\Scripts\python.exe" goto :pp_launcher
+"%~dp0.venv\Scripts\python.exe" -c "%_PP_PROBE%" >nul 2>&1
+if errorlevel 1 goto :pp_launcher
+set "PYTHON_CMD="%~dp0.venv\Scripts\python.exe""
 goto :pp_done
 
 :pp_launcher
