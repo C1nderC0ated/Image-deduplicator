@@ -459,6 +459,16 @@ def make_thumb(im, thumb_px, fast=False):
         # background, does the whole job in one - and is bit-exact, which
         # was checked across all 256 alphas x 256 colours rather than
         # sampled. Combined with the transpose fix: 2911 -> 1183 MB.
+        if im2.mode == 'La':
+            # Premultiplied greyscale+alpha converts to exactly one thing in
+            # Pillow: LA. La->L, ->RGB, ->RGBA and ->P all raise "conversion
+            # from La to L not supported", so going straight to RGBA below
+            # would throw. RGBa, the colour equivalent, has no such problem -
+            # this is a quirk of one mode, not a family. No image FILE decodes
+            # to La (Pillow cannot write it as TIFF, PNG or WebP either), so
+            # this is a latent trap rather than something a scan hits, but it
+            # costs one line to close.
+            im2 = im2.convert('LA')
         rgba = im2 if im2.mode == 'RGBA' else im2.convert('RGBA')
         bg = Image.new('RGB', rgba.size, (255, 255, 255))
         bg.paste(rgba, (0, 0), rgba)

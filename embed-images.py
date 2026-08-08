@@ -640,6 +640,9 @@ def main():
                     if (im.mode in ('RGBA', 'LA', 'PA', 'La')
                             or 'transparency' in im.info):
                         # One buffer instead of three - see make_thumb.
+                        if im.mode == 'La':
+                            # see make_thumb: La converts only to LA
+                            im = im.convert('LA')
                         rgba = im if im.mode == 'RGBA' else im.convert('RGBA')
                         bg = Image.new('RGB', rgba.size, (255, 255, 255))
                         bg.paste(rgba, (0, 0), rgba)
