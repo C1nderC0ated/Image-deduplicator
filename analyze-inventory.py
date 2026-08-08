@@ -722,6 +722,27 @@ def quality_key(recs, i):
     return (r['w'] * r['h'], r['b'], -r.get('qsum', 10 ** 9))
 
 
+def shown_dims(r):
+    """(w, h) as the picture actually appears, not as the file stores it.
+
+    The collector records the file's RAW dimensions but thumbnails the
+    EXIF-ROTATED image, so a portrait phone photo stores 4032x3024 and
+    displays as portrait. Printing the raw pair beside a rotated thumbnail
+    is merely confusing; feeding it to the "identical dimensions" test is
+    worse - an EXIF-rotated original and a physically-rotated,
+    EXIF-stripped copy of the SAME photo were labelled MIXED RESOLUTIONS
+    despite having identical pixels.
+
+    Orientations 5-8 are the ones that transpose (6 and 8 are the quarter
+    turns, 5 and 7 those plus a mirror). Fixed here rather than in the
+    collector so existing inventories keep working: 'ori' has been recorded
+    all along, it was simply never read. Note keeper_key above is unaffected
+    either way, since it ranks on w*h, which does not care about rotation.
+    """
+    w, h = r['w'], r['h']
+    return (h, w) if r.get('ori') in (5, 6, 7, 8) else (w, h)
+
+
 # ------------------------------------------------------------- invariants --
 class InvariantError(Exception):
     pass
@@ -1217,7 +1238,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
 
     def meta(i):
         r = recs[i]
-        s = '%dx%d &middot; %s' % (r['w'], r['h'], mb(r['b']))
+        s = '%dx%d &middot; %s' % (shown_dims(r) + (mb(r['b']),))
         if 'qsum' in r:
             s += ' &middot; q%d' % r['qsum']
         return s
@@ -1314,7 +1335,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
         A('<p class="lead">%s</p>' % lead)
         for cl_id, keeper, editable, refs in groups:
             members = editable + refs
-            dims = set((recs[i]['w'], recs[i]['h']) for i in members)
+            dims = set(shown_dims(recs[i]) for i in members)
             note = 'mixed resolutions' if len(dims) > 1 else 'identical dimensions'
             label = ('cluster %d' % cl_id) if cl_id else '%d files' % len(members)
             A('<div class="cl" id="cluster-%s"><div class="ch">'
@@ -1350,7 +1371,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                           tier_a, tier_b, root, info_b=None):
     def info(i, keeper):
         r = recs[i]
-        t = '%dx%d, %.2f MB' % (r['w'], r['h'], r['b'] / 1048576.0)
+        t = '%dx%d, %.2f MB' % (shown_dims(r) + (r['b'] / 1048576.0,))
         if 'qsum' in r:
             t += ', q%d' % r['qsum']
         if keeper:
@@ -1391,7 +1412,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             L += ['', '# ' + '=' * 74, '#  ' + head, '# ' + '=' * 74]
             last_key = key
         members = editable + refs
-        dims = set((recs[i]['w'], recs[i]['h']) for i in members)
+        dims = set(shown_dims(recs[i]) for i in members)
         L += ['', '#  cluster %d  (%d files%s)'
               % (cl_id, len(members),
                  ', MIXED RESOLUTIONS' if len(dims) > 1 else '')]
