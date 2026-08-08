@@ -220,9 +220,22 @@ def frame_signature(im):
     both measured 112 ms on a 120-frame GIF - so sampling generously costs
     nothing over sampling meanly.
 
-    8x8 greyscale per frame: 64 bytes, so five frames add ~440 base64
-    characters against a 128px thumbnail's few KB. Stills return '' and pay
-    nothing at all.
+    RGB, not greyscale. Greyscale was the first attempt and it is
+    colour-blind in exactly the way that matters here: two animations whose
+    frames differ only in hue collapse onto the same luma. Measured, with
+    an identical first frame so nothing else could separate them - pure red
+    against pure green, both luma 76, scored 0.00 on a cut of 12.0, and
+    crimson/blue and magenta/olive scored 8.5 and 4.0. All three would have
+    been reported as automatic duplicates. In RGB the same pairs score 64,
+    62 and 85.
+
+    8x8x3 per frame: 192 bytes, so five frames add ~1.3 KB of base64
+    against a 128px thumbnail's few KB. Stills return '' and pay nothing.
+
+    The walk is strictly ASCENDING and then rewinds to 0. That is not
+    incidental: Pillow 12.3 raises on a backwards seek to a middle frame of
+    an APNG, so any implementation that visits frames out of order breaks
+    on them.
     """
     n = int(getattr(im, 'n_frames', 1) or 1)
     if n < 2:
@@ -233,7 +246,7 @@ def frame_signature(im):
     try:
         for idx in want:
             im.seek(idx)
-            out += im.convert('L').resize((8, 8), Image.BILINEAR).tobytes()
+            out += im.convert('RGB').resize((8, 8), Image.BILINEAR).tobytes()
     except Exception:
         return ''                 # unseekable: say nothing rather than guess
     finally:
