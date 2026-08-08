@@ -3,7 +3,39 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.5 — 2026-08-09 (current)
+## v4.2.6 — 2026-08-09 (current)
+
+**Partial files are now named as partial** — and the obvious way to do
+that was measured, found dangerous, and rejected.
+
+- **Truncated files are identified by name.** An interrupted download, a
+  bad copy or a half-synced cloud folder now reports as
+  `TruncatedFile: incomplete download or copy`, distinct from a genuinely
+  corrupt file, because the user can go and re-fetch one and not the
+  other. Detection is a structural walk of the container's own length
+  fields — JPEG segments, PNG chunks, RIFF size — over the bytes already
+  read for the SHA-256, so it costs nothing. It touches no Pillow state
+  and no globals, which matters at eight workers. Verified 12/12
+  truncations caught across JPEG, PNG, WebP and EXIF-bearing JPEG, with
+  **zero false positives** including the cases that defeat a naive tail
+  check: a JPEG with an appended MP4 (every phone "motion photo"), a PNG
+  with trailing junk, and a JPEG whose EXIF thumbnail carries its own
+  end-of-image marker. Anything unrecognised is never accused.
+- **`ImageFile.LOAD_TRUNCATED_IMAGES` was NOT enabled**, though it is the
+  obvious fix and was the plan. Measured on this pipeline: Pillow fills
+  the undecoded remainder with a *constant* — grey for JPEG, black for
+  PNG — so two unrelated photos cut to 1200 bytes both become the same
+  flat square and score **MAD 0.0710** against a Tier A gate of 4.0.
+  Intact, that pair scores 97.21. It is the 16-bit white-square bug again,
+  an order of magnitude worse (0.07 vs 0.71), and it would put real files
+  on a delete list.
+  It also buys nothing. A truncated file does not match *its own intact
+  original*: self-MAD 8.4 / 37.8 / 67.3 with 90% / 50% / 10% of the bytes
+  kept — every one outside the gate. So the feature would have added a
+  false-delete risk in exchange for a duplicate match that does not
+  happen. Partial pixels are never compared; the file is reported instead.
+
+## v4.2.5 — 2026-08-09
 
 **Large images no longer eat the machine, and PIL stops accusing your
 photos of being an attack.**

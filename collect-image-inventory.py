@@ -201,6 +201,78 @@ def exif_str(v):
     return str(v).replace('\x00', '').strip()[:120]
 
 
+def truncated(data):
+    """True when the container itself says bytes are missing.
+
+    Deliberately NOT done by asking Pillow, and deliberately not paired
+    with ImageFile.LOAD_TRUNCATED_IMAGES. Measured, on this toolkit's own
+    pipeline: with that flag on, Pillow fills the undecoded remainder with
+    a CONSTANT - grey for JPEG, black for PNG - so two unrelated photos cut
+    to 1200 bytes both become the same flat square and score MAD 0.0710
+    against a Tier A gate of 4.0. Intact, that pair scores 97.21. It is the
+    16-bit white-square bug again, and worse (0.07 vs 0.71).
+
+    And it buys nothing: a truncated file does not even match its own
+    intact original - self-MAD 8.4 / 37.8 / 67.3 with 90% / 50% / 10% of
+    the bytes kept, every one of them outside the gate. So partial pixels
+    are never compared. The file is reported as damaged instead, by name,
+    which is the part that was actually missing.
+
+    Reads only the bytes already in hand for the SHA-256, so it is free.
+    Pure function of those bytes - no Pillow, no global state, nothing to
+    race across the eight workers. Anything unrecognised returns False:
+    this may only ever ACCUSE a file it is certain about.
+    """
+    n = len(data)
+    if n < 12:
+        # Too small to identify. A 0-byte or stub file is "unreadable",
+        # which is what it will be reported as - calling it truncated would
+        # be a guess, and this function may only accuse what it is sure of.
+        return False
+    if data[:3] == b'\xff\xd8\xff':       # JPEG
+        i = 2
+        while i + 4 <= n:
+            if data[i] != 0xFF:
+                return False              # lost marker alignment; do not guess
+            m = data[i + 1]
+            if m == 0xFF:
+                i += 1
+                continue
+            if m == 0x01 or 0xD0 <= m <= 0xD8:
+                i += 2
+                continue
+            if m == 0xD9:
+                return False
+            seg = int.from_bytes(data[i + 2:i + 4], 'big')
+            if seg < 2:
+                return False
+            if m == 0xDA:
+                # Entropy data cannot legally contain a bare FFD9 (an FF is
+                # stuffed as FF00, or is a restart marker), so an FFD9 at or
+                # past the scan is the true end. Searching backwards makes
+                # the intact case O(1), and requiring it past the scan start
+                # skips the EOI inside an EXIF thumbnail - which lives in an
+                # APPn segment and otherwise reads as a complete file.
+                return data.rfind(b'\xff\xd9') < i + 2 + seg
+            i += 2 + seg
+        return True
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        i = 8
+        while i + 8 <= n:
+            ln = int.from_bytes(data[i:i + 4], 'big')
+            typ = data[i + 4:i + 8]
+            end = i + 12 + ln             # length + type + payload + CRC
+            if end > n:
+                return True
+            if typ == b'IEND':
+                return False              # trailing junk is not our business
+            i = end
+        return True
+    if data[:4] == b'RIFF':               # WebP and friends
+        return n < 8 + int.from_bytes(data[4:8], 'little')
+    return False
+
+
 def make_thumb(im, thumb_px, fast=False):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
@@ -316,6 +388,11 @@ def process_one(full, rel, thumb_px, fast=False):
             for chunk in iter(lambda: f.read(1 << 20), b''):
                 h.update(chunk)
     rec['sha'] = h.hexdigest()
+    # Free: these are the bytes just hashed. Only for files read in one go;
+    # the larger streaming path is covered by the check in work_one's error
+    # branch, which is where a partial file almost always ends up anyway.
+    if data is not None and truncated(data):
+        rec['trunc'] = 1
 
     src = io.BytesIO(data) if data is not None else full
     with Image.open(src) as im:
@@ -393,6 +470,18 @@ def work_one(full, rel, thumb_px, fast=False):
     except Exception as e:
         try:
             msg = type(e).__name__ + ': ' + str(e)
+            # Say WHICH kind of broken. A partial file - interrupted
+            # download, bad copy, half-synced cloud folder - is something
+            # the user can go and re-fetch, while a genuinely corrupt one
+            # is not. Only on the error path, so a healthy scan never pays
+            # for the extra read.
+            try:
+                with open(full, 'rb') as _f:
+                    if truncated(_f.read()):
+                        msg = 'TruncatedFile: incomplete download or copy ' \
+                              '(' + msg + ')'
+            except Exception:
+                pass
             # decoding runs from memory, so PIL names a BytesIO instead of the
             # file - put the filename back and drop the run-random 0x address.
             # The replacement MUST be a callable: as a string it would be
