@@ -12,7 +12,27 @@ rem
 rem  Order, most trusted first:
 rem     1. %IMGDEDUP_PYTHON%      explicit override, always wins
 rem     2. py -3.14 .. -3.9       the launcher, newest first
-rem     3. python                 whatever is on PATH
+rem     3. .venv beside this file - what setup builds when it has to make
+rem        one. Uncommon on Windows (that is mainly the PEP 668 route, and
+rem        Windows ships no marker) but reachable: setup offers the venv
+rem        whenever pip is MISSING and venv works, which is not gated on
+rem        platform. Without this step setup could install every package
+rem        into a .venv the launchers then refused to look at, and every
+rem        later run reported those same packages missing while the fix sat
+rem        on disk.
+rem     4. python                 whatever is on PATH
+rem
+rem  Deliberately BELOW the py launcher, unlike imgdedup.sh where .venv
+rem  comes first. On Linux a PEP 668 distro forces everything into the venv,
+rem  so it has to win; on Windows `py` is the idiomatic entry point and a
+rem  stray .venv should not quietly hijack it. It still sits above bare
+rem  `python`, which is the weakest signal here - it can be a Store stub or
+rem  whatever happens to be first on PATH.
+rem
+rem  The ordering only decides between candidates that BOTH pass the probe,
+rem  so this costs nothing in the case that motivated the step: when setup
+rem  installed into .venv because system pip was broken, the py-launcher
+rem  interpreters fail the functional probe and fall through to it anyway.
 rem
 rem  Every probe passed in here must be FUNCTIONAL - it has to call into
 rem  the package, not just name it: a gutted install (folders survive,
@@ -34,9 +54,19 @@ goto :pp_done
 
 :pp_launcher
 where py >nul 2>&1
-if errorlevel 1 goto :pp_path
+if errorlevel 1 goto :pp_venv
 for %%V in (3.14 3.13 3.12 3.11 3.10 3.9) do call :pp_try_ver %%V
 if defined PYTHON_CMD goto :pp_done
+
+rem %~dp0 is THIS file's folder - the toolkit folder - and already ends in a
+rem backslash. It is deliberately not the caller's directory: the .venv sits
+rem beside the scripts, not beside whatever was dragged onto them.
+:pp_venv
+if not exist "%~dp0.venv\Scripts\python.exe" goto :pp_path
+"%~dp0.venv\Scripts\python.exe" -c "%_PP_PROBE%" >nul 2>&1
+if errorlevel 1 goto :pp_path
+set "PYTHON_CMD="%~dp0.venv\Scripts\python.exe""
+goto :pp_done
 
 :pp_path
 python -c "%_PP_PROBE%" >nul 2>&1

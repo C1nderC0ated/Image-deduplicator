@@ -187,8 +187,16 @@ def candidates():
 
     # In launcher order, because the verdict is first-match-wins and its whole
     # job is to predict what the launchers will actually pick:
-    #   IMGDEDUP_PYTHON  ->  .venv beside the toolkit  ->  PATH
-    # The .venv was previously invisible here. It is not on PATH and the
+    #   Linux/macOS   IMGDEDUP_PYTHON -> .venv -> PATH        (imgdedup.sh)
+    #   Windows       IMGDEDUP_PYTHON -> py    -> .venv -> PATH
+    #                                                     (_pick-python.bat)
+    # The two differ on purpose - a PEP 668 distro forces every package into
+    # the venv so it has to win there, while on Windows `py` is the idiomatic
+    # entry point and a stray .venv should not hijack it - so this cannot be
+    # one order. Hard-coding the Linux one made the label "what the launchers
+    # use" false on Windows, which is worse than not reporting it at all.
+    #
+    # The .venv was invisible here until recently. It is not on PATH and the
     # launchers exec it directly rather than activating it, so $VIRTUAL_ENV -
     # the only venv this ever looked at - is unset. On any PEP 668 distro that
     # is exactly where setup puts every package, so the doctor would report
@@ -198,12 +206,18 @@ def candidates():
     if override:
         add([override], 'IMGDEDUP_PYTHON')
     here = os.path.dirname(os.path.abspath(__file__))
-    for rel in (os.path.join('.venv', 'bin', 'python'),
-                os.path.join('.venv', 'Scripts', 'python.exe')):
-        p = os.path.join(here, rel)
-        if os.path.exists(p):
-            add([p], 'toolkit .venv (what the launchers use)')
+
+    def add_toolkit_venv():
+        label = ('toolkit .venv (below the py launcher here)' if IS_WIN
+                 else 'toolkit .venv (what the launchers use)')
+        for rel in (os.path.join('.venv', 'bin', 'python'),
+                    os.path.join('.venv', 'Scripts', 'python.exe')):
+            p = os.path.join(here, rel)
+            if os.path.exists(p):
+                add([p], label)
+
     if not IS_WIN:
+        add_toolkit_venv()
         # No `py` launcher off Windows. Interpreters live on PATH under
         # versioned names, and pyenv / deadsnakes / Homebrew installs are
         # only reachable that way, so ask for each one by name.
@@ -243,6 +257,10 @@ def candidates():
             tag, star, path = m.group(1), m.group(2), m.group(3).strip('"')
             if path.lower().endswith(('python.exe', 'pythonw.exe')) and os.path.exists(path):
                 add([path], 'py launcher: ' + tag + (' (default)' if star else ''))
+    if IS_WIN:
+        # After the py launcher, before bare PATH - mirroring
+        # _pick-python.bat exactly.
+        add_toolkit_venv()
     for exe in ('python', 'python3'):
         rc, out = run([exe, '-c', 'import sys;print(sys.executable)'], timeout=30)
         if rc == 0 and out.strip():
