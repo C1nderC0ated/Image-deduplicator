@@ -151,7 +151,27 @@ def _defuse_stale_torchvision():
 _TV_BROKEN = _defuse_stale_torchvision()
 
 try:
-    from transformers import CLIPModel, CLIPImageProcessor
+    from transformers import CLIPModel
+    try:
+        # The Pillow-backed processor, ASKED FOR BY NAME.
+        #
+        # Plain CLIPImageProcessor prints, once per run:
+        #   `CLIPImageProcessor` requires torchvision (not installed);
+        #   falling back to `CLIPImageProcessorPil` ...
+        # and then hands back a CLIPImageProcessorPil regardless - verified,
+        # the two construct the identical class. So naming it directly costs
+        # nothing and removes a warning about a package this toolkit
+        # deliberately does not need.
+        #
+        # Deliberately unconditional, rather than preferring the torchvision
+        # backend where it happens to exist: the two backends resample
+        # differently, and vectors that depend on which optional package a
+        # machine has installed are not comparable between machines. Stable
+        # embeddings are worth more here than a marginally faster resize.
+        from transformers import CLIPImageProcessorPil as CLIPImageProcessor
+    except ImportError:
+        # older transformers: no Pil-suffixed name, and no warning either
+        from transformers import CLIPImageProcessor
 except ImportError as exc:
     import importlib.util
     if importlib.util.find_spec('transformers') is None:
@@ -541,6 +561,12 @@ def main():
                         # intact while skipping most of the decode work.
                         im.draft(None, (draft_px, draft_px))
                     im = ImageOps.exif_transpose(im)
+                    if im.mode == 'P' and isinstance(
+                            im.info.get('transparency'), bytes):
+                        # See make_thumb in collect-image-inventory.py: a
+                        # byte-array tRNS warns on every convert(), and the
+                        # RGBA hop it asks for is pixel-identical.
+                        im = im.convert('RGBA')
                     im = im.convert('RGB')
                     px = proc(images=im, return_tensors='pt')['pixel_values'][0]
                 return r, px, None, rel

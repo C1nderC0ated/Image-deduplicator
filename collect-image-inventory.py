@@ -181,6 +181,15 @@ def make_thumb(im, thumb_px, fast=False):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
     im2 = ImageOps.exif_transpose(im)
+    if im2.mode == 'P' and isinstance(im2.info.get('transparency'), bytes):
+        # A palette image whose tRNS is a byte ARRAY (per-entry alpha, not a
+        # single transparent index) makes Pillow warn on every convert().
+        # Going via RGBA is exactly what it asks for, and it is pixel-
+        # identical here - verified, because RGBA->RGB keeps the palette
+        # colours and only drops the alpha channel RGB has no room for. Left
+        # alone it is one warning PER IMAGE, which buries the real output of
+        # a 36k-image scan.
+        im2 = im2.convert('RGBA')
     if im2.mode != 'RGB':
         im2 = im2.convert('RGB')
     im2.thumbnail((thumb_px, thumb_px), Image.LANCZOS)

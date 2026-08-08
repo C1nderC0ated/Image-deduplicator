@@ -90,7 +90,15 @@ except Exception as e:
     o['collect_err'] = type(e).__name__ + ': ' + str(e)[:110]
 try:
     import torch
-    from transformers import CLIPModel, CLIPImageProcessor
+    from transformers import CLIPModel
+    # Ask for the Pillow backend by name, exactly as the embedder does.
+    # Plain CLIPImageProcessor prints a torchvision warning and then returns
+    # this same class anyway, and that line lands in the middle of the
+    # doctor's own output.
+    try:
+        from transformers import CLIPImageProcessorPil as CLIPImageProcessor
+    except ImportError:
+        from transformers import CLIPImageProcessor
     torch.zeros(1) + 1
     o['embed_ok'] = True
     o['torchver'] = str(torch.__version__)
