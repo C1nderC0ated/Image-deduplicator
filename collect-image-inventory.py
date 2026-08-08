@@ -529,6 +529,7 @@ def main():
     nbytes = 0
     written = 0
     unreadable_ext = {}
+    unreadable_why = {}          # exception type -> [count, [(path, msg), ..]]
     header = {'schema': SCHEMA, 'root': root, 'files': total,
               'thumb': args.thumb, 'started': int(time.time() * 1000)}
     w = PartWriter(out, args.split_mb, header)
@@ -569,6 +570,19 @@ def main():
             else:
                 err += 1
                 unreadable_ext[ext] = unreadable_ext.get(ext, 0) + 1
+                # Keep the REASON, not just the count. It was already being
+                # written to the JSONL and then never shown, so the only
+                # thing on screen was "N unreadable" plus an extension
+                # histogram - which is why "some images give an error" gets
+                # reported as a guess. Grouped by exception type, because
+                # MemoryError and "truncated" want completely different
+                # answers from the user.
+                why = str(rec.get('err', 'unknown'))
+                kind_of = why.split(':', 1)[0].strip() or 'unknown'
+                slot = unreadable_why.setdefault(kind_of, [0, []])
+                slot[0] += 1
+                if len(slot[1]) < 3:
+                    slot[1].append((rec.get('p', '?'), why[:140]))
             w.write(rec)
             written += 1
             if written % 250 == 0 or written == total:
@@ -624,6 +638,25 @@ def main():
         print('Unreadable by extension: ' + json.dumps(unreadable_ext))
         if not HEIF_OK and any(e in unreadable_ext for e in ('.heic', '.heif', '.avif')):
             print('  -> install pillow-heif and re-run with --resume to fill these in.')
+    if unreadable_why:
+        print('')
+        print('Why they failed:')
+        for kind_of, (n, samples) in sorted(unreadable_why.items(),
+                                            key=lambda kv: -kv[1][0]):
+            print('  %s  (%d)' % (kind_of, n))
+            for path, msg in samples:
+                print('     %s' % path)
+                print('       %s' % msg)
+            if n > len(samples):
+                print('     ... and %d more' % (n - len(samples)))
+        if 'MemoryError' in unreadable_why:
+            # Very large non-JPEG files are the usual cause: JPEG gets the
+            # libjpeg draft fast path, PNG/TIFF/WebP/BMP are decoded whole,
+            # once per worker thread.
+            print('  -> ran out of memory decoding. Large PNG/TIFF/WebP are')
+            print('     read at full size, once per worker; re-run with')
+            print('     --workers 2 (or 1) to cut the peak.')
+        print('  Every reason is also stored in the inventory, as "err".')
     tot_mb = sum(os.path.getsize(p) for p in w.paths) / 1048576.0
     for p in w.paths:
         print('Output: ' + p)
