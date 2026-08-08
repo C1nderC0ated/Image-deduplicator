@@ -35,11 +35,23 @@ frame after the first.
   that "the frame count is recorded so a still never silently 'duplicates'
   an animation". The field was recorded and never looked at, so the promise
   was not kept. It is now, and the README says what the code actually does.
-- Animations of **differing frame counts** are no longer eligible for
-  automatic deletion against each other. That can cost a real match when an
-  optimiser drops duplicate frames — but such a pair goes to the review
-  tier rather than vanishing. Missing a duplicate leaves both files on
-  disk; a false one puts a file on a delete list.
+- **The sampled frames decide, not the frame count.** The first rule
+  refused any pair whose frame counts differed, and a real corpus of 2739
+  GIFs disproved it immediately: four pixel-identical pairs were rejected
+  purely on count, and the fingerprint scored them 0.97, 2.63, 2.94 and
+  10.25 — three of those sit *inside* the 0.00–1.93 range of the 45 pairs
+  that were allowed through. They were re-encodes with a few frames
+  trimmed, not different animations. Frame count is now only the fallback
+  for records with no fingerprint.
+- **`FRAME_CUT` is 6.0, set from that corpus rather than guessed.** Same
+  animation with matching counts scored 0.00–1.93; same animation trimmed,
+  0.97–2.94; the same base clip where one file is a longer loop, 10.25;
+  genuinely different animations, 62–85. Six sits above every confirmed
+  re-encode and below the loop variant, which is the right side to err on —
+  a trimmed or extended clip goes to review instead of onto a delete list,
+  and the margin to 62 keeps unrelated animations out regardless.
+  Net effect on that library: 48 Tier A clusters instead of 45, with one
+  pair held back for review.
 
 Video is out of scope, and deliberately so — see the README.
 

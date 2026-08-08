@@ -745,17 +745,32 @@ def anim_compatible(ra, rb):
     """
     a, b = ra.get('anim'), rb.get('anim')
     if bool(a) != bool(b):
-        return False
-    if a and b and a != b:
-        return False
-    return frames_agree(ra, rb)
+        return False                  # a still can never stand in for motion
+    if not (a and b):
+        return True                   # two stills: nothing here applies
+    if ra.get('fsig') and rb.get('fsig'):
+        # Sampled frames are the real signal, so let them decide even when
+        # the frame counts differ. Frame count alone was the first rule and
+        # a real corpus disproved it: of 2739 GIFs, four pixel-identical
+        # pairs were rejected purely for differing counts, and the
+        # fingerprint scored them 0.97, 2.63, 2.94 and 10.25 - three of
+        # those sit inside the 0.00-1.93 range of the 45 pairs that were
+        # allowed through. They were re-encodes with a few frames trimmed,
+        # not different animations.
+        return frames_agree(ra, rb)
+    return a == b                     # no fingerprint: fall back to the count
 
 
-# 8-bit grey levels. Deliberately looser than the Tier A pixel gate of 4.0:
-# these are 8x8 grids of frames that were resampled independently, and GIF
-# palette quantisation alone moves them a little. It only has to separate
-# "the same animation" from "a different one", which is a wide gap.
-FRAME_CUT = 12.0
+# Set from a real corpus of 2739 GIFs, not guessed. On that library:
+#   same animation, matching frame counts   0.00 - 1.93   (45 pairs)
+#   same animation, a few frames trimmed    0.97 - 2.94   (3 pairs)
+#   same base clip, one a longer loop       10.25         (1 pair)
+#   genuinely different animations          62 - 85       (measured separately)
+# 6.0 sits in the gap above every confirmed re-encode and below the loop
+# variant, which is the right side to err on: a trimmed-or-extended clip
+# goes to review rather than onto a delete list, while the enormous margin
+# to 62 keeps unrelated animations out regardless.
+FRAME_CUT = 6.0
 
 
 def frames_agree(ra, rb):
