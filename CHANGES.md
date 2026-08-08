@@ -3,7 +3,47 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.2.4 — 2026-08-09 (current)
+## v4.2.5 — 2026-08-09 (current)
+
+**Large images no longer eat the machine, and PIL stops accusing your
+photos of being an attack.**
+
+- **Peak memory roughly halved on big non-JPEG images.** JPEG already
+  escaped via `im.draft()`, which decodes at 1/8 inside libjpeg; PNG, TIFF,
+  WebP and BMP have no equivalent and were decoded whole, then copied by
+  `exif_transpose`, then copied again by `convert('RGB')`. Measured on this
+  box: a 144 Mpx PNG peaked at **1135 MB → 590 MB** (−48%, and 1.5× faster);
+  64 Mpx went **522 → 286 MB**. That peak is *per worker*, and the default
+  fan-out is eight — which is how a folder of 12k textures became a
+  `MemoryError`, reported to the user as nothing more than one more
+  "unreadable" file.
+  **Gated on size, deliberately.** `reduce()` followed by LANCZOS is not
+  identical to LANCZOS alone — measured at up to MAD 1.18 on sharp/UI
+  content, a third of the Tier A budget of 4.0. Applying it everywhere
+  would shift every stored thumbnail to save memory on images that were
+  never a problem. Verified: at 4, 36 and 80 Mpx the output is
+  **byte-identical** to before; only above 80 Mpx does anything change, and
+  there the alternative was running out of memory and being dropped from
+  the report entirely. Palette modes are excluded, since `reduce()` would
+  average palette *indices*.
+- **The decompression-bomb warning is ours now.** Pillow wrote this
+  straight to unbuffered stderr, so it appeared *above* the tool's own
+  banner:
+  `DecompressionBombWarning: Image size (324000000 pixels) exceeds limit
+  ... could be decompression bomb DOS attack.`
+  To someone scanning their own holiday photos that reads as a crash and as
+  an accusation. The guard is aimed at untrusted uploads; here the user
+  owns every file. Suppressed at module level — *not* with
+  `catch_warnings()`, which is process-global state and not thread-safe
+  across the eight workers — and replaced with a plain summary of very
+  large images, their sizes, and the `--workers` lever. Sizes come from the
+  lazy `Image.open` header, so they cost nothing and are known *before* the
+  decode that might fail. `DecompressionBombError` (the >2× case) is a
+  different class and still raises, and is still recorded as unreadable.
+
+`pre` becomes `exif+pil+flat+big`.
+
+## v4.2.4 — 2026-08-09
 
 **Transparent images are composited, not flattened by accident.**
 `convert('RGB')` discards the alpha band and keeps whatever RGB happens to

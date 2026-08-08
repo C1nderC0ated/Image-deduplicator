@@ -52,6 +52,7 @@ import re
 import shutil
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 
@@ -105,6 +106,29 @@ except Exception:
     pass
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# Pillow writes this straight to stderr, unbuffered, so it landed ABOVE our
+# own banner:
+#   PIL/Image.py:3578: DecompressionBombWarning: Image size (324000000
+#   pixels) exceeds limit of 300000000 pixels, could be decompression bomb
+#   DOS attack.
+# To someone scanning their own holiday photos that reads as a crash, and
+# as an accusation that their file is an attack. The guard is aimed at
+# untrusted uploads; here the user owns every file being scanned.
+#
+# Suppressed at module level rather than with catch_warnings(), which is
+# process-global state and NOT thread-safe - the collector runs eight
+# workers, so trapping per image would let one thread's filter leak into
+# another's. Instead the size is read from the lazy Image.open header (see
+# process_one), and anything oversized is reported in our own voice at the
+# end. DecompressionBombError, the >2x case, is a separate class and still
+# raises and is still recorded as unreadable.
+warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+
+# Flagged as "very large" for the summary. Well below the bomb limit on
+# purpose: this is the size at which decoding starts to dominate memory,
+# not the size at which Pillow gets suspicious.
+HUGE_PX = 80_000_000
 
 EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tif', '.tiff',
         '.heic', '.heif', '.avif'}
@@ -180,6 +204,33 @@ def exif_str(v):
 def make_thumb(im, thumb_px, fast=False):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
+    # Shrink very large images on the way out of the decoder, before
+    # anything makes a full-size copy of them. Measured on this box:
+    # a 144 Mpx PNG peaked at 1135 MB and now peaks at 590 MB (-48%, and
+    # 1.5x faster); 64 Mpx went 522 -> 286 MB. That peak is per worker, so
+    # the default eight-way fan-out is what turns a folder of 12k textures
+    # into a MemoryError. JPEG already escapes this via im.draft() in
+    # process_one, which decodes at 1/8 in libjpeg; PNG/TIFF/WebP/BMP have
+    # no equivalent, so this is their version of it.
+    #
+    # GATED ON SIZE ON PURPOSE. reduce() then LANCZOS is not identical to
+    # LANCZOS alone - measured at up to MAD 1.18 on sharp/UI content, which
+    # is a third of the Tier A budget of 4.0. Applying it everywhere would
+    # shift every stored thumbnail to save memory on images that were never
+    # a problem. Above HUGE_PX the trade flips: those are rare, and the
+    # alternative for them is running out of memory and being dropped from
+    # the report entirely.
+    #
+    # Palette modes are excluded because reduce() would average palette
+    # INDICES, which is meaningless - and at one byte per pixel they are
+    # the least of the memory problem anyway.
+    if (im.size[0] * im.size[1] >= HUGE_PX
+            and im.mode not in ('P', 'PA')):
+        k = 1
+        while max(im.size) // (k * 2) >= thumb_px * 4:
+            k *= 2
+        if k > 1:
+            im = im.reduce(k)
     im2 = ImageOps.exif_transpose(im)
     # High-bit-depth images must be RESCALED, not converted. Pillow's
     # I;16 -> L path CLIPS at 255, so every pixel above 1/257 of full scale
@@ -277,6 +328,10 @@ def process_one(full, rel, thumb_px, fast=False):
     with Image.open(src) as im:
         rec['fmt'] = im.format or ''
         rec['w'], rec['h'] = im.size
+        # Read from the header - Image.open is lazy, so this costs nothing
+        # and is known BEFORE the decode that might run out of memory.
+        if rec['w'] * rec['h'] >= HUGE_PX:
+            rec['huge'] = round(rec['w'] * rec['h'] / 1e6, 1)
         if getattr(im, 'is_animated', False):
             rec['anim'] = int(getattr(im, 'n_frames', 2))
 
@@ -542,6 +597,7 @@ def main():
     written = 0
     unreadable_ext = {}
     unreadable_why = {}          # exception type -> [count, [(path, msg), ..]]
+    huge_seen = []               # (path, megapixels) for very large images
     header = {'schema': SCHEMA, 'root': root, 'files': total,
               'thumb': args.thumb, 'started': int(time.time() * 1000)}
     w = PartWriter(out, args.split_mb, header)
@@ -595,6 +651,8 @@ def main():
                 slot[0] += 1
                 if len(slot[1]) < 3:
                     slot[1].append((rec.get('p', '?'), why[:140]))
+            if kind in ('ok', 'reused') and rec.get('huge'):
+                huge_seen.append((rec.get('p', '?'), rec['huge']))
             w.write(rec)
             written += 1
             if written % 250 == 0 or written == total:
@@ -669,6 +727,21 @@ def main():
             print('     read at full size, once per worker; re-run with')
             print('     --workers 2 (or 1) to cut the peak.')
         print('  Every reason is also stored in the inventory, as "err".')
+    if huge_seen:
+        # Said in our own voice, replacing PIL's stderr warning about a
+        # "decompression bomb DOS attack" - which is about untrusted
+        # uploads and reads as an accusation when it is your own photo.
+        huge_seen.sort(key=lambda t: -t[1])
+        print('')
+        print('Very large images (%d, biggest %.1f MP):' % (len(huge_seen),
+                                                            huge_seen[0][1]))
+        for path, mp in huge_seen[:3]:
+            print('   %.1f MP  %s' % (mp, path))
+        if len(huge_seen) > 3:
+            print('   ... and %d more' % (len(huge_seen) - 3))
+        print('  These decode fine but are memory-hungry, and are read once')
+        print('  per worker. If a scan runs out of memory, --workers 2 is')
+        print('  the lever. Recorded in the inventory as "huge".')
     tot_mb = sum(os.path.getsize(p) for p in w.paths) / 1048576.0
     for p in w.paths:
         print('Output: ' + p)

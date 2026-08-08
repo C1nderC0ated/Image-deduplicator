@@ -50,6 +50,7 @@ import os
 import shutil
 import sys
 import time
+import warnings
 from concurrent.futures import TimeoutError as FuturesTimeout
 
 # Exotic characters in filenames must not crash a redirected console.
@@ -189,6 +190,17 @@ except ImportError as exc:
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
+# See collect-image-inventory.py: Pillow's raw stderr warning reads as a
+# crash and as an accusation about the user's own file. Suppressed at
+# module level rather than per image, because catch_warnings() is
+# process-global and not thread-safe. The >2x DecompressionBombError is a
+# different class and still raises.
+warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
+
+# Matches collect-image-inventory.py. Above this, a non-JPEG image is
+# shrunk during decode rather than materialised at full size.
+HUGE_PX = 80_000_000
+
 # Stamped into the output header as "pre", and checked on resume. Bump this
 # whenever preprocessing changes what the model actually sees, so a resumed
 # file cannot silently mix two populations of vectors.
@@ -200,7 +212,10 @@ Image.MAX_IMAGE_PIXELS = 300_000_000
 #             machines. Also covers the high-bit-depth rescale below.
 #   +flat     transparent pixels composited onto white instead of having
 #             their alpha silently dropped.
-PRE_TAG = 'exif+pil+flat'
+#   +big      images at or above HUGE_PX are reduced during decode instead
+#             of being materialised at full size. Affects ONLY those; every
+#             ordinary image is untouched.
+PRE_TAG = 'exif+pil+flat+big'
 
 
 def default_workers():
@@ -535,6 +550,11 @@ def main():
                 print('         - Transparent pixels are composited onto white')
                 print('           rather than having their alpha dropped, so a')
                 print('           cut-out now embeds as what you actually see.')
+            if prev_pre in (None, '', 'exif', 'exif+pil', 'exif+pil+flat'):
+                print('         - Images at or above %d MP are shrunk during'
+                      % (HUGE_PX // 1_000_000))
+                print('           decode to keep memory down. Nothing smaller')
+                print('           is touched.')
             print('')
             print('         Every one of these is conditional on the images')
             print('         involved, which is why this warns instead of')
@@ -596,6 +616,21 @@ def main():
                         # for ~4x the model input keeps resampling quality
                         # intact while skipping most of the decode work.
                         im.draft(None, (draft_px, draft_px))
+                    elif (draft_px and im.mode not in ('P', 'PA')
+                          and im.size[0] * im.size[1] >= HUGE_PX):
+                        # Non-JPEG has no libjpeg draft mode, so a 144 Mpx
+                        # PNG is decoded whole - 1135 MB per worker,
+                        # measured. reduce() on the way out of the decoder
+                        # halves that. Gated on size for the same reason as
+                        # the collector: reduce-then-resample is not
+                        # identical to resampling alone, so ordinary images
+                        # are left exactly as they were and only the ones
+                        # that risk running out of memory take the change.
+                        k = 1
+                        while max(im.size) // (k * 2) >= draft_px:
+                            k *= 2
+                        if k > 1:
+                            im = im.reduce(k)
                     im = ImageOps.exif_transpose(im)
                     # See make_thumb in collect-image-inventory.py: Pillow
                     # CLIPS high-bit-depth data at 255 rather than rescaling
