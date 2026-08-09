@@ -471,6 +471,17 @@ def main():
         stem = base + '-embeddings'
     out = os.path.join(os.path.dirname(os.path.abspath(inv)), stem + '.jsonl')
 
+    # Resolved HERE, before the resume guards, because the precision that
+    # actually gets written depends on it. --fp16 is honoured only on a GPU,
+    # so a run that asks for it and lands on the CPU writes fp32 vectors -
+    # and the guard used to compare against the FLAG, so it saw fp16 ==
+    # fp16, waved the run through, and appended fp32 vectors to a file whose
+    # header says fp16. That is precisely the silent mixing it exists to
+    # stop, and it was invisible because the opposite direction (an fp16
+    # file resumed without the flag) was caught correctly.
+    device = resolve_device(args.device)
+    use_half = args.fp16 and device in ('cuda', 'xpu')
+
     done = set()
     prev_err = {}                     # sha -> last recorded error message
     prev_model = prev_dim = prev_pre = prev_prec = None
@@ -510,13 +521,23 @@ def main():
         # precision the Tier A cosine floor works at, so appending
         # one kind to a file of the other would quietly skew every
         # later comparison - the same trap the model check exists for.
-        if done and prev_prec and prev_prec != ('fp16' if args.fp16 else 'fp32'):
+        now_prec = 'fp16' if use_half else 'fp32'
+        if done and prev_prec and prev_prec != now_prec:
             print('')
             print('  [STOP] that file was built with %s vectors; this run '
-                  'would append %s.' % (prev_prec,
-                                        'fp16' if args.fp16 else 'fp32'))
-            print('  Re-run %s --fp16, or move the file aside to start fresh.'
-                  % ('with' if prev_prec == 'fp16' else 'without'))
+                  'would append %s.' % (prev_prec, now_prec))
+            if args.fp16 and not use_half:
+                # The subtle case: they DID pass --fp16, so "re-run with
+                # --fp16" would be maddening advice. The flag is being
+                # ignored because this run is not on a GPU.
+                print('  --fp16 was given but only applies on a GPU, and this')
+                print('  run is on %s. Either run it where the GPU is visible'
+                      % device)
+                print('  (see the device note above), or move the file aside')
+                print('  and re-embed from scratch on this machine.')
+            else:
+                print('  Re-run %s --fp16, or move the file aside to start '
+                      'fresh.' % ('with' if prev_prec == 'fp16' else 'without'))
             sys.exit(2)
         if done and prev_pre != PRE_TAG:
             # Cumulative: name every change the existing file predates, so a
@@ -579,7 +600,6 @@ def main():
                                     'https://download.pytorch.org/whl/cu132'))
         print('')
 
-    device = resolve_device(args.device)
     batch = args.batch or (64 if device == 'cuda' else 8)
     workers = args.workers if args.workers > 0 else default_workers()
     print('Batch size: ' + str(batch) + '   decode threads: ' + str(workers))
@@ -627,9 +647,21 @@ def main():
                     # pixel score and the CLIP vector describe different
                     # pictures.
                     if im.mode in ('I;16', 'I;16L', 'I;16B', 'I;16N'):
+                        # see make_thumb: point() rejects the byte-order
+                        # variants, and I;16B is just a big-endian TIFF
+                        if im.mode != 'I;16':
+                            im = im.convert('I')
                         im = im.point(lambda v: v * (1 / 257)).convert('L')
                     elif im.mode in ('I', 'F'):
                         lo, hi = im.getextrema()
+                        if not (abs(lo) < 3.0e38 and abs(hi) < 3.0e38):
+                            # Inf/NaN collapses the scale to 0 and blacks
+                            # out the image - see make_thumb. Refused for
+                            # the same reason, and refused HERE too so the
+                            # embedder and the collector agree about which
+                            # files exist.
+                            raise ValueError('image has no finite pixel '
+                                             'range (contains Inf or NaN)')
                         span = (hi - lo) or 1
                         im = im.point(
                             lambda v: (v - lo) * (255.0 / span)).convert('L')
@@ -663,7 +695,7 @@ def main():
     pool = ThreadPoolExecutor(max_workers=workers)
     with open(out, 'a', encoding='utf-8') as f:
 
-        use_half = args.fp16 and device in ('cuda', 'xpu')
+        # use_half was decided up with the device, before the resume guard
         if args.fp16 and not use_half:
             print('(--fp16 ignored: it only applies on a GPU)')
         elif use_half:

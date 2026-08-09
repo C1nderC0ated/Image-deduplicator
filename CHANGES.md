@@ -3,7 +3,52 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3 — 2026-08-09 (current)
+## v4.3.1 — 2026-08-09 (current)
+
+**Four defects found by auditing this session's own changes**, three of
+them introduced by it. Two were false DELETE recommendations, which is the
+one outcome this tool exists to avoid.
+
+- **Short animations got shorter fingerprints.** `frame_signature` built
+  its sample indices with a *set* comprehension, so they deduplicated: a
+  2-frame GIF emitted 384 bytes, 3-frame 576, 4-frame 768, ≥5 frames 960.
+  Fingerprints of different lengths are positionally incomparable, and the
+  comparison treated that as "nothing to say" and returned True — which
+  reads as consent. Unrelated animations sharing a first frame have
+  byte-identical thumbnails, so pixels and CLIP both agree and the
+  fingerprint was the only thing standing between them and an automatic
+  delete. Measured: **8 of 8 unrelated pairs allowed through, now 0 of 8**.
+  Fixed in both directions — the collector always emits 5 tiles now
+  (repeating an index when the animation is shorter, seeks still ascending
+  for APNG), and a size mismatch falls back to the frame count instead of
+  abstaining, because inventories written earlier today hold short ones.
+- **`I;16B` was dropped from the inventory entirely.** `point()` is
+  implemented for `I`, `I;16` and `F` only; the byte-order variants raise.
+  `I;16B` is what a big-endian 16-bit TIFF opens as — ordinary scanner and
+  Adobe output — and the raise took `make_thumb` down, so the file got no
+  sha, no thumbnail, and was never compared against anything. Converts via
+  `I` now.
+- **A float image containing `Inf` or `NaN` turned solid black.** The span
+  became infinite, the scale `0.0`, and every pixel mapped to 0 — so two
+  unrelated such images scored a perfect match and one was offered for
+  deletion. Refused now, with a reason, so the file is reported rather than
+  compared wrongly. Clamping in place is not available: Pillow's `point()`
+  accepts only affine expressions for these modes, and Collect is
+  deliberately Pillow-only with no numpy to fall back on.
+- **`--fp16` checked the flag, not the precision actually used.** The flag
+  is honoured only on a GPU, so a run that asks for fp16 and lands on the
+  CPU writes fp32 — and the guard compared against the flag, saw a match,
+  and appended fp32 vectors to a file whose header said fp16. Exactly the
+  silent mixing it exists to prevent, and invisible because the opposite
+  direction was caught correctly. The device is resolved before the guard
+  now, and the guard and the header stamp share one expression. When the
+  flag was given but ignored, the message says so instead of advising a
+  re-run with a flag that is already set.
+
+Two self-test cases pin the fingerprint: the sample count is fixed for
+every length, and a size-mismatched fingerprint is not consent.
+
+## v4.3 — 2026-08-09
 
 **Animations are compared as animations.** Until now the collector
 thumbnailed frame 0 and nothing else ever looked further, which made every

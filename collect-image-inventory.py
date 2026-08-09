@@ -435,11 +435,34 @@ def make_thumb(im, thumb_px, fast=False):
     # image byte-identical to its own 8-bit export (verified, max diff 0),
     # so the two are correctly recognised as the same picture.
     if im2.mode in ('I;16', 'I;16L', 'I;16B', 'I;16N'):
+        # point() is implemented for I, I;16 and F only - the byte-order
+        # variants raise "point operation not supported for this mode".
+        # I;16B is not exotic: it is what a big-endian 16-bit TIFF opens
+        # as, which is ordinary scanner and Adobe output, and the raise
+        # took make_thumb down so the file was never inventoried at all -
+        # no sha, no thumbnail, never compared against anything.
+        if im2.mode != 'I;16':
+            im2 = im2.convert('I')
         im2 = im2.point(lambda v: v * (1 / 257)).convert('L')
     elif im2.mode in ('I', 'F'):
         # 32-bit int and float carry no defined range, so normalise by what
         # is actually in the image rather than assuming one.
         lo, hi = im2.getextrema()
+        if not (abs(lo) < 3.0e38 and abs(hi) < 3.0e38):
+            # One Inf or NaN pixel makes the span infinite, the scale 0.0
+            # and EVERY pixel black - and two unrelated images then score a
+            # perfect match, so one is offered for deletion. That is the
+            # exact failure this rescale exists to prevent. (NaN fails the
+            # comparison too, which is what we want.)
+            #
+            # Refusing is the safe answer, not a cop-out: the file is
+            # recorded as unreadable with this reason and never compared,
+            # rather than compared wrongly. Clamping in place is not
+            # available - Pillow's point() accepts only affine expressions
+            # for I and F, and Collect is deliberately Pillow-only, with no
+            # numpy to fall back on.
+            raise ValueError(
+                'image has no finite pixel range (contains Inf or NaN)')
         span = (hi - lo) or 1
         im2 = im2.point(lambda v: (v - lo) * (255.0 / span)).convert('L')
     # Alpha must be COMPOSITED, not dropped. convert('RGB') discards the
