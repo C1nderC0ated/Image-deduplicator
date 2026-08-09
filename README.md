@@ -71,7 +71,7 @@ Generated at run time, next to your images:
   drag folders onto; elsewhere use `./imgdedup.sh`. GPU acceleration (Embed
   only) works with **NVIDIA, AMD and Intel**; see [AMD GPUs](#amd-gpus)
   for the one platform that needs care. Deleted files go to the
-  Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively — never a
+  Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively, never a
   permanent delete on any of them.
 - **Python 3.9+** (tested on 3.14). No admin rights, no installer.
 - Packages, by stage:
@@ -91,7 +91,7 @@ Generated at run time, next to your images:
   **Several no longer permit it, and Arch is one of them.** Arch, Debian
   12+, Ubuntu 23.04+, Fedora 38+ and Homebrew all mark their Python as
   *externally managed* ([PEP 668](https://peps.python.org/pep-0668/)), and
-  pip refuses to install into it at all. `--user` is refused too — that is
+  pip refuses to install into it at all. `--user` is refused too. That is
   the part that catches people out, and so is `pip uninstall`. There, the
   install **must** go into a virtual environment. `./imgdedup.sh setup`
   detects this, offers to create one beside the toolkit, and installs into
@@ -99,8 +99,7 @@ Generated at run time, next to your images:
   automatically, so nothing else changes.
 
   **`pip` may not be there at all**, which is a different problem with a
-  different fix. It is packaged separately from Python on most distros —
-  `python-pip` on Arch, `python3-pip` on Debian/Ubuntu, `python314-pip`
+  different fix. It is packaged separately from Python on most distros, `python-pip` on Arch, `python3-pip` on Debian/Ubuntu, `python314-pip`
   and friends on openSUSE, so a base install has none, and every pip
   command simply reports `No module named pip`. Setup and
   `./imgdedup.sh doctor` both check and name the package. Where pip is
@@ -111,7 +110,7 @@ Generated at run time, next to your images:
 
 **Easiest: let the toolkit install it.** Setup detects your GPU
 (NVIDIA / AMD / Intel), asks which PyTorch build you want, shows the exact
-pip command and waits for a yes — it never installs anything silently:
+pip command and waits for a yes. It never installs anything silently:
 
 ```
 Windows        Check-Image-Tools.bat      (offers setup when something is missing)
@@ -144,27 +143,25 @@ your hardware; pick one, then `pip install transformers` either way:
 
 **Linux is straightforward.** The ROCm index above carries cp310–cp315
 wheels, so any supported Python works. You need the amdgpu/ROCm kernel
-driver — `rocm-smi` running is the sign it is there. One thing that looks
+driver, `rocm-smi` running is the sign it is there. One thing that looks
 wrong but isn't: a ROCm build still reports its device as `cuda`, because
 HIP deliberately reuses that namespace. `Device: cuda (Radeon …)` is
 correct.
 
 **Windows is awkward, and not because of this tool.** AMD publishes
 ROCm-for-Windows wheels only at `repo.radeon.com`, only for **Python 3.12**,
-and only as full-ABI `cp312` builds. Python 3.13/3.14 cannot load them —
-that is a wheel-ABI fact, not a flag: `--ignore-requires-python` skips the
+and only as full-ABI `cp312` builds. Python 3.13/3.14 cannot load them. That is a wheel-ABI fact, not a flag: `--ignore-requires-python` skips the
 check and the import then fails anyway. Upstream PyTorch ships no ROCm
 wheels for Windows at all.
 
 Three honest options:
 
 1. **Install Python 3.12 alongside** your main Python, run setup with it,
-   and point *only* the Embed stage at it —
-   `set IMGDEDUP_PYTHON=C:\Path\To\Python312\python.exe`. The toolkit already
+   and point *only* the Embed stage at it, `set IMGDEDUP_PYTHON=C:\Path\To\Python312\python.exe`. The toolkit already
    resolves an interpreter per stage, so Collect and Analyze stay on 3.14.
    You also need AMD's stated graphics driver (26.2.2 for ROCm 7.2.1).
 2. **Use the CPU build.** Embedding a few thousand images is a coffee, and
-   it is resumable — a perfectly reasonable choice.
+   it is resumable, a perfectly reasonable choice.
 3. Not recommended: `torch-directml`. In maintenance mode, last release
    2024, hard-pins `torch==2.4.1`, is *also* cp312-or-older, and is not a
    drop-in `cuda` device, so it costs the same Python constraint while
@@ -177,29 +174,29 @@ Not sure what you have? **Run the doctor first** (`Check-Image-Tools.bat` /
 `./imgdedup.sh doctor`). It lists every Python on the machine, tests each
 one *functionally*, reports your GPUs and whether a compute driver is
 actually present, and offers to install what is missing. torchvision is
-probed but **not needed** — it is only reported because a broken install of
+probed but **not needed**. It is only reported because a broken install of
 it takes transformers down (see [Troubleshooting](#troubleshooting)).
 
 ---
 
 ## How to run
 
-1. Copy the whole toolkit folder anywhere (or leave it where it is — the
+1. Copy the whole toolkit folder anywhere (or leave it where it is, the
    launchers find their scripts next to themselves).
 2. **Drag the folder you want scanned onto `Collect-Image-Inventory.bat`**
    (or double-click it to scan the folder the .bat sits in). The scan runs
    on a thread pool; ~1,600 images take well under a minute on an SSD.
 3. *(Optional but worth it)* drag the new `image-inventory.jsonl`, or its
-   folder — onto `Embed-Images.bat`. First run downloads the CLIP model
+   folder, onto `Embed-Images.bat`. First run downloads the CLIP model
    (~600 MB, cached forever after). This is what catches crops and edits.
 4. Drag the same folder onto `Analyze-Inventory.bat`.
 5. Open `<name>-report.html`, look at the pictures. Each group is labelled
-   **`cluster N`**, the same number the list uses — search the .txt for
+   **`cluster N`**, the same number the list uses, search the .txt for
    `cluster 91` to land on the same group (clicking the number in the
    report links to it). Then edit `<name>-list.txt` if you disagree with
-   any decision — the first character of a line is the whole interface:
+   any decision, the first character of a line is the whole interface:
    `X` deletes, `.` keeps. **Every cluster member is an editable line, the
-   suggested keeper included — prefer a different copy? Just move the `X`.**
+   suggested keeper included, prefer a different copy? Just move the `X`.**
 6. Run `Recycle-Duplicates.bat` (Windows) or `./Recycle-Duplicates.sh`
    (Linux/macOS), read the preview, answer `y`. Both just run
    `Recycle-Duplicates.py`, which is where every safety rule lives.
@@ -216,17 +213,17 @@ Restore it.
 
 ### Stage 1 — Collect
 
-Walks the folder tree — 17 extensions, the ones that actually turn up in an
+Walks the folder tree, 17 extensions, the ones that actually turn up in an
 image gallery: `.jpg .jpeg .jfif .jpe .png .apng .webp .gif .tif .tiff .bmp
 .tga .qoi`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
 cursors, Photoshop files, game textures and the legacy encodings are
 deliberately excluded (an asset folder reuses the same texture on purpose,
 so every "duplicate" found there is intended); `collect-image-inventory.py`
 lists each exclusion and the reason for it. Camera RAW is not supported at
-all — Pillow cannot decode it. It writes one JSON line per
+all, Pillow cannot decode it. It writes one JSON line per
 image: relative path, byte size, mtime, **SHA-256**, format, dimensions,
 key EXIF fields (timestamp, camera, software, orientation), a **JPEG
-quantization fingerprint** (`qsum` — lower means less recompressed), any
+quantization fingerprint** (`qsum`, lower means less recompressed), any
 **AI-generation text chunks** found in PNGs (Stable Diffusion / ComfyUI
 `parameters`), and a 128 px thumbnail, rotation-corrected, stored losslessly
 when that is smaller than JPEG.
@@ -238,8 +235,7 @@ when that is smaller than JPEG.
   once. Records stream out in scan order, so the output is deterministic.
 - **Resume.** Re-running offers to reuse the previous inventory: files with
   unchanged size+mtime are carried over without re-reading, so a re-scan
-  after a cleanup takes seconds. Unreadable files are always retried —
-  installing `pillow-heif` and re-running with resume fills in exactly the
+  after a cleanup takes seconds. Unreadable files are always retried, installing `pillow-heif` and re-running with resume fills in exactly the
   HEICs. The newest previous inventory wins, records from a different
   `--thumb` are never reused, and superseded inventory files are listed as
   safe to delete (it will not delete them itself).
@@ -263,24 +259,24 @@ keyed by the file's SHA-256, so renaming or moving images does not
 invalidate it, and byte-identical files share one vector.
 
 Why bother: pixel comparison cannot see that a cropped image is "the same
-picture" — the pixels genuinely differ. CLIP can. In testing this stage
+picture", the pixels genuinely differ. CLIP can. In testing this stage
 caught a crop whose pixel difference was **nine times** the duplicate
 threshold; no pixel method would ever have flagged it.
 
 - **Pipelined.** Images are decoded and preprocessed on a thread pool that
   runs ahead of the model, so the GPU never waits for the disk; JPEGs
   decode via libjpeg draft mode at ~4x the model input (`--no-draft` opts
-  out). EXIF orientation is applied before embedding — the same correction
+  out). EXIF orientation is applied before embedding, the same correction
   Stage 1 applies to thumbnails.
 - **GPU-first, honestly.** The launcher probes for a Python whose torch can
   actually drive a CUDA GPU before settling for a CPU build, and when the
-  embedder still lands on CPU it prints *why* — the usual culprit is the
+  embedder still lands on CPU it prints *why*, the usual culprit is the
   CPU-only torch wheel (`+cpu` in the version), which can never use a GPU
   regardless of code. `--device cuda` forces the matter (clean error if
   impossible), `--device cpu` opts out of the lecture.
 - **Resumable.** Re-running skips every SHA already embedded and appends;
   failed files are retried every run, like the collector. One pathological
-  image cannot kill the run — a failed batch is retried one image at a
+  image cannot kill the run, a failed batch is retried one image at a
   time and only the offender is logged. If a byte-identical twin of a
   missing file exists, the twin is read instead.
 - **Refuses to mix models.** A file built with a different model (or
@@ -306,35 +302,35 @@ pixels alone, and byte-identical files are always clustered:
 | **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, inpaints, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995, or containment ≥ 0.92 with CLIP ≥ 0.94, or luma/orientation match at duplicate level | `.` always |
 
 Within a cluster the **keeper** is chosen by highest resolution, then
-largest file, then finest JPEG quantization (`qsum`) — the
+largest file, then finest JPEG quantization (`qsum`), the
 least-recompressed copy, not just the biggest. It is only a *suggestion*:
 every member of every cluster is an editable line in the list.
 
 Numbers you will see in the report:
 
-- **mad** — mean absolute pixel difference, 0–255. 0 is identical; a JPEG
+- **mad**: mean absolute pixel difference, 0–255. 0 is identical; a JPEG
   re-save lands around 1–3; unrelated images land in the tens.
-- **cos** — CLIP semantic similarity. Beware its high baseline: in a
+- **cos**: CLIP semantic similarity. Beware its high baseline: in a
   single-genre library *random* pairs average ~0.76 and can exceed 0.98,
   which is why Tier A demands 0.99 *and* pixel agreement, not either alone.
-- **ncc** — how well the smaller image matches somewhere *inside* the
+- **ncc**: how well the smaller image matches somewhere *inside* the
   larger one (1.0 = perfect containment). This is the crop detector; it
   needs OpenCV, and the run tells you if that is missing.
 
 Long runs print per-stage elapsed times, so you can see where the time
 goes. If the folder is clean, Analyze writes **only the report** (which
-says so) — no selection list and no recycler. Stale outputs from earlier
+says so), no selection list and no recycler. Stale outputs from earlier
 runs are named for manual removal; it deletes nothing itself.
 
 ### Stage 4 — Recycle
 
 The generated `Recycle-Duplicates.py` (run via its `.bat` on Windows or
-`.sh` elsewhere — both only locate a Python) is deliberately paranoid, and
+`.sh` elsewhere. Both only locate a Python) is deliberately paranoid, and
 it enforces safety **per cluster**, not per line:
 
 1. a file marked `X` is deleted only while at least one *other* member of
    its cluster stays unmarked, still exists, and still matches its
-   scan-time SHA-256 — the *surviving witness*;
+   scan-time SHA-256, the *surviving witness*;
 2. a cluster with every member marked `X` is refused outright ("unmark at
    least one");
 3. the file itself must still match its scan-time size and SHA-256;
@@ -343,19 +339,19 @@ it enforces safety **per cluster**, not per line:
    refusal cannot be bypassed through a reference row;
 5. lines whose path matches nothing in the manifest are warned about and
    ignored rather than guessed at;
-6. on Windows, paths too long to recycle are **refused** — past ~260
+6. on Windows, paths too long to recycle are **refused**, past ~260
    resolved characters the OS deletes permanently while reporting success,
    so the recycler will not attempt them at all.
 
-A file that belongs to two clusters — an exact duplicate that is also the
-uncropped original of something — gets its editable line in exactly one;
+A file that belongs to two clusters, an exact duplicate that is also the
+uncropped original of something, gets its editable line in exactly one;
 the other shows it as an `also in cluster N (edit it there)` comment, so
 two lines can never disagree about the same file.
 
 This is what makes keeper-swapping safe: whichever copy you leave unmarked
-becomes the witness, and no edit — deliberate or accidental — can make a
+becomes the witness, and no edit, deliberate or accidental, can make a
 cluster lose its last verified copy. The script shows the count and total
-size, asks `y/N`, and moves files to the OS trash — never a permanent
+size, asks `y/N`, and moves files to the OS trash, never a permanent
 delete. The exit code is the number of failures.
 
 Trash backends: Windows uses the same Recycle-Bin call Explorer makes;
@@ -371,7 +367,7 @@ its trash directory is refused, not silently copied.
 
 Two layers, because they protect against different things.
 
-**The generated recycler protects against the world changing** — files
+**The generated recycler protects against the world changing**, files
 edited, moved, or replaced between scan and delete. That is the re-hashing
 above.
 
@@ -385,7 +381,7 @@ asserts four invariants over its own output:
 
 A violation aborts the run with nothing written. This is not theoretical:
 crop relationships chain (A is a crop of B, B of C), and an earlier
-revision built Tier B from raw pairs — leaving files marked KEEP in one
+revision built Tier B from raw pairs, leaving files marked KEEP in one
 entry and delete-candidate in another. The invariants exist because that
 happened, and `--self-test` re-proves all of them in a second.
 
@@ -439,8 +435,7 @@ more:
 
 **Interpreter choice.** The `.bat` launchers call `_pick-python.bat`;
 `imgdedup.sh` probes `python3.14` … `python3.9`, then `python3`/`python`.
-Both try `IMGDEDUP_PYTHON` first (always wins) and probe *functionally* —
-the candidate must actually import and call into the packages the stage
+Both try `IMGDEDUP_PYTHON` first (always wins) and probe *functionally*, the candidate must actually import and call into the packages the stage
 needs. To pin an interpreter for everything:
 
 ```
@@ -452,17 +447,17 @@ export IMGDEDUP_PYTHON=/usr/bin/python3.12       (Linux/macOS)
 
 ## Working with an AI assistant (optional)
 
-The toolkit is fully standalone — no stage needs an AI assistant, a network
+The toolkit is fully standalone, no stage needs an AI assistant, a network
 connection (after the one-time model download), or anything outside your
 machine. **By default nothing is copied anywhere.**
 
-If you *want* a second pair of eyes — asking your AI assistant (e.g.
-Claude) to sanity-check a borderline cluster or tune thresholds — pass
+If you *want* a second pair of eyes, asking your AI assistant (e.g.
+Claude) to sanity-check a borderline cluster or tune thresholds, pass
 `--share` to Collect or Embed. That drops a copy of the output into a
 shared data folder the assistant can be pointed at (per-platform default;
 `IMGDEDUP_SHARE_DIR` or `--mirror-dir <path>` to choose your own).
 
-The shared copy only ever contains inventories and embeddings — hashes,
+The shared copy only ever contains inventories and embeddings, hashes,
 metadata and small thumbnails, never your original image files.
 
 ---
@@ -503,17 +498,16 @@ machine.
   from an earlier pass, delete them; they no longer describe reality.
 - **`pip install torch` says "no matching distribution" on Python 3.14.**
   You are on the `cu121` index; it has no 3.14 wheels. Use `cu132` (or
-  `/cpu`). These suffixes move — `cu128` became `cu132`, so prefer the
+  `/cpu`). These suffixes move, `cu128` became `cu132`, so prefer the
   setup helper, which reads the current list from the index instead of
   trusting a number written here.
-- **Embed refuses to run: "built with a different model".** Deliberate —
-  vectors from different models are not comparable. Re-run with the old
+- **Embed refuses to run: "built with a different model".** Deliberate, vectors from different models are not comparable. Re-run with the old
   `--model`, or move/delete the embeddings file to start fresh.
 - **The run says OpenCV is missing.** Crop detection degrades to what CLIP
   alone can see. `pip install opencv-python-headless` fixes it (on a
   distro-managed Python, `./imgdedup.sh setup`; see PEP 668 above).
 - **HEIC/HEIF files show as unreadable.** Install `pillow-heif`, then
-  re-run Collect with `--resume` — only those files are re-read.
+  re-run Collect with `--resume`, only those files are re-read.
 - **Analyze is slow on a huge library.** It prints per-stage times, so you
   can see where it is. `--no-orient` skips rotation matching; on 36k
   images the full default run measured ~19 minutes on an adversarial
@@ -523,11 +517,9 @@ machine.
   newest automatically; the recycler and list carry the same `-2` suffix
   so they stay bound to each other.
 - **A cluster was refused with "no copy would survive", but its own lines
-  show a `.`.** One of its members is marked `X` in a different cluster —
-  the same file can appear in two, and the refusal names the file and
+  show a `.`.** One of its members is marked `X` in a different cluster, the same file can appear in two, and the refusal names the file and
   the cluster where it is editable. Unmark it there.
-- **A file I marked `X` was skipped or refused.** Read the printed reason —
-  its bytes (or its keeper's) changed since the scan, the keeper is gone,
+- **A file I marked `X` was skipped or refused.** Read the printed reason: its bytes (or its keeper's) changed since the scan, the keeper is gone,
   or on Windows its path is too long to recycle safely. That is the guard
   doing its job.
 
@@ -593,7 +585,7 @@ properly is a different tool, not a flag on this one.
 invariants, emission-plan rules, the pair-chaining case that caused the
 original keeper/candidate bug, and exact set-equality of the BLAS sweep
 against brute force (including pairs placed deliberately at the band
-edge). Every guard was validated by *mutation testing* — deliberately
+edge). Every guard was validated by *mutation testing*, deliberately
 re-breaking the code and confirming the check fires.
 
 The stages are tested end-to-end on synthetic image sets (exact copies,
@@ -618,13 +610,13 @@ notice.
 
 One clause is worth reading rather than skimming, because this tool moves
 your files: the software is provided **as is, without warranty**. It is
-built to be careful — nothing is deleted without a list you edited
+built to be careful. Nothing is deleted without a list you edited
 yourself, and everything goes to the recycle bin or trash rather than
 being erased, but the guarantees end at the license text. Keep backups
 of anything you cannot replace.
 
-Third-party dependencies — Pillow and NumPy, plus optionally OpenCV,
-PyTorch, Hugging Face Transformers and pillow-heif — are installed from
+Third-party dependencies, Pillow and NumPy, plus optionally OpenCV,
+PyTorch, Hugging Face Transformers and pillow-heif, are installed from
 PyPI under their own licenses, and none of their code is bundled here.
 
 One nuance if you ever ship a *frozen bundle* rather than source: a few
@@ -635,6 +627,6 @@ constrain this source release, which ships no one else's code.
 
 ---
 
-*The pipeline never deletes on its own — the human holds the list, the
+*The pipeline never deletes on its own, the human holds the list, the
 script holds the trash, and the trash holds everything else. Built with
 Claude, 2026.*

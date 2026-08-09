@@ -13,18 +13,18 @@ one outcome this tool exists to avoid.
   its sample indices with a *set* comprehension, so they deduplicated: a
   2-frame GIF emitted 384 bytes, 3-frame 576, 4-frame 768, ≥5 frames 960.
   Fingerprints of different lengths are positionally incomparable, and the
-  comparison treated that as "nothing to say" and returned True — which
+  comparison treated that as "nothing to say" and returned True, which
   reads as consent. Unrelated animations sharing a first frame have
   byte-identical thumbnails, so pixels and CLIP both agree and the
   fingerprint was the only thing standing between them and an automatic
   delete. Measured: **8 of 8 unrelated pairs allowed through, now 0 of 8**.
-  Fixed in both directions — the collector always emits 5 tiles now
+  Fixed in both directions, the collector always emits 5 tiles now
   (repeating an index when the animation is shorter, seeks still ascending
   for APNG), and a size mismatch falls back to the frame count instead of
   abstaining, because inventories written earlier today hold short ones.
 - **`I;16B` was dropped from the inventory entirely.** `point()` is
   implemented for `I`, `I;16` and `F` only; the byte-order variants raise.
-  `I;16B` is what a big-endian 16-bit TIFF opens as — ordinary scanner and
+  `I;16B` is what a big-endian 16-bit TIFF opens as, ordinary scanner and
   Adobe output, and the raise took `make_thumb` down, so the file got no
   sha, no thumbnail, and was never compared against anything. Converts via
   `I` now.
@@ -67,13 +67,12 @@ frame after the first.
 
 - **Five frames are sampled across the whole animation** and stored as an
   8x8 grey fingerprint each. Five rather than two because GIF seeking is a
-  *replay from frame 0*, not random access — 2.6 ms to reach frame 1 and
+  *replay from frame 0*, not random access, 2.6 ms to reach frame 1 and
   128 ms to reach frame 119 of the same file. Once the walk to the end is
   paid for, extra samples along the way are nearly free (K=4 and K=8 both
   measured 112 ms on a 120-frame GIF), so sampling generously costs nothing
   over sampling meanly.
-- **Only animations pay.** A 30-frame GIF costs 33 ms including the scan —
-  less than a 900×900 still at 38 ms. Stills store no fingerprint at all.
+- **Only animations pay.** A 30-frame GIF costs 33 ms including the scan, less than a 900×900 still at 38 ms. Stills store no fingerprint at all.
   The fingerprint is ~440 base64 characters against a thumbnail of several
   KB.
 - **`anim` is finally read.** README has promised since the field existed
@@ -84,7 +83,7 @@ frame after the first.
   refused any pair whose frame counts differed, and a real corpus of 2739
   GIFs disproved it immediately: four pixel-identical pairs were rejected
   purely on count, and the fingerprint scored them 0.97, 2.63, 2.94 and
-  10.25 — three of those sit *inside* the 0.00–1.93 range of the 45 pairs
+  10.25, three of those sit *inside* the 0.00–1.93 range of the 45 pairs
   that were allowed through. They were re-encodes with a few frames
   trimmed, not different animations. Frame count is now only the fallback
   for records with no fingerprint.
@@ -92,8 +91,7 @@ frame after the first.
   animation with matching counts scored 0.00–1.93; same animation trimmed,
   0.97–2.94; the same base clip where one file is a longer loop, 10.25;
   genuinely different animations, 62–85. Six sits above every confirmed
-  re-encode and below the loop variant, which is the right side to err on —
-  a trimmed or extended clip goes to review instead of onto a delete list,
+  re-encode and below the loop variant, which is the right side to err on, a trimmed or extended clip goes to review instead of onto a delete list,
   and the margin to 62 keeps unrelated animations out regardless.
   Net effect on that library: 48 Tier A clusters instead of 45, with one
   pair held back for review.
@@ -110,14 +108,14 @@ is pointed at:
 
 - **The libjpeg draft fast path was silently lost.** It was gated on
   `format == 'JPEG'`, so every MPO decoded at full resolution. Measured on
-  a 3000px frame: 750x750 drafted versus 3000x3000 undrafted — **16x the
+  a 3000px frame: 750x750 drafted versus 3000x3000 undrafted, **16x the
   pixels**, and 0.120s -> 0.061s per file. Fixed in both the collector and
   the embedder.
   This does move MPO thumbnails (UI content MAD 2.25), and that was worth
   checking rather than assuming, because a similar shift was rejected one
   version ago. Here it goes the right way: an MPO and an ordinary JPEG
   export of the *same photo* previously scored 1.87 against each other
-  because only one of them was drafted, and now score **0.80** — the pair a
+  because only one of them was drafted, and now score **0.80**, the pair a
   deduper most needs to match got 2.3x tighter. The earlier rejection was
   of a change that moved thumbnails away from everything for no gain; this
   one moves them toward their own twin.
@@ -138,7 +136,7 @@ that was measured, found dangerous, and rejected.
   `TruncatedFile: incomplete download or copy`, distinct from a genuinely
   corrupt file, because the user can go and re-fetch one and not the
   other. Detection is a structural walk of the container's own length
-  fields — JPEG segments, PNG chunks, RIFF size — over the bytes already
+  fields (JPEG segments, PNG chunks, RIFF size) over the bytes already
   read for the SHA-256, so it costs nothing. It touches no Pillow state
   and no globals, which matters at eight workers. Verified 12/12
   truncations caught across JPEG, PNG, WebP and EXIF-bearing JPEG, with
@@ -148,7 +146,7 @@ that was measured, found dangerous, and rejected.
   end-of-image marker. Anything unrecognised is never accused.
 - **`ImageFile.LOAD_TRUNCATED_IMAGES` was NOT enabled**, though it is the
   obvious fix and was the plan. Measured on this pipeline: Pillow fills
-  the undecoded remainder with a *constant* — grey for JPEG, black for
+  the undecoded remainder with a *constant*, grey for JPEG, black for
   PNG, so two unrelated photos cut to 1200 bytes both become the same
   flat square and score **MAD 0.0710** against a Tier A gate of 4.0.
   Intact, that pair scores 97.21. It is the 16-bit white-square bug again,
@@ -156,7 +154,7 @@ that was measured, found dangerous, and rejected.
   on a delete list.
   It also buys nothing. A truncated file does not match *its own intact
   original*: self-MAD 8.4 / 37.8 / 67.3 with 90% / 50% / 10% of the bytes
-  kept — every one outside the gate. So the feature would have added a
+  kept, every one outside the gate. So the feature would have added a
   false-delete risk in exchange for a duplicate match that does not
   happen. Partial pixels are never compared; the file is reported instead.
 
@@ -175,7 +173,7 @@ photos of being an attack.**
   `MemoryError`, reported to the user as nothing more than one more
   "unreadable" file.
   **Gated on size, deliberately.** `reduce()` followed by LANCZOS is not
-  identical to LANCZOS alone — measured at up to MAD 1.18 on sharp/UI
+  identical to LANCZOS alone, measured at up to MAD 1.18 on sharp/UI
   content, a third of the Tier A budget of 4.0. Applying it everywhere
   would shift every stored thumbnail to save memory on images that were
   never a problem. Verified: at 4, 36 and 80 Mpx the output is
@@ -190,7 +188,7 @@ photos of being an attack.**
   ... could be decompression bomb DOS attack.`
   To someone scanning their own holiday photos that reads as a crash and as
   an accusation. The guard is aimed at untrusted uploads; here the user
-  owns every file. Suppressed at module level — *not* with
+  owns every file. Suppressed at module level, *not* with
   `catch_warnings()`, which is process-global state and not thread-safe
   across the eight workers, and replaced with a plain summary of very
   large images, their sizes, and the `--workers` lever. Sizes come from the
@@ -204,14 +202,14 @@ photos of being an attack.**
 
 **Transparent images are composited, not flattened by accident.**
 `convert('RGB')` discards the alpha band and keeps whatever RGB happens to
-sit *under* transparent pixels — colour no human has ever seen, because
+sit *under* transparent pixels, colour no human has ever seen, because
 every viewer paints those pixels as background.
 
 Measured before: two cut-outs a human sees as identical (same black
 square, transparent background, junk RGB of `(255,0,0,0)` vs `(0,255,0,0)`
 underneath) scored **MAD 146** against each other and were never reported
 as duplicates. The same artwork saved once transparent and once flattened
-onto white missed each other the same way — a headline use case for a
+onto white missed each other the same way, a headline use case for a
 deduplicator, silently failing on the difference between two invisible
 backgrounds.
 
@@ -229,8 +227,7 @@ Two properties worth stating, both verified rather than assumed:
   that branch collapsed into this one. Confirmed silent for byte-array
   tRNS, integer tRNS and LA.
 
-`pre` becomes `exif+pil+flat`, and the resume warning is now cumulative —
-it names exactly which changes a given file predates, so an ancient file
+`pre` becomes `exif+pil+flat`, and the resume warning is now cumulative, it names exactly which changes a given file predates, so an ancient file
 is told all three and a nearly-current one only what actually differs.
 
 **This changes stored thumbnails and vectors for any image with
@@ -245,17 +242,17 @@ never produce.** Found while investigating two harmless-looking warnings.
 - **16-bit and float images were destroyed, then called duplicates of each
   other.** Pillow's `I;16 -> RGB` path *clips* at 255 instead of rescaling,
   so every pixel above 1/257 of full scale became pure white and a 16-bit
-  photo thumbnailed to a near-solid white square — Photoshop/Krita exports,
+  photo thumbnailed to a near-solid white square, Photoshop/Krita exports,
   depth maps, scientific TIFFs, AI-upscaler output.
   That is not merely an ugly thumbnail. Measured: two *visibly different*
   16-bit images both went 99.7% white and scored **MAD 0.71 against a Tier
-  A gate of 4.0** — reported as automatic duplicates, one of them offered
+  A gate of 4.0**, reported as automatic duplicates, one of them offered
   up for deletion. The identical pair as 8-bit scores 72.3 and is correctly
   rejected.
   Now rescaled before conversion. `1/257`, not `1/256`, because 257 is
   65535/255 and it makes a 16-bit image **byte-identical to its own 8-bit
   export** (verified, max diff 0). After the fix the two different images
-  score 72.29 — *exactly* the 8-bit number, and a 16-bit image against its
+  score 72.29, *exactly* the 8-bit number, and a 16-bit image against its
   own 8-bit twin scores 0.0000. So this removes a false positive **and**
   recovers a true positive the tool had been missing. 32-bit int and float
   carry no defined range, so those normalise by the image's own extrema.
@@ -273,7 +270,7 @@ Two warnings that fired on ordinary input and pointed at nothing useful:
 
 - **Palette transparency.** A PNG whose tRNS is a byte array (per-entry
   alpha) made Pillow warn on every `convert()`. Going via RGBA is what it
-  asks for and is pixel-identical — measured, since RGBA→RGB keeps the
+  asks for and is pixel-identical, measured, since RGBA→RGB keeps the
   palette colours and drops only the alpha channel RGB has no room for.
   pngquant and TinyPNG output hits this constantly. Worth noting the first
   version of this fix's own comment claimed one warning *per image*; CPython
@@ -281,7 +278,7 @@ Two warnings that fired on ordinary input and pointed at nothing useful:
   The comment now says so.
 - **torchvision.** transformers printed `CLIPImageProcessor requires
   torchvision (not installed); falling back to CLIPImageProcessorPil` and
-  then returned that class regardless — verified, both paths construct the
+  then returned that class regardless, verified, both paths construct the
   identical object. Asked for by name now. Deliberately unconditional
   rather than preferring the torchvision backend where it exists: the two
   resample differently, and vectors that depend on which optional package a
@@ -303,7 +300,7 @@ Two warnings that fired on ordinary input and pointed at nothing useful:
 ## v4.2.2 — 2026-08-08
 
 **pip itself is now checked before anything tries to use it.** It is not
-part of Python on most Linux distros — Arch splits it into `python-pip`,
+part of Python on most Linux distros, Arch splits it into `python-pip`,
 Debian into `python3-pip`, so a base install genuinely has none, and
 every command the toolkit printed would have died with `No module named
 pip`, which reads like a broken toolkit rather than a missing system
@@ -334,7 +331,7 @@ Three defects found while verifying, each worth more than the feature:
 - **The venv route is no longer recommended where it cannot be taken.**
   Debian 12 with `python3-pip` present but `python3-venv` absent is an
   ordinary state, and precisely the machine PEP 668 forces down that path.
-  Setup recommended, and under `--yes` auto-selected — a route the
+  Setup recommended, and under `--yes` auto-selected, a route the
   machine could not follow. Note the split is narrower than usually told:
   the `venv` module is in the base `python3`; `python3-venv` adds only
   `ensurepip` and the wheels, so `python3 -m venv` imports fine and *then*
@@ -345,7 +342,7 @@ Three defects found while verifying, each worth more than the feature:
   one was caught.
 
 Also: the missing-pip explanation no longer tells a Windows user that
-their situation is "normal on Linux" — same symptom, three different
+their situation is "normal on Linux", same symptom, three different
 causes, and it now names the one that applies.
 
 ## v4.2.1 — 2026-08-07
@@ -358,14 +355,13 @@ machine rather than by anything here.
   Ubuntu 23.04+, Fedora 38+ and Homebrew mark their interpreter
   *externally managed* ([PEP 668](https://peps.python.org/pep-0668/)) and
   pip refuses to install into it. `pip_base()` was appending `--user` on
-  exactly that path, on the assumption that `--user` is exempt. It is not
-  — pip rejects it identically, and blocks `pip uninstall` too (verified
+  exactly that path, on the assumption that `--user` is exempt. It is not, pip rejects it identically, and blocks `pip uninstall` too (verified
   against pip 26.2.1's own source, not from memory). Setup dead-ended
   with `pip exited 1` and no way forward.
   It now detects the marker and offers three routes, defaulting to the
   one that works: **a virtual environment beside the toolkit**, created
   and populated for you. `--break-system-packages` is offered but never
-  taken silently — it is the thing the distro is actively preventing.
+  taken silently. It is the thing the distro is actively preventing.
   Rather than guess package names, it quotes the marker's own `Error`
   text, so the advice is the distro's, and is right on distros this
   script has never heard of.
@@ -373,7 +369,7 @@ machine rather than by anything here.
   install into an environment no stage ever used.
 - **`in_venv()` matches pip's own test.** The first version also accepted
   `$VIRTUAL_ENV`, which an activated venv exports even while the
-  interpreter actually running is the system one — we would have believed
+  interpreter actually running is the system one. We would have believed
   ourselves exempt exactly where pip refuses.
 - **A failed base install no longer reports success.** The return value of
   the first `pip install` was discarded, so a refusal fell through to
@@ -389,19 +385,19 @@ machine rather than by anything here.
 ### Tests: the OpenCV-free path is now actually covered
 
 The `absdiff_mean` recursion below shipped because **every test here runs
-where OpenCV is installed**, so the fallback branch was unreachable — a
+where OpenCV is installed**, so the fallback branch was unreachable, a
 suite cannot cover a configuration it never enters. There are now 16
 checks that take OpenCV away and compare against the real thing.
 
 Two switches are needed and neither alone is enough: `_cv2 = None` reaches
 `absdiff_mean` and `imdecode_rgb`, but `compute_nccs` imports `cv2`
-*locally* and keeps scoring happily — only `sys.modules['cv2'] = None`
+*locally* and keeps scoring happily, only `sys.modules['cv2'] = None`
 reaches it. A test setting just the first would have proved nothing about
 the crop tier.
 
 Validated by mutation, as everything else here is: reintroducing the
 recursion produces 6 failures, swapping the Pillow fallback to BGR
-produces 3, and making `compute_nccs` raise produces 1 — with no
+produces 3, and making `compute_nccs` raise produces 1, with no
 traceback in any case, because a check that raises is reported as a
 failure rather than killing the run and hiding every check after it.
 
@@ -411,7 +407,7 @@ failure rather than killing the run and hiding every check after it.
 default.** Everything was measured before and after; nothing here is a
 guess, and two promising ideas were *rejected* on the evidence.
 
-Default (nothing to opt into, detection unchanged — recall still 20/20 with
+Default (nothing to opt into, detection unchanged, recall still 20/20 with
 embeddings, 15/20 without, zero false positives):
 
 - **Orientation matching 4.4x faster**, the analyzer's single biggest cost
@@ -424,16 +420,16 @@ embeddings, 15/20 without, zero false positives):
   real rotated copy still scores exactly 0.0000.
 - **Thumbnail decoding ~2.6x faster** via `cv2.imdecode`, verified
   **pixel-identical** to Pillow across 240 JPEG and lossless-WebP
-  thumbnails in both orientations — byte-for-byte, not merely close. Falls
+  thumbnails in both orientations, byte-for-byte, not merely close. Falls
   back to Pillow when OpenCV is absent.
 - **Pixel scoring ~1.3x faster** using `cv2.absdiff` on uint8 instead of
   building float32 temporaries. Worth stating plainly: the values move by
-  ~1e-6, and they move in the *more accurate* direction — absdiff's mean
+  ~1e-6, and they move in the *more accurate* direction, absdiff's mean
   accumulates in float64 where the old path accumulated in float32. No tier
   verdict changed in measurement.
   **Fixed same day, after release:** this edit also replaced the
   OpenCV-free fallback with a call to the function itself, so Analyze died
-  with `RecursionError` on any machine without OpenCV — a configuration
+  with `RecursionError` on any machine without OpenCV, a configuration
   `requirements.txt` explicitly calls optional. Nothing caught it because
   the self-test runs where OpenCV is installed, so the fallback branch was
   never entered. The numpy path is restored and now checked against
@@ -445,12 +441,12 @@ embeddings, 15/20 without, zero false positives):
 
 Opt-in, because they change stored bytes or vectors:
 
-- **`--fp16`** (Embed): float16 on the GPU, **2.9x faster** — 343 -> 999
+- **`--fp16`** (Embed): float16 on the GPU, **2.9x faster**, 343 -> 999
   img/s measured on a batch of 64. Vectors shift: max pairwise-cosine change
   0.0006, enough to move a pair sitting exactly on the Tier A cosine floor
   into the review tier. The header records `"prec"`, and resuming a file
   built at the other precision now **stops** rather than silently mixing
-  vectors — the same guard the model check has always had.
+  vectors, the same guard the model check has always had.
 - **`--fast-thumbs`** (Collect): skips the lossless-WebP attempt, **~2.7x
   faster scanning** (35 ms -> 13 ms per image). Thumbnails become always-JPEG,
   so flat/UI content loses its smaller lossless copy and its stored pixels
@@ -474,41 +470,39 @@ Opt-in, because they change stored bytes or vectors:
 
 **AMD and Intel GPUs, and a setup helper that installs the right one.**
 
-- **`_setup.py` — one guided installer, shared by every launcher.**
+- **`_setup.py`, one guided installer, shared by every launcher.**
   `./imgdedup.sh setup`, `Check-Image-Tools.bat`, and each per-stage `.bat`
   all hand off to it rather than carrying their own install logic; the
   `.bat` side goes through `_offer-setup.bat` for the same reason. Code
   that *changes the user's machine* is the last place to let three
   launchers drift apart. It detects the GPU, asks which PyTorch build you
-  want, prints the exact command and waits for a yes — never silent, and
+  want, prints the exact command and waits for a yes, never silent, and
   it installs `torch` only (never `torchvision`, which nothing here needs
   and a stale copy of which breaks transformers).
 - **GPU detection without vendor toolchains.** `rocm-smi`/`nvidia-smi` only
   exist *after* a working install, which is precisely the case setup is
-  fixing. It reads PCI vendor IDs instead — sysfs `/sys/class/drm/card*`
+  fixing. It reads PCI vendor IDs instead, sysfs `/sys/class/drm/card*`
   on Linux, `Win32_VideoController` PNPDeviceID on Windows (`wmic` is
   deprecated). Same ID space both sides, so one vendor table serves both.
   Those tools are still used, but only to tell "card present" from
-  "compute driver usable" — a distinction the report now makes.
+  "compute driver usable", a distinction the report now makes.
 - **Fixed: the embedder told AMD users their GPU could never work.**
   `resolve_device` treated any build without `torch.version.cuda` as
   CPU-only and prescribed a CUDA wheel. But a ROCm build reports
   `torch.cuda.is_available() == True` (HIP reuses the `torch.cuda`
-  namespace) and `torch.version.cuda` is **not** a reliable discriminator —
-  PyTorch's own `collect_env.py` overrides it inside the HIP branch. Build
+  namespace) and `torch.version.cuda` is **not** a reliable discriminator, PyTorch's own `collect_env.py` overrides it inside the HIP branch. Build
   detection now checks `torch.version.hip` first, and every fallback
   message names the vendor actually present. Intel XPU and Apple Metal are
   recognised too.
 - **Index versions are discovered, not hardcoded.** The stable ROCm index
-  moved 6.4 → 7.0 → 7.1 → 7.2 in a few releases, and CUDA is now `cu132` —
-  the `cu128` this README had been repeating was already stale. Setup reads
+  moved 6.4 → 7.0 → 7.1 → 7.2 in a few releases, and CUDA is now `cu132`, the `cu128` this README had been repeating was already stale. Setup reads
   the live PEP-503 listing and sorts **numerically**: `rocm7.14` is newer
   than `rocm7.2`, which both string and float comparison get backwards.
   Pinned values remain only as an offline fallback.
 - **AMD on Windows is explained instead of half-offered.** AMD ships
   ROCm-for-Windows only as full-ABI `cp312` wheels from `repo.radeon.com`;
   3.13/3.14 cannot load them, and no flag changes that. Setup detects the
-  case and points at the fix that actually works — install Python 3.12
+  case and points at the fix that actually works, install Python 3.12
   alongside and aim *only* the Embed stage at it with `IMGDEDUP_PYTHON`,
   which the per-stage interpreter resolution already supports. `torch-directml`
   is documented as a dead end (maintenance mode, 2024, pins torch 2.4.1,
@@ -529,19 +523,18 @@ the 20/20 detection truth set re-checked after every change:
   actual free memory; decoded on demand with a bounded cache otherwise.
 - **CLIP candidates bounded per image** (`--clip-neighbors`, default 48).
   A flat cosine-0.90 floor admitted a *fifth of all pairs* on a
-  high-baseline library — 130M pairs at 36k. A duplicate is always among
+  high-baseline library, 130M pairs at 36k. A duplicate is always among
   its original's nearest neighbours, so top-K finds the same pairs while
   the count stays linear. A binding cap is reported, never silent.
 - **Expensive per-pair tests (luma, orientation) run last**, only on pairs
   every cheaper test rejected, each behind a coarse 8×8 screen with a wide
   3× margin. Measured: luma 1.65M → 546k pairs, orientation 1.65M → 235k.
-- **Orientation sweep skipped when embeddings exist** — it is seven extra
+- **Orientation sweep skipped when embeddings exist**: it is seven extra
   full O(n²) passes whose only job is discovering rotated pairs on pixels
   alone, which CLIP (rotation-insensitive) has already done. Still runs
   with `--no-embeddings`, where it is genuinely needed.
 - **The all-pairs sweep is banded**: `mean|a-b| >= |mean(a)-mean(b)|`, so
-  rows sorted by signature mean only need comparing within `cut`. Exact —
-  `--self-test` proves set equality with brute force, including a pair
+  rows sorted by signature mean only need comparing within `cut`. Exact, `--self-test` proves set equality with brute force, including a pair
   placed deliberately just inside the band edge. 166s → 89s at 36k.
 - Gram matrix in float32 with a widened bound (survivors re-checked
   exactly); the exact re-check no longer materialises ~800 MB of
@@ -555,7 +548,7 @@ are substantially faster.
 verified by reproduction before fixing):
 
 - **Volumes without a Recycle Bin are refused on Windows.** On removable /
-  FAT drives and network paths the shell delete call does not fail — it
+  FAT drives and network paths the shell delete call does not fail. It
   silently deletes PERMANENTLY and reports success, same family as the
   long-path case. The recycler now refuses UNC paths and queries the
   volume for a usable bin (`SHQueryRecycleBinW`) before touching anything.
@@ -565,7 +558,7 @@ verified by reproduction before fixing):
   from the embeddings file (analyze accepts ≥50% coverage) had no path
   left that could discover their rotated copies. The sweep now runs for
   exactly the uncovered rows, using re-oriented signature grids (pure
-  permutations — no decodes), so it costs |uncovered|×n, not n².
+  permutations, no decodes), so it costs |uncovered|×n, not n².
 - **A filename containing a newline can no longer forge mark lines.**
   Written raw into the selection list, such a name splits across lines and
   everything after the newline parses as a fresh mark that can override
@@ -577,7 +570,7 @@ verified by reproduction before fixing):
   something was actually dropped. `imgdedup.sh` help no longer truncates
   mid-sentence (the sed range now tracks the header's closing rule). The
   embedder docstring no longer claims an AI assistant consumes the
-  embeddings — the analyzer does. The developer-machine venv path is gone
+  embeddings; the analyzer does. The developer-machine venv path is gone
   from all four files that carried it, along with its fallback probes.
 - Refuted by the same review, for the record: the ThumbStore preload was
   claimed to complete a doomed decode before falling back (it cancels),
@@ -591,21 +584,20 @@ deletion stage existed only as PowerShell, so elsewhere the pipeline
 stopped one step short of useful.
 
 - **One recycler, every OS**: `Recycle-Duplicates.py` plus thin `.bat`/`.sh`
-  launchers that only find a Python. Every safety rule lives in one place —
-  the deciding argument, since duplicated launcher logic was a real v3 bug
+  launchers that only find a Python. Every safety rule lives in one place, the deciding argument, since duplicated launcher logic was a real v3 bug
   and v3.8 found a critical hole in the PowerShell survivor rule. The
   manifest is JSON, retiring the PowerShell quoting problem entirely.
   **Regenerate any `Recycle-Duplicates*.ps1` you still intend to run.**
 - **Trash on every platform, never permanent deletion.** Windows:
   `SHFileOperationW` + `FOF_ALLOWUNDO` (Explorer's own call), with a
-  correct `SHFILEOPSTRUCTW` declaration — the widely-copied one is wrong
-  on 32-bit. Linux: the freedesktop.org Trash spec — per-volume trash
+  correct `SHFILEOPSTRUCTW` declaration, the widely-copied one is wrong
+  on 32-bit. Linux: the freedesktop.org Trash spec, per-volume trash
   dirs, `.trashinfo` with RFC 2396 byte-wise encoding, collisions won by
   `O_EXCL` (trashing six `IMG_1234.jpg` from six folders is this tool's
   normal case). macOS: `~/.Trash` ("Put Back" needs private metadata; said
   plainly rather than pretended). Cross-filesystem trashing is refused,
-  not silently turned into a whole-file copy — glib refuses too.
-- **`./imgdedup.sh collect|embed|analyze|doctor`** — one POSIX entry point
+  not silently turned into a whole-file copy, glib refuses too.
+- **`./imgdedup.sh collect|embed|analyze|doctor`**: one POSIX entry point
   with the same functional interpreter probing as the `.bat` fleet.
 - **Fixed for Linux:** `--share`'s hardcoded `C:\Users\...` path would
   have silently created a directory *named* that on POSIX (now a
@@ -618,13 +610,13 @@ stopped one step short of useful.
   elsewhere) and gives platform-correct advice.
 
 Tested as far as this Windows machine allows: the freedesktop backend
-against real files via `XDG_DATA_HOME` (24 checks — layout, header, date
+against real files via `XDG_DATA_HOME` (24 checks, layout, header, date
 format, encoding incl. non-ASCII and newlines, same-name collisions, stray
 files never overwritten, symlink not target), generated `.sh` under a real
 `sh`, the full pipeline through `imgdedup.sh`, and the 13-case recycler
 safety suite with a verified Recycle-Bin round-trip. **Not verified:**
 cross-filesystem trashing, desktop "Restore" integration,
-undecodable-filename round-trips — those need a real Linux box.
+undecodable-filename round-trips, those need a real Linux box.
 
 ## v3.10 — 2026-08-07
 
@@ -646,10 +638,10 @@ undecodable-filename round-trips — those need a real Linux box.
   candidates (all eight orientations now swept; `--no-orient` opts out);
   grayscale copies missed (luma compared when colour rejects); gentle
   crops lost to scale-grid quantisation (0.9→1.0 jump; grid now finer).
-  Everything routes to **Tier B (review)** — verified Tier A output
+  Everything routes to **Tier B (review)**, verified Tier A output
   byte-identical on a 3,050-image run.
 - Cost at 3,050 images: 13.6s without orientation, 23.0s with. A cheaper
-  luma gate was tried and **reverted** — it cost three truth-set cases and
+  luma gate was tried and **reverted**. It cost three truth-set cases and
   saved nothing. Without Embed the set scores 15/20 (CLIP is what
   nominates brightness/grayscale/crop pairs).
 
@@ -659,20 +651,20 @@ undecodable-filename round-trips — those need a real Linux box.
 against shipped code first.
 
 - **CRITICAL: one filename could abort an entire scan.** v3.8's filename
-  restore used `re.sub(..., repr(rel), ...)` — a string replacement is a
+  restore used `re.sub(..., repr(rel), ...)`. A string replacement is a
   regex *template*, and `repr()` of a non-printable (U+00A0 from a
   browser paste, soft hyphen, BOM) emits `\xNN`, which the template
   parser rejects. The error handler itself raised, truncating the scan
   with a footer claiming zero errors. Now a callable replacement, and the
   handler is wrapped so "never raises" is actually true.
-- **Aspect-changing crops were still invisible** — v3.8 fixed only the
+- **Aspect-changing crops were still invisible**: v3.8 fixed only the
   exact-area tie, but thumbnails are capped on the long side, so a
   square crop of a 16:9 photo gets the *larger* thumbnail and the
   original was searched inside its own crop. Both directions always tried
   now; measured 0.406 → 0.963 on a real crop (gate 0.92). Strictly
   additive over 106 verified pairs.
 - The cross-cluster refusal's explanatory branch was dead code (iterated
-  the already-filtered list) — the blocking file is now named. The
+  the already-filtered list), the blocking file is now named. The
   embedder recorded the first path instead of the path actually read when
   twin fallback engaged. An explicit `--mirror-dir` beside the scan root
   silently copied nothing. `errors='replace'` narrowed to stdout only.
@@ -681,7 +673,7 @@ against shipped code first.
   only relation was to those drops. The drops' Tier A keeper now stands
   in (same pixels), nothing pre-marked; moved into `build_tier_b()` so
   `--self-test` proves all three cases.
-- **The report is dark-themed** — read next to pictures, the thumbnails
+- **The report is dark-themed**: read next to pictures, the thumbnails
   should be the brightest thing on screen. Same colour language.
 
 ## v3.8 — 2026-08-07
@@ -691,15 +683,14 @@ real 5,011-image scan, and new self-test cases.
 
 - **CRITICAL: the Recycle script could delete a file its own safety rule
   had just refused.** A file shared by two clusters produced a deletion
-  plan entry in both — at worst bypassing a home cluster's refusal through
+  plan entry in both, at worst bypassing a home cluster's refusal through
   the reference row and recycling the last intact copy. Latent since v3.5.
   X-selection now requires the cluster to own the row; references still
   count as witnesses.
 - Crop detection was direction-blind for same-size thumbnails (the
-  equal-area tie made container choice arbitrary — filename order decided
+  equal-area tie made container choice arbitrary, filename order decided
   whether a crop was found). Equal-area pairs now try both directions.
-- Tier B groups with no suggested deletions were silently discarded —
-  including files with no other cluster, which then appeared nowhere.
+- Tier B groups with no suggested deletions were silently discarded, including files with no other cluster, which then appeared nowhere.
   Now emitted as informational clusters, nothing pre-marked.
 - The analyzer allocated a full n×n CLIP matrix (~10 GB at 50k images);
   now computed per row block, byte-identical output.
@@ -712,7 +703,7 @@ real 5,011-image scan, and new self-test cases.
 
 ## v3.7 — 2026-08-06
 
-**Speed pass over all three stages — same results, proved.** Inventory
+**Speed pass over all three stages, same results, proved.** Inventory
 records/thumbnails byte-identical, analyzer list/report byte-identical on
 identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
 
@@ -726,7 +717,7 @@ identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
   provably lossless bound (self-test asserts set equality), uint8 thumbs,
   threaded scoring, per-image grayscale/template caches.
 - **Detection fixes:** a sha missing from the embeddings file read as
-  cosine 0.0 and silently blocked every tier — even byte-identical copies
+  cosine 0.0 and silently blocked every tier, even byte-identical copies
   (missing now means "judge by pixels"; SHA-equal files force-clustered).
   The embedder ignored EXIF orientation while thumbnails corrected it, so
   the CLIP veto blocked genuinely identical rotated pairs (header records
@@ -753,7 +744,7 @@ identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
 ## v3.5 — 2026-08-06
 
 - **Fixed: one file could get an editable line in two clusters**, and the
-  lines could disagree — the Recycle script keys marks by filename, last
+  lines could disagree, the Recycle script keys marks by filename, last
   line wins, which turned one real cluster's `.`+`X` into "every copy is
   marked X". First cluster to claim a file now owns its line (Tier A
   first); others show a comment. A new `check_emission` invariant refuses
@@ -763,7 +754,7 @@ identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
 
 - **Survives a stale torchvision after a torch reinstall** ("DLL load
   failed" from `_C.pyd` linked against a replaced torch). The embedder
-  hides a present-but-unloadable torchvision — transformers then uses its
+  hides a present-but-unloadable torchvision, transformers then uses its
   Pillow path, same vectors, and prints both cleanup options. Nothing in
   this toolkit needs torchvision; it is probed only because a broken one
   takes transformers down. The old error blamed the wrong causes.
@@ -789,7 +780,7 @@ identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
 
 ## v3 — 2026-08-05
 
-**New: `analyze-inventory.py`** — the duplicate analysis is a tested
+**New: `analyze-inventory.py`**, the duplicate analysis is a tested
 script, not logic re-derived per run.
 
 - **Keeper/candidate collision fixed**: crop relationships chain, and
@@ -798,7 +789,7 @@ script, not logic re-derived per run.
   clustered before keeper election; four invariants asserted before
   anything is written; violation aborts. `--self-test` added, every
   check mutation-tested.
-- Clean folders get only the report — no empty-manifest deletion script;
+- Clean folders get only the report, no empty-manifest deletion script;
   stale outputs are named for manual removal.
 - **Launcher fleet drift fixed**: three launchers with three different
   interpreter orders became one shared `_pick-python.bat` with functional
