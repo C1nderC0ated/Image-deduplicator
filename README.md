@@ -1,15 +1,16 @@
 # Image Inventorization
 
-A three-stage, fully local pipeline that finds **duplicate, re-encoded,
-resized, rotated, mirrored and cropped images** in large libraries (tested
-from 1,500 to 36,000 images). Everything runs on your own machine — no
-uploads, no cloud, no accounts. Windows, Linux and macOS.
+A three-stage pipeline that finds duplicate, re-encoded, resized, rotated,
+mirrored and cropped images in large libraries. Tested from 1,500 to 36,000
+images. Everything runs on your own machine: nothing is uploaded, and there
+is no account to make. Runs on Windows, Linux and macOS.
 
-Nothing is ever deleted automatically. The pipeline's only output is a
-visual report, an editable selection list, and a recycler script that
-re-verifies every file at the moment of deletion and asks for confirmation.
-There is no silent "clean everything" — you review, you choose, and
-everything it removes lands in your **Recycle Bin / Trash**, not oblivion.
+Nothing is ever deleted automatically. The pipeline produces a visual
+report, a selection list you edit yourself, and a recycler script that
+re-checks every file at the moment of deletion and asks before doing
+anything. There is no "clean everything" button. You read the report, mark
+what should go, and whatever the recycler removes lands in the Recycle Bin
+or Trash rather than being erased.
 
 ```
 your image folder
@@ -68,7 +69,7 @@ Generated at run time, next to your images:
 
 - **Windows 10/11, Linux, or macOS.** Windows gets a `.bat` per stage to
   drag folders onto; elsewhere use `./imgdedup.sh`. GPU acceleration (Embed
-  only) works with **NVIDIA, AMD and Intel** — see [AMD GPUs](#amd-gpus)
+  only) works with **NVIDIA, AMD and Intel**; see [AMD GPUs](#amd-gpus)
   for the one platform that needs care. Deleted files go to the
   Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively — never a
   permanent delete on any of them.
@@ -91,7 +92,7 @@ Generated at run time, next to your images:
   12+, Ubuntu 23.04+, Fedora 38+ and Homebrew all mark their Python as
   *externally managed* ([PEP 668](https://peps.python.org/pep-0668/)), and
   pip refuses to install into it at all. `--user` is refused too — that is
-  the part that catches people out — and so is `pip uninstall`. There, the
+  the part that catches people out, and so is `pip uninstall`. There, the
   install **must** go into a virtual environment. `./imgdedup.sh setup`
   detects this, offers to create one beside the toolkit, and installs into
   it; every launcher then prefers that `.venv` over the system Python
@@ -100,7 +101,7 @@ Generated at run time, next to your images:
   **`pip` may not be there at all**, which is a different problem with a
   different fix. It is packaged separately from Python on most distros —
   `python-pip` on Arch, `python3-pip` on Debian/Ubuntu, `python314-pip`
-  and friends on openSUSE — so a base install has none, and every pip
+  and friends on openSUSE, so a base install has none, and every pip
   command simply reports `No module named pip`. Setup and
   `./imgdedup.sh doctor` both check and name the package. Where pip is
   missing but `venv` works, a virtual environment supplies its own, so the
@@ -121,7 +122,7 @@ The per-stage launchers do the same: if a stage cannot run, they offer
 setup instead of just failing.
 
 By hand, PyTorch is installed separately because the right build depends on
-your hardware — pick one, then `pip install transformers` either way:
+your hardware; pick one, then `pip install transformers` either way:
 
 | Hardware | Command |
 |---|---|
@@ -166,7 +167,7 @@ Three honest options:
    it is resumable — a perfectly reasonable choice.
 3. Not recommended: `torch-directml`. In maintenance mode, last release
    2024, hard-pins `torch==2.4.1`, is *also* cp312-or-older, and is not a
-   drop-in `cuda` device — so it costs the same Python constraint while
+   drop-in `cuda` device, so it costs the same Python constraint while
    adding an incompatible device API.
 
 Setup detects which case you are in and says so, instead of printing a
@@ -188,7 +189,7 @@ it takes transformers down (see [Troubleshooting](#troubleshooting)).
 2. **Drag the folder you want scanned onto `Collect-Image-Inventory.bat`**
    (or double-click it to scan the folder the .bat sits in). The scan runs
    on a thread pool; ~1,600 images take well under a minute on an SSD.
-3. *(Optional but worth it)* drag the new `image-inventory.jsonl` — or its
+3. *(Optional but worth it)* drag the new `image-inventory.jsonl`, or its
    folder — onto `Embed-Images.bat`. First run downloads the CLIP model
    (~600 MB, cached forever after). This is what catches crops and edits.
 4. Drag the same folder onto `Analyze-Inventory.bat`.
@@ -468,29 +469,29 @@ metadata and small thumbnails, never your original image files.
 
 ## Troubleshooting
 
-Newest lessons first — most of these were discovered the hard way, on this
-very machine.
+Newest lessons first. Most were discovered the hard way, on this very
+machine.
 
 - **After reinstalling torch, Embed dies with "entry point not found" /
   "DLL load failed while importing _C" pointing at `torchvision\_C.pyd`.**
   torchvision's compiled extension is linked against one exact torch
-  build, so replacing torch leaves it stale — and it still *looks*
-  installed, which is why transformers picks it up and dies. The embedder
-  detects this, ignores the broken torchvision and carries on via Pillow —
-  **nothing in this toolkit needs torchvision** — but clean it up:
+  build, so replacing torch leaves it stale. It still *looks* installed,
+  which is why transformers picks it up and dies. The embedder detects
+  this, ignores the broken torchvision and carries on via Pillow, since
+  nothing in this toolkit needs torchvision. Clean it up anyway:
   `pip uninstall torchvision`, or reinstall the matched pair with
   `pip install --force-reinstall torch torchvision --index-url
   https://download.pytorch.org/whl/cu132`. Rule of thumb: torch and
   torchvision must be reinstalled together, always.
 - **Embedding runs on the CPU although I have an Nvidia GPU.** Almost
-  always the installed torch is the CPU-only wheel — the version says so
-  (`2.x.y+cpu`) — and no setting can route a `+cpu` build to a GPU. The
+  always the installed torch is the CPU-only wheel. The version says so
+  (`2.x.y+cpu`), and no setting can route a `+cpu` build to a GPU. The
   doctor and the embedder both name the fix:
   `pip uninstall torch` then
   `pip install torch --index-url https://download.pytorch.org/whl/cu132`.
-  Only the **Embed** stage uses the GPU at all; Collect and Analyze on CPU
-  is correct, not a bug.
-- **A tool picked a Python that "has" a package, yet imports fail — or the
+  Only the Embed stage uses the GPU at all; Collect and Analyze on CPU is
+  correct, not a bug.
+- **A tool picked a Python that "has" a package, yet imports fail, or the
   doctor shows `[EMPTY]`.** A package whose files were deleted but whose
   *folder* survived still imports as an empty namespace package, so plain
   `pip list` / `import` checks lie. Every probe in this toolkit is
@@ -502,7 +503,7 @@ very machine.
   from an earlier pass, delete them; they no longer describe reality.
 - **`pip install torch` says "no matching distribution" on Python 3.14.**
   You are on the `cu121` index; it has no 3.14 wheels. Use `cu132` (or
-  `/cpu`). These suffixes move — `cu128` became `cu132` — so prefer the
+  `/cpu`). These suffixes move — `cu128` became `cu132`, so prefer the
   setup helper, which reads the current list from the index instead of
   trusting a number written here.
 - **Embed refuses to run: "built with a different model".** Deliberate —
@@ -510,7 +511,7 @@ very machine.
   `--model`, or move/delete the embeddings file to start fresh.
 - **The run says OpenCV is missing.** Crop detection degrades to what CLIP
   alone can see. `pip install opencv-python-headless` fixes it (on a
-  distro-managed Python, `./imgdedup.sh setup` — see PEP 668 above).
+  distro-managed Python, `./imgdedup.sh setup`; see PEP 668 above).
 - **HEIC/HEIF files show as unreadable.** Install `pillow-heif`, then
   re-run Collect with `--resume` — only those files are re-read.
 - **Analyze is slow on a huge library.** It prints per-stage times, so you
@@ -523,7 +524,7 @@ very machine.
   so they stay bound to each other.
 - **A cluster was refused with "no copy would survive", but its own lines
   show a `.`.** One of its members is marked `X` in a different cluster —
-  the same file can appear in two — and the refusal names the file and
+  the same file can appear in two, and the refusal names the file and
   the cluster where it is editable. Unmark it there.
 - **A file I marked `X` was skipped or refused.** Read the printed reason —
   its bytes (or its keeper's) changed since the scan, the keeper is gone,
@@ -534,45 +535,55 @@ very machine.
 
 ## Notes & caveats
 
-- **Comparisons run on 128 px thumbnails,** which is what makes a
-  million-pair sweep fast. Thresholds were calibrated against real
-  libraries with contact-sheet review: a JPEG re-save scores mad ≈ 1–3,
-  genuinely different images 10+. Borderline pairs are surfaced in Tier B
-  rather than decided.
-- **Tier B is a review queue, not a verdict.** Same-prompt AI re-rolls,
-  inpaint variants and crops are *structurally* alike; only you know which
-  ones you consider "the same picture". That is why it is pre-set to `.`.
-- **What it will miss.** Crops retaining under ~⅓ of the original; and —
-  without the Embed stage — brightness/colour edits and crops, because
-  nothing then nominates those pairs for scoring. On a 20-case truth set
-  of known same-picture transformations the pipeline finds **20/20 with
-  embeddings, 15/20 without** — run the semantic stage.
-- **Animated GIF/WebP/APNG** are compared by **five frames sampled across
-  the whole animation**, not just the first. Frame 0 alone is not enough:
-  two entirely different animations that happen to start the same score a
-  perfect pixel match, and so does a still lifted out of a GIF. Both were
-  being reported as automatic duplicates. An animation and a still are now
-  never auto-deleted against each other, nor are two animations whose
-  frames diverge — those go to the review tier instead of a delete list.
-  Only animations pay for the scan: a 30-frame GIF costs about as much as
-  one 900×900 photo, and the frame fingerprint adds ~440 characters beside
-  a thumbnail of several KB.
-- **Video is out of scope**, and not only because decoding it is expensive.
-  A GIF is an image file Pillow already opens, so extending to it cost one
-  seek loop. Video would need a decoder this toolkit does not have —
-  OpenCV's wheels bundle FFmpeg, but OpenCV is *optional* here, so video
-  would either become a hard dependency or work only sometimes, which is
-  worse than not working. The deeper problem is that the pixel-plus-CLIP
-  model does not describe video: the same clip in two containers, at two
-  frame rates, from a resolution ladder, or trimmed a second differently is
-  the same video and would score as unrelated. And the safety model does
-  not survive the trip — the whole design rests on you *seeing* a thumbnail
-  of each file before approving a deletion, which one still frame of a
-  ten-minute video cannot give you. Deduplicating video properly is a
-  different tool, not a flag on this one.
-- **Unicode-safe** — paths in Cyrillic, Japanese, emoji, typographic
-  quotes, non-printable characters; each of those became a test case after
-  breaking something once.
+Comparisons run on 128 px thumbnails, which is what makes a million-pair
+sweep fast. The thresholds were calibrated against real libraries with
+contact-sheet review: a JPEG re-save scores mad ≈ 1–3, genuinely different
+images 10 or more. Borderline pairs get surfaced in Tier B rather than
+decided.
+
+Tier B is a review queue, not a verdict. Same-prompt AI re-rolls, inpaint
+variants and crops are *structurally* alike, and only you know which of
+them you count as "the same picture". That is why every line there starts
+pre-set to `.`.
+
+What it will miss: crops retaining under about a third of the original,
+and, without the Embed stage, brightness or colour edits, because nothing
+nominates those pairs for scoring in the first place. Against a 20-case
+truth set of known same-picture transformations the pipeline finds
+**20/20 with embeddings and 15/20 without**, so run the semantic stage.
+
+Animated GIF, WebP and APNG are compared by five frames sampled across the
+whole animation rather than by the first one alone. Frame 0 is not enough:
+two completely different animations that happen to start the same way
+score a perfect pixel match, and so does a still lifted out of a GIF. Both
+used to be reported as automatic duplicates. An animation and a still are
+now never auto-deleted against each other, and neither are two animations
+whose frames diverge; those go to the review tier instead. Only animations
+pay for the scan, and not much: a 30-frame GIF costs about what one
+900×900 photo does, and the frame fingerprint adds roughly 440 characters
+beside a thumbnail of several KB.
+
+Paths in Cyrillic, Japanese, emoji, typographic quotes and non-printable
+characters all work. Each of those became a test case after breaking
+something once.
+
+### Why video is out of scope
+
+Not mainly because decoding it is expensive. A GIF is an image file Pillow
+already opens, so extending to it cost one seek loop; video needs a decoder
+this toolkit does not have. OpenCV's wheels bundle FFmpeg, but OpenCV is
+*optional* here, so video support would either become a hard dependency or
+work only sometimes, and working only sometimes is worse than not working.
+
+The deeper problem is that the pixel-plus-CLIP model does not describe
+video at all. The same clip in two containers, at two frame rates, from a
+resolution ladder, or trimmed a second differently is the same video, and
+every one of those pairs would score as unrelated.
+
+And the safety model does not survive the trip. This whole design rests on
+you *seeing* a thumbnail of each file before approving a deletion, which
+one still frame of a ten-minute video cannot give you. Deduplicating video
+properly is a different tool, not a flag on this one.
 
 ---
 
@@ -609,7 +620,7 @@ One clause is worth reading rather than skimming, because this tool moves
 your files: the software is provided **as is, without warranty**. It is
 built to be careful — nothing is deleted without a list you edited
 yourself, and everything goes to the recycle bin or trash rather than
-being erased — but the guarantees end at the license text. Keep backups
+being erased, but the guarantees end at the license text. Keep backups
 of anything you cannot replace.
 
 Third-party dependencies — Pillow and NumPy, plus optionally OpenCV,

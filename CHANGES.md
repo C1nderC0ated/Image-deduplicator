@@ -25,11 +25,11 @@ one outcome this tool exists to avoid.
 - **`I;16B` was dropped from the inventory entirely.** `point()` is
   implemented for `I`, `I;16` and `F` only; the byte-order variants raise.
   `I;16B` is what a big-endian 16-bit TIFF opens as — ordinary scanner and
-  Adobe output — and the raise took `make_thumb` down, so the file got no
+  Adobe output, and the raise took `make_thumb` down, so the file got no
   sha, no thumbnail, and was never compared against anything. Converts via
   `I` now.
 - **A float image containing `Inf` or `NaN` turned solid black.** The span
-  became infinite, the scale `0.0`, and every pixel mapped to 0 — so two
+  became infinite, the scale `0.0`, and every pixel mapped to 0, so two
   unrelated such images scored a perfect match and one was offered for
   deletion. Refused now, with a reason, so the file is reported rather than
   compared wrongly. Clamping in place is not available: Pillow's `point()`
@@ -37,7 +37,7 @@ one outcome this tool exists to avoid.
   deliberately Pillow-only with no numpy to fall back on.
 - **`--fp16` checked the flag, not the precision actually used.** The flag
   is honoured only on a GPU, so a run that asks for fp16 and lands on the
-  CPU writes fp32 — and the guard compared against the flag, saw a match,
+  CPU writes fp32, and the guard compared against the flag, saw a match,
   and appended fp32 vectors to a file whose header said fp16. Exactly the
   silent mixing it exists to prevent, and invisible because the opposite
   direction was caught correctly. The device is resolved before the guard
@@ -98,7 +98,7 @@ frame after the first.
   Net effect on that library: 48 Tier A clusters instead of 45, with one
   pair held back for review.
 
-Video is out of scope, and deliberately so — see the README.
+Video is out of scope, and deliberately so; see the README.
 
 ## v4.2.7 — 2026-08-09
 
@@ -130,7 +130,7 @@ records are byte-identical.
 
 ## v4.2.6 — 2026-08-09
 
-**Partial files are now named as partial** — and the obvious way to do
+**Partial files are now named as partial**, and the obvious way to do
 that was measured, found dangerous, and rejected.
 
 - **Truncated files are identified by name.** An interrupted download, a
@@ -149,7 +149,7 @@ that was measured, found dangerous, and rejected.
 - **`ImageFile.LOAD_TRUNCATED_IMAGES` was NOT enabled**, though it is the
   obvious fix and was the plan. Measured on this pipeline: Pillow fills
   the undecoded remainder with a *constant* — grey for JPEG, black for
-  PNG — so two unrelated photos cut to 1200 bytes both become the same
+  PNG, so two unrelated photos cut to 1200 bytes both become the same
   flat square and score **MAD 0.0710** against a Tier A gate of 4.0.
   Intact, that pair scores 97.21. It is the 16-bit white-square bug again,
   an order of magnitude worse (0.07 vs 0.71), and it would put real files
@@ -171,7 +171,7 @@ photos of being an attack.**
   `exif_transpose`, then copied again by `convert('RGB')`. Measured on this
   box: a 144 Mpx PNG peaked at **1135 MB → 590 MB** (−48%, and 1.5× faster);
   64 Mpx went **522 → 286 MB**. That peak is *per worker*, and the default
-  fan-out is eight — which is how a folder of 12k textures became a
+  fan-out is eight; which is how a folder of 12k textures became a
   `MemoryError`, reported to the user as nothing more than one more
   "unreadable" file.
   **Gated on size, deliberately.** `reduce()` followed by LANCZOS is not
@@ -192,7 +192,7 @@ photos of being an attack.**
   an accusation. The guard is aimed at untrusted uploads; here the user
   owns every file. Suppressed at module level — *not* with
   `catch_warnings()`, which is process-global state and not thread-safe
-  across the eight workers — and replaced with a plain summary of very
+  across the eight workers, and replaced with a plain summary of very
   large images, their sizes, and the `--workers` lever. Sizes come from the
   lazy `Image.open` header, so they cost nothing and are known *before* the
   decode that might fail. `DecompressionBombError` (the >2× case) is a
@@ -255,13 +255,13 @@ never produce.** Found while investigating two harmless-looking warnings.
   Now rescaled before conversion. `1/257`, not `1/256`, because 257 is
   65535/255 and it makes a 16-bit image **byte-identical to its own 8-bit
   export** (verified, max diff 0). After the fix the two different images
-  score 72.29 — *exactly* the 8-bit number — and a 16-bit image against its
+  score 72.29 — *exactly* the 8-bit number, and a 16-bit image against its
   own 8-bit twin scores 0.0000. So this removes a false positive **and**
   recovers a true positive the tool had been missing. 32-bit int and float
   carry no defined range, so those normalise by the image's own extrema.
 - **`pre` is now a named constant, `exif+pil`.** Changing the image
   processor (below) altered what the model sees wherever torchvision was
-  installed, and the header still said `exif` — so a resumed embeddings
+  installed, and the header still said `exif`, so a resumed embeddings
   file could have quietly mixed two vector populations, the exact trap the
   model and precision guards exist to prevent. Kept a WARN rather than a
   STOP because both changes are *conditional*: no torchvision means no
@@ -291,7 +291,7 @@ Two warnings that fired on ordinary input and pointed at nothing useful:
 
 - **`_pick-python.bat` now sees a `.venv`**, which `imgdedup.sh` already
   did. Setup offers the venv route whenever pip is missing, and that is not
-  gated on platform — so on a Windows Python with broken pip it could
+  gated on platform, so on a Windows Python with broken pip it could
   install everything into a `.venv` every `.bat` then refused to look at,
   reporting those same packages missing while the fix sat on disk.
   Ordered *below* the `py` launcher, unlike Linux: a PEP 668 distro forces
@@ -304,7 +304,7 @@ Two warnings that fired on ordinary input and pointed at nothing useful:
 
 **pip itself is now checked before anything tries to use it.** It is not
 part of Python on most Linux distros — Arch splits it into `python-pip`,
-Debian into `python3-pip` — so a base install genuinely has none, and
+Debian into `python3-pip`, so a base install genuinely has none, and
 every command the toolkit printed would have died with `No module named
 pip`, which reads like a broken toolkit rather than a missing system
 package.
@@ -326,7 +326,7 @@ Three defects found while verifying, each worth more than the feature:
   interpreter and `pyvenv.cfg` *before* provisioning pip, so an abort left
   something that looked like a working environment and could install
   nothing. The launchers prefer a `.venv` beside them over any Python on
-  PATH — so one failed setup would have captured every later run,
+  PATH, so one failed setup would have captured every later run,
   including the setup meant to repair it. Only ever removes what that call
   created; a pre-existing `.venv` is never touched, and there is a test
   for both. `setup`'s launcher probe now requires `pip` as well, so a
@@ -334,7 +334,7 @@ Three defects found while verifying, each worth more than the feature:
 - **The venv route is no longer recommended where it cannot be taken.**
   Debian 12 with `python3-pip` present but `python3-venv` absent is an
   ordinary state, and precisely the machine PEP 668 forces down that path.
-  Setup recommended — and under `--yes` auto-selected — a route the
+  Setup recommended, and under `--yes` auto-selected — a route the
   machine could not follow. Note the split is narrower than usually told:
   the `venv` module is in the base `python3`; `python3-venv` adds only
   `ensurepip` and the wheels, so `python3 -m venv` imports fine and *then*
@@ -416,7 +416,7 @@ embeddings, 15/20 without, zero false positives):
 
 - **Orientation matching 4.4x faster**, the analyzer's single biggest cost
   at scale. It was resizing shape-changing rotations so it could compare
-  them — but the collector thumbnails the *rotated* image, so a genuine
+  them, but the collector thumbnails the *rotated* image, so a genuine
   rotated copy already has a transposed thumbnail and the orientation that
   matches it restores the original shape. Comparing a resized, distorted
   rotation is work that cannot succeed. Skipping those: 1846 -> 420 us per
@@ -640,7 +640,7 @@ undecodable-filename round-trips — those need a real Linux box.
 - **Recall 8/20 → 20/20** on a truth set of known same-picture
   transformations, no new false positives (unrelated pairs: mad ≥ 52.9;
   true duplicates: ≤ 3.2). Four causes: the CLIP veto silently discarded
-  pixel-identical pairs (no branch matched — and CLIP is the weaker
+  pixel-identical pairs (no branch matched, and CLIP is the weaker
   signal: an unrelated pair scored 0.982, above several real duplicates;
   such pairs now go to review); rotated/mirrored copies never became
   candidates (all eight orientations now swept; `--no-orient` opts out);
@@ -764,7 +764,7 @@ identical inputs, embedding cosines 1.0000 (two deliberate exceptions).
 - **Survives a stale torchvision after a torch reinstall** ("DLL load
   failed" from `_C.pyd` linked against a replaced torch). The embedder
   hides a present-but-unloadable torchvision — transformers then uses its
-  Pillow path, same vectors — and prints both cleanup options. Nothing in
+  Pillow path, same vectors, and prints both cleanup options. Nothing in
   this toolkit needs torchvision; it is probed only because a broken one
   takes transformers down. The old error blamed the wrong causes.
 
