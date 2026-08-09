@@ -217,7 +217,7 @@ Restore it.
 
 Walks the folder tree — 17 extensions, the ones that actually turn up in an
 image gallery: `.jpg .jpeg .jfif .jpe .png .apng .webp .gif .tif .tiff .bmp
-.tga`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
+.tga .qoi`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
 cursors, Photoshop files, game textures and the legacy encodings are
 deliberately excluded (an asset folder reuses the same texture on purpose,
 so every "duplicate" found there is intended); `collect-image-inventory.py`
