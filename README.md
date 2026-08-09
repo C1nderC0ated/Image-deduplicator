@@ -215,7 +215,7 @@ Restore it.
 
 ### Stage 1 — Collect
 
-Walks the folder tree — 16 extensions, the ones that actually turn up in an
+Walks the folder tree — 17 extensions, the ones that actually turn up in an
 image gallery: `.jpg .jpeg .jfif .jpe .png .apng .webp .gif .tif .tiff .bmp
 .tga`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
 cursors, Photoshop files, game textures and the legacy encodings are

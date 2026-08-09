@@ -147,6 +147,12 @@ EXTS = {
     # is why it is here and .dds is not: a screenshot belongs in a gallery,
     # a texture belongs to the game.
     '.tga',
+    # QOI. Not a gallery format by origin - nothing consumer writes it, no
+    # browser renders it, and its real users are game and embedded work -
+    # but it is current rather than legacy, Pillow decodes it, and the
+    # asymmetry decides it: listing it costs one entry, leaving it out means
+    # a QOI file is skipped without a word.
+    '.qoi',
 }
 
 # What is deliberately NOT scanned, and why - each of these was in the list
@@ -160,8 +166,11 @@ EXTS = {
 #   .psd                     a working file, not a gallery image - and the
 #                            one format here Pillow can read but not write,
 #                            so it could never be tested end to end.
-#   .pcx .sgi .dib .qoi      legacy or niche encodings nothing writes into
-#   .ppm .pgm .pbm .pnm      a photo library today.
+#   .pcx .sgi .dib           legacy encodings nothing writes into a photo
+#   .ppm .pgm .pbm .pnm      library today. (.qoi sat here once and came
+#                            back: it is niche, but it is not legacy, and
+#                            skipping a file silently costs more than one
+#                            entry in a set.)
 #   .jp2 .j2k .jpf .jpx      JPEG 2000: archival and medical, effectively
 #                            never a consumer gallery format.
 #   .pdf .eps .fits .grib    Pillow opens these, but scanning a photo
