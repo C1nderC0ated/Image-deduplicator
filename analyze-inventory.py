@@ -776,12 +776,17 @@ FRAME_CUT = 6.0
 def frames_agree(ra, rb):
     """Do two animations still match once you look past frame 0?
 
-    Returns True when there is nothing to compare - one side has no
-    sampled frames, or they were sampled at different lengths - because
-    silence here must not manufacture a duplicate OR destroy one. The
-    frame-count check above already separates animations of different
-    lengths; this catches the harder case, two animations of the SAME
-    length that begin identically and then diverge.
+    Returns True when one side has no fingerprint at all - there is
+    genuinely nothing to say, and silence must not destroy a real match.
+
+    A SIZE MISMATCH is different, and getting that wrong shipped a false
+    delete. Fingerprints of unequal length are positionally incomparable,
+    and this used to abstain on them, which reads as consent: an all-black
+    2-sample fingerprint and an all-white 5-sample one were declared
+    compatible, so unrelated animations sharing a first frame were
+    pre-marked for the Recycle Bin. Collector fingerprints are fixed-size
+    now, but inventories written before that fix still hold short ones, so
+    fall back to the frame count instead of consenting.
     """
     fa, fb = ra.get('fsig'), rb.get('fsig')
     if not fa or not fb:
@@ -791,8 +796,10 @@ def frames_agree(ra, rb):
         B = np.frombuffer(base64.b64decode(fb), dtype=np.uint8)
     except Exception:
         return True
-    if A.size != B.size or A.size == 0:
+    if A.size == 0 or B.size == 0:
         return True
+    if A.size != B.size:
+        return ra.get('anim') == rb.get('anim')
     return float(np.abs(A.astype(np.float32) - B.astype(np.float32)).mean()) <= FRAME_CUT
 
 
@@ -1303,6 +1310,34 @@ def self_test():
               % ('PASS' if not bad else 'FAIL', len(shapes) * 2,
                  '' if not bad else '   ' + '; '.join(bad[:2])))
         ok = ok and not bad
+
+        # Every animation must produce the SAME NUMBER of samples, however
+        # few frames it has. Deduplicating the sample indices made short
+        # animations emit shorter fingerprints, which are positionally
+        # incomparable - and the comparison below used to read that as
+        # consent, pre-marking unrelated animations for deletion.
+        want = _c.FRAME_SAMPLES
+        lens = set()
+        for n in (2, 3, 4, 5, 6, 9, 40):
+            idx = [int(round(t * (n - 1) / (want - 1))) for t in range(want)]
+            lens.add(len(idx))
+        fixed = lens == {want}
+        print('  [%s] frame fingerprint is %d samples for every length'
+              % ('PASS' if fixed else 'FAIL', want))
+        ok = ok and fixed
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # ... and a mismatched length must never be read as agreement.
+    try:
+        short = base64.b64encode(b'\x00' * 384).decode()
+        longer = base64.b64encode(b'\xff' * 960).decode()
+        strict = not frames_agree({'fsig': short, 'anim': 2},
+                                  {'fsig': longer, 'anim': 9})
+        print('  [%s] a size-mismatched fingerprint is not consent'
+              % ('PASS' if strict else 'FAIL'))
+        ok = ok and strict
     except Exception as exc:
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False

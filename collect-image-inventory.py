@@ -306,13 +306,25 @@ def frame_signature(im):
     n = int(getattr(im, 'n_frames', 1) or 1)
     if n < 2:
         return ''
-    want = sorted({int(round(t * (n - 1) / (FRAME_SAMPLES - 1)))
-                   for t in range(FRAME_SAMPLES)})
+    # ALWAYS emit FRAME_SAMPLES tiles, repeating an index when the animation
+    # is shorter than that. A set comprehension here deduplicated the
+    # indices, so a 2-frame GIF produced 384 bytes, 3-frame 576, 4-frame 768
+    # and anything longer 960 - and two fingerprints of different lengths
+    # are positionally incomparable, which made the comparison abstain and
+    # wave the pair through on frame 0 alone. Fixed size means sample k is
+    # the same fraction of the timeline on both sides, so a 3-frame and a
+    # 6-frame animation are genuinely compared.
+    want = [int(round(t * (n - 1) / (FRAME_SAMPLES - 1)))
+            for t in range(FRAME_SAMPLES)]
     out = bytearray()
     try:
-        for idx in want:
+        tiles = {}
+        for idx in sorted(set(want)):     # seek ascending - APNG demands it
             im.seek(idx)
-            out += im.convert('RGB').resize((8, 8), Image.BILINEAR).tobytes()
+            tiles[idx] = im.convert('RGB').resize(
+                (8, 8), Image.BILINEAR).tobytes()
+        for idx in want:
+            out += tiles[idx]
     except Exception:
         return ''                 # unseekable: say nothing rather than guess
     finally:
