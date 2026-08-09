@@ -131,35 +131,48 @@ warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 # not the size at which Pillow gets suspicious.
 HUGE_PX = 80_000_000
 
-# Every one of these is decoded by Pillow itself - no extra dependency, and
-# nothing here can turn into "unreadable" noise just for being listed.
-# Chosen from Image.EXTENSION rather than from memory.
+# Formats that turn up in an actual image GALLERY. Every one is decoded by
+# Pillow itself, so none can become "unreadable" noise just for being listed.
 EXTS = {
-    # the common photo and web formats
-    '.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.apng', '.webp', '.gif',
-    '.bmp', '.dib', '.tif', '.tiff',
-    # phone and modern codecs
+    # photos and general images
+    '.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.webp', '.tif', '.tiff',
+    '.bmp',
+    # phone cameras (.hif is Canon's name for the same container).
+    # These need pillow-heif; without it they are the one group that lands
+    # as unreadable.
     '.heic', '.heif', '.hif', '.avif',
-    # Targa: Warcraft 3 and a great many older games screenshot to .tga,
-    # and .icb/.vda/.vst are the same container under other names
-    '.tga', '.icb', '.vda', '.vst',
-    # game and desktop assets
-    '.dds', '.ico', '.cur', '.icns',
-    # design and print
-    '.psd', '.jp2', '.j2k', '.jpf', '.jpx',
-    # netpbm and other plain formats that tools still emit
-    '.ppm', '.pgm', '.pbm', '.pnm', '.pcx', '.sgi', '.qoi',
+    # animated
+    '.gif', '.apng',
+    # Targa - Warcraft 3 and a good many older games screenshot to it, which
+    # is why it is here and .dds is not: a screenshot belongs in a gallery,
+    # a texture belongs to the game.
+    '.tga',
 }
 
-# Pillow will also open .pdf, .eps, .fits, .grib, .mpeg and friends. They are
-# left out deliberately: scanning a photo library for weather data and
-# PostScript finds no duplicates and plenty of noise.
+# What is deliberately NOT scanned, and why - each of these was in the list
+# at some point and taken back out:
 #
-# Camera RAW (.cr2 .nef .arw .dng .orf .rw2) is NOT here because Pillow
-# cannot decode it - verified, none are registered. It needs rawpy/libraw,
-# and a real design decision besides: a RAW carries an embedded JPEG
-# preview, so "is this a duplicate" has two different answers depending on
-# which of the two you mean.
+#   .dds .icb .vda .vst      game textures and Targa's texture-side aliases.
+#                            Asset folders reuse the same file on purpose,
+#                            so every "duplicate" found there is intended.
+#   .ico .cur .icns          icons and cursors. Multi-resolution containers
+#                            that are UI furniture, not pictures.
+#   .psd                     a working file, not a gallery image - and the
+#                            one format here Pillow can read but not write,
+#                            so it could never be tested end to end.
+#   .pcx .sgi .dib .qoi      legacy or niche encodings nothing writes into
+#   .ppm .pgm .pbm .pnm      a photo library today.
+#   .jp2 .j2k .jpf .jpx      JPEG 2000: archival and medical, effectively
+#                            never a consumer gallery format.
+#   .pdf .eps .fits .grib    Pillow opens these, but scanning a photo
+#                            library for PostScript and weather data finds
+#                            no duplicates and plenty of noise.
+#
+# Camera RAW (.cr2 .nef .arw .dng .orf .rw2) is absent for a different
+# reason: Pillow cannot decode it at all - verified, none are registered. It
+# would need rawpy/libraw, plus a real design decision, because a RAW
+# carries an embedded JPEG preview and "is this a duplicate" has two
+# different answers depending on which of the two you mean.
 SKIP_DIRS = {'.git', '.venv', 'venv', '__pycache__', 'node_modules',
              '$recycle.bin', 'system volume information', '_inventory',
              # Linux/macOS equivalents. The trash ones matter: without them a

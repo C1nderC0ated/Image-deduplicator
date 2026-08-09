@@ -215,8 +215,14 @@ Restore it.
 
 ### Stage 1 — Collect
 
-Walks the folder tree (`.jpg .jpeg .png .webp .gif .bmp .tif .tiff`, plus
-`.heic .heif .avif` when the codec is present) and writes one JSON line per
+Walks the folder tree — 16 extensions, the ones that actually turn up in an
+image gallery: `.jpg .jpeg .jfif .jpe .png .apng .webp .gif .tif .tiff .bmp
+.tga`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
+cursors, Photoshop files, game textures and the legacy encodings are
+deliberately excluded (an asset folder reuses the same texture on purpose,
+so every "duplicate" found there is intended); `collect-image-inventory.py`
+lists each exclusion and the reason for it. Camera RAW is not supported at
+all — Pillow cannot decode it. It writes one JSON line per
 image: relative path, byte size, mtime, **SHA-256**, format, dimensions,
 key EXIF fields (timestamp, camera, software, orientation), a **JPEG
 quantization fingerprint** (`qsum` — lower means less recompressed), any
