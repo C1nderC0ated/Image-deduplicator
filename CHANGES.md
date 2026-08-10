@@ -3,7 +3,47 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.1 — 2026-08-09 (current)
+## v4.3.2 — 2026-08-10 (current)
+
+**The analyzer got a third faster, and the output did not move by one
+byte.** On the 36,410-image reference library the whole stage went from
+242 s to 162 s, and `duplicates-list.txt` came out with the same md5 it
+had before, down to every intermediate count.
+
+- **The hottest function in the tool was on the slow path.** v4.2f gave
+  `absdiff_mean` a fast OpenCV route, but `mad_pair` carried its own copy
+  of the old body and never got it. That is the single most-called
+  function here, 376,660 pairs on the reference library and 99.8 s of a
+  242 s run, so the one place it mattered most was the one place the
+  speedup missed. It shares `absdiff_mean` now instead of duplicating it,
+  which is also why the omission was possible in the first place.
+- **`cv2.norm(NORM_L1)` replaced `cv2.absdiff().mean()`.** It sums the
+  absolute differences in one pass with no intermediate image, so there is
+  no uint8 difference buffer and no float32 pair. Dividing by `A.size`
+  recovers the mean *exactly* rather than approximately, because the sum
+  is over integers: measured 0.000e+00 apart over 400 trials, and again
+  over 2,700 comparisons spanning 2-D grayscale, 1x1, and non-contiguous
+  views. About 13x faster, 85.0 -> 6.3 us per pair.
+- **Orientation got 2.2x faster for free**, 18.3 s to 8.4 s, because
+  `oriented_mad` already called `absdiff_mean` and simply inherited it.
+- Scoring itself is 2.8x rather than 13x faster, because what remains is
+  no longer the arithmetic: only about a tenth of candidate pairs share a
+  thumbnail shape, so the rest pay a Lanczos resize that now dominates the
+  phase.
+- Against the numpy fallback the values shift by ~1e-6, unchanged from
+  v4.2f and in the more accurate direction. Zero verdict changes at the
+  4.0 and 12.0 gates across 8,654 real pairs, and the full run is
+  byte-identical.
+
+Rejected after measuring, recorded so they are not tried again: folding
+the luma into one matmul (5% for 2.3e-05 of drift), cv2 for the
+post-matmul luma MAD (faster but no more accurate), thread pinning (a win
+under load that reverses on an idle machine), a deeper signature window
+(noise), WebP thumbnails (64 of 36,410 qualify), and `cv2.imread` for
+loading files, which returns `None` rather than raising on non-ASCII paths
+on Windows and would have silently skipped part of a real library.
+
+## v4.3.1 — 2026-08-09
 
 **Four defects found by auditing this session's own changes**, three of
 them introduced by it. Two were false DELETE recommendations, which is the
