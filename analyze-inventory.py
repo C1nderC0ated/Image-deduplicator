@@ -1534,8 +1534,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     live = bool(list_lines and editable_at)
     if live:
         A('<div class="bar">'
-          '<button id="ball">Mark all Tier B suggested</button>'
-          '<button id="bnone">Clear Tier B</button>'
+          '<button id="ball">Mark all Tier B suggestions</button>'
+          '<button id="bnone">Clear Tier B marks</button>'
           '<button id="breset">Reset to scan defaults</button>'
           '<span class="sp"></span>'
           '<span class="tally"><b id="nx">0</b> marked X</span>'
@@ -2022,22 +2022,24 @@ def offer_tier_b(marks):
         interactive = False
     if not interactive:
         print('')
-        print('  Tier B: untouched, %d flagged file(s) kept. Using the list '
-              'as it is.' % len(pend))
+        print('  Tier B: untouched, %d flagged file%s kept. Using the list '
+              'as it is.' % (len(pend), '' if len(pend) == 1 else 's'))
         print('          Mark them in the report, or run from a terminal to '
               'choose here.')
         return marks
     size = sum(e['size'] for e in pend) / 1048576.0
+    noun = '%d Tier B file%s' % (len(pend), '' if len(pend) == 1 else 's')
     print('')
-    print('  Tier B: %d file(s), %.1f MB, none marked.' % (len(pend), size))
+    print('  Tier B: %d file%s, %.1f MB, none marked.'
+          % (len(pend), '' if len(pend) == 1 else 's', size))
     print('  Crop or variant matches - same subject, different pixels. The '
           'scan picked')
     print('  a copy to drop in each but left them unmarked; this tier is '
           'where it is')
     print('  least reliable.')
     print('')
-    print('    [Enter]  use the list as it is      (default)')
-    print('    b        also trash all %d' % len(pend))
+    print('    [Enter]  use the list as it is        (default)')
+    print('    b        also trash the %s' % noun)
     print('    q        exit without deleting')
     print('')
     print('  Marking per file in the report is more precise, and stops this '
@@ -2057,8 +2059,8 @@ def offer_tier_b(marks):
     if a == 'b':
         for e in pend:
             marks[e['rel']] = 'X'
-        print('  -> %d added. Same checks apply: every cluster keeps at least '
-              'one copy,' % len(pend))
+        print('  -> %s added. Same checks apply: every cluster keeps at least '
+              'one copy,' % noun)
         print('     and files whose bytes changed since the scan are skipped.')
     return marks
 

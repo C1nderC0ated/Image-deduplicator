@@ -27,7 +27,10 @@ a genuinely untouched Tier B, which is the case it was added for.
 - The prompt points at the report as the more precise route, since marking
   per file is what stops it asking.
 - Wording throughout the prompt, the review bar and the launcher was cut
-  back to what is happening, without the commentary around it.
+  back to what is happening, without the commentary around it. Each choice
+  names what it acts on rather than a bare count, since the eye lands on
+  the options without reading the header above them: "also trash the 3
+  Tier B files", not "also trash all 3".
 
 The selection list is unchanged - the new field lives in the recycler's
 manifest, and the list is still byte-identical to v4.3.2's for the same
