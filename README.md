@@ -40,6 +40,7 @@ point, inspect everything in a text editor, and re-run stages independently.
 
 | Path | Role |
 |------|------|
+| `Find-Duplicates.bat` | All three stages on one folder, then opens the report |
 | `Collect-Image-Inventory.bat` + `collect-image-inventory.py` | Stage 1 — scan a folder into `image-inventory.jsonl` |
 | `Embed-Images.bat` + `embed-images.py` | Stage 2 (optional) — CLIP embeddings for semantic matching |
 | `Analyze-Inventory.bat` + `analyze-inventory.py` | Stage 3 — find duplicates, write report / list / recycler |
@@ -181,6 +182,21 @@ it takes transformers down (see [Troubleshooting](#troubleshooting)).
 
 ## How to run
 
+**The short way: drag your folder onto `Find-Duplicates.bat`.** It runs
+all three stages in order and opens the report at the end. If PyTorch is
+not installed it says so and carries on with pixel comparison alone,
+rather than stopping — you lose the pass that catches recoloured and
+heavily cropped copies, not the tool. On Linux/macOS the same thing is
+`./imgdedup.sh collect <folder>` then `embed` then `analyze`.
+
+Then open the report, click the pictures you want gone, press **Download
+duplicates-list.txt**, save it over the old one, and run the recycler.
+Arrow keys move, <kbd>X</kbd> toggles, and the keeper of a group cannot be
+marked at all, so no group can be emptied by accident.
+
+The stage-by-stage route below still works and is worth knowing when a run
+goes wrong, since it lets you re-run one stage without redoing the others.
+
 1. Copy the whole toolkit folder anywhere (or leave it where it is, the
    launchers find their scripts next to themselves).
 2. **Drag the folder you want scanned onto `Collect-Image-Inventory.bat`**
@@ -200,6 +216,10 @@ it takes transformers down (see [Troubleshooting](#troubleshooting)).
 6. Run `Recycle-Duplicates.bat` (Windows) or `./Recycle-Duplicates.sh`
    (Linux/macOS), read the preview, answer `y`. Both just run
    `Recycle-Duplicates.py`, which is where every safety rule lives.
+   If Tier B files the scan flagged are still unmarked it asks first:
+   `Enter` for Tier A only (the default, and what happens with piped input
+   or no terminal), `b` to include them, `q` to stop and review. Either way
+   they go through the same survivor and hash checks as everything else.
 
 On Linux/macOS, steps 2–4 are `./imgdedup.sh collect <folder>`,
 `./imgdedup.sh embed <folder>`, `./imgdedup.sh analyze <folder>`.
@@ -598,7 +618,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.2** (2026-08-10). Full history, including every bug and what it
+**v4.3.2f** (2026-08-10). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

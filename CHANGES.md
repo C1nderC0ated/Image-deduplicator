@@ -3,7 +3,48 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.2 — 2026-08-10 (current)
+## v4.3.2f — 2026-08-10 (current)
+
+**Tier B stopped being homework.** Reviewing it meant reading a few
+hundred lines of text and moving characters by hand, which is why almost
+nobody did. Two ways out, and neither one deletes anything on its own.
+
+- **The report is now the review tool.** Click a thumbnail to mark or
+  unmark it, or walk the strip with the arrow keys and toggle with
+  <kbd>X</kbd>. A running count sits in the bar with **Mark all Tier B
+  suggestions**, **Clear every Tier B mark** and **Reset to as-scanned**,
+  and one button downloads the selection list with your marks in it. Drop
+  that over the old file and run the recycler as before.
+  The page holds the list *verbatim* and only ever rewrites the first
+  character of a line it was told is editable. It cannot invent a line,
+  reorder one, or touch a comment - rendering the format a second time in
+  JavaScript would leave two implementations free to drift, which this
+  project has already been bitten by. Verified: the downloaded bytes are
+  identical to the file the run wrote, BOM and CRLF included.
+  Keeper tiles get no toggle at all, so a cluster cannot be emptied here.
+- **The recycler asks about Tier B instead of ignoring it.** When rows the
+  scan nominated are still unmarked it offers, in plain words, `[Enter]`
+  Tier A only, `b` to include Tier B, `q` to quit and review first. Enter
+  is the default and changes nothing. Piped input or no terminal prints a
+  note and continues with Tier A alone, so scripts behave exactly as
+  before. Whatever is chosen still passes the same survivor and hash
+  checks; this decides what to *propose*, never what is safe.
+- **`Find-Duplicates.bat`**: drag a folder on, get all three stages and
+  the report. Windows had a .bat per stage and no way to just run the
+  thing; Linux has had `imgdedup.sh` for a while. The CLIP stage is
+  treated as optional out loud - without PyTorch it says what is lost
+  (recoloured and heavily cropped copies) and carries on with pixels,
+  rather than stopping.
+- **The Tier B count in the report was overstating the work.** It counted
+  relations found, but a Tier B drop already editable in a Tier A cluster
+  is shown as a reference and cannot be marked there - so a report saying
+  "6 candidates" offered 3. It now counts what the page actually renders,
+  which is also what the review bar can touch.
+
+The selection list is byte-identical to the one the previous version
+wrote for the same inventory; only the report and the recycler changed.
+
+## v4.3.2 — 2026-08-10
 
 **Embedding and analysis both got substantially faster, and neither
 output moved by one byte.** On the 36,410-image reference library:

@@ -1385,7 +1385,9 @@ def small_b64(rec, maxw=150):
     return base64.b64encode(b.getvalue()).decode('ascii')
 
 
-def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
+def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
+                 list_lines=None, editable_at=None, suggested_b=None,
+                 list_name=None):
     def mb(x):
         return '%.2f MB' % (x / 1048576.0)
 
@@ -1445,8 +1447,44 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
       'footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);'
       'color:var(--dim);font-size:13.5px;max-width:84ch}'
       'code{background:#232833;color:#cdd3e0;padding:1px 5px;border-radius:4px;font-size:12.5px}'
+      # Review controls. Hidden unless the page was given a list to edit,
+      # so a report written without one looks exactly as it did before.
+      '.bar{position:sticky;top:0;z-index:9;background:#131720ee;backdrop-filter:blur(8px);'
+      'border-bottom:1px solid var(--line);margin:0 -24px 8px;padding:11px 24px;'
+      'display:flex;gap:10px;align-items:center;flex-wrap:wrap}'
+      '.bar .sp{flex:1}'
+      'button{font:600 13px/1 inherit;color:var(--ink);background:var(--panel2);'
+      'border:1px solid var(--line);border-radius:7px;padding:8px 13px;cursor:pointer}'
+      'button:hover{background:#252b38;border-color:#3a4358}'
+      'button.go{background:#1d4d38;border-color:#2c6b4e;color:#c8f5e0}'
+      'button.go:hover{background:#236049}'
+      '.tally{font:600 13px/1 inherit;color:var(--dim)}'
+      '.tally b{color:var(--drop);font-size:15px}'
+      '.it.sel{outline:2px solid #5b7cfa;outline-offset:3px;border-radius:8px}'
+      '.it .tg{margin-top:5px;width:100%;padding:5px 0;font-size:11px}'
+      '.it.on .tg{background:#4a1f1f;border-color:#7a3030;color:#ffd6d6}'
+      '.hint{color:var(--dim);font-size:12.5px;margin:0 0 14px}'
+      'kbd{background:#232833;border:1px solid var(--line);border-bottom-width:2px;'
+      'border-radius:4px;padding:0 5px;font:11px ui-monospace,monospace;color:#cdd3e0}'
       '</style><div class="wrap">')
+    live = bool(list_lines and editable_at)
+    if live:
+        A('<div class="bar">'
+          '<button id="ball">Mark all Tier B suggestions</button>'
+          '<button id="bnone">Clear every Tier B mark</button>'
+          '<button id="breset">Reset to as-scanned</button>'
+          '<span class="sp"></span>'
+          '<span class="tally"><b id="nx">0</b> marked for the bin</span>'
+          '<button class="go" id="bdl">Download %s</button></div>'
+          % esc(list_name or 'duplicates-list.txt'))
     A('<h1>Duplicate report</h1>')
+    if live:
+        A('<p class="hint">Click any thumbnail to mark or unmark it, or use '
+          '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move and <kbd>X</kbd> to toggle. '
+          'Nothing is deleted here &mdash; when the marks look right, download the '
+          'list, put it back beside the images, and run the recycler. '
+          'The keeper of a cluster refuses to be marked, so a group can never be '
+          'emptied from this page.</p>')
     if not tier_a and not tier_b:
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
           'No duplicates found &mdash; every image in this folder is distinct. '
@@ -1456,19 +1494,33 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
     A('<p class="sub">Cluster numbers match the selection list exactly &mdash; '
       'search the .txt for <code>cluster 91</code> to find the same group. '
       'Click a number to link straight to it.</p>')
+    plan_by_key = {'A': [], 'B': []}
+    if plan:
+        for cl_id, key, keeper, editable, refs in plan:
+            plan_by_key[key].append((cl_id, keeper, editable, refs))
+
+    def shown_drops(key, tier):
+        """How many files this tier actually offers HERE.
+
+        Not the same as the number of relations it found: a Tier B drop that
+        is already editable in a Tier A cluster is shown as a reference and
+        cannot be marked here, so counting relations promised more to review
+        than the page contains. It also has to agree with the review bar,
+        which can only touch what it renders."""
+        if not plan:
+            return sum(len(d) for _, d, _ in tier)
+        return sum(len([m for m in ed if m != kp])
+                   for _c, kp, ed, _r in plan_by_key[key])
+
     A('<div class="stats">')
     for b, s in (('%d' % stats['n'], 'images'),
                  ('%d' % stats['exact'], 'exact (SHA) duplicates'),
                  ('%d' % len(tier_a), 'duplicate clusters'),
                  ('%d' % dn, 'droppable files'),
                  (mb(db), 'reclaimable'),
-                 ('%d' % sum(len(d) for _, d, _ in tier_b), 'crop / variant to review')):
+                 ('%d' % shown_drops('B', tier_b), 'crop / variant to review')):
         A('<div class="stat"><b>%s</b><span>%s</span></div>' % (b, s))
     A('</div>')
-    plan_by_key = {'A': [], 'B': []}
-    if plan:
-        for cl_id, key, keeper, editable, refs in plan:
-            plan_by_key[key].append((cl_id, keeper, editable, refs))
 
     for tier, key, colour, bg, title, lead in (
             (tier_a, 'A', '#3ddc97', '#12281e', 'DUPLICATE',
@@ -1484,7 +1536,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
         A('<h2><span class="pill" style="color:%s;background:%s">TIER %s &middot; %s</span> '
           '<span style="color:var(--dim);font-weight:400;font-size:15px">%d clusters &middot; '
           '%d candidates</span></h2>' % (colour, bg, key, title, len(groups),
-                                         sum(len(d) for _, d, _ in tier)))
+                                         shown_drops(key, tier)))
         A('<p class="lead">%s</p>' % lead)
         for cl_id, keeper, editable, refs in groups:
             members = editable + refs
@@ -1503,9 +1555,17 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
             for d in [m for m in editable if m != keeper]:
                 cls = 'd' if key == 'A' else 'n'
                 lab = 'DROP' if key == 'A' else 'REVIEW'
-                A('<div class="it %s"><img src="data:image/jpeg;base64,%s" alt="">'
-                  '<div class="lb">%s</div><div class="fn">%s<br>%s</div></div>'
-                  % (cls, small_b64(recs[d]), lab, meta(d), esc(recs[d]['p'][:44])))
+                rel = recs[d]['p']
+                on = ' on' if key == 'A' else ''
+                tog = ''
+                if live and rel in (editable_at or {}):
+                    tog = ('<button class="tg" data-p="%s">%s</button>'
+                           % (esc(rel), 'bin' if key == 'A' else 'keep'))
+                A('<div class="it %s%s"%s><img src="data:image/jpeg;base64,%s" alt="">'
+                  '<div class="lb">%s</div><div class="fn">%s<br>%s</div>%s</div>'
+                  % (cls, on,
+                     (' data-p="%s"' % esc(rel)) if tog else '',
+                     small_b64(recs[d]), lab, meta(d), esc(rel[:44]), tog))
             for r in refs:
                 A('<div class="it r"><img src="data:image/jpeg;base64,%s" alt="">'
                   '<div class="lb">IN CLUSTER %s</div><div class="fn">%s<br>%s</div></div>'
@@ -1515,13 +1575,69 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None):
     A('<footer><b>Method.</b> ' + esc(stats['method']) +
       '<br><br><b>Guarantees.</b> Every file appears at most once as a deletion candidate, '
       'and no file marked KEEP is a candidate anywhere. Both are asserted in code before '
-      'these files are written; a violation aborts the run.</footer></div></html>')
+      'these files are written; a violation aborts the run.</footer></div>')
+    if live:
+        # The page holds the list verbatim and only ever rewrites the first
+        # character of a line it was told is editable. It cannot invent a
+        # line, reorder one, or touch a comment, so the file it hands back
+        # is the one this run wrote with some marks flipped - nothing else.
+        A('<script>')
+        A('var LINES=%s,AT=%s,SUGG=%s,NAME=%s,CRLF=%s;'
+          % (json.dumps(list_lines), json.dumps(editable_at),
+             json.dumps(suggested_b or []), json.dumps(list_name or 'duplicates-list.txt'),
+             'true' if os.name == 'nt' else 'false'))
+        A(r'''
+var ORIG=LINES.slice(), tiles=[].slice.call(document.querySelectorAll('.it[data-p]')), cur=0;
+function mark(p,on){var i=AT[p]; if(i===undefined)return;
+  LINES[i]=(on?'X':'.')+LINES[i].slice(1);}
+function isOn(p){var i=AT[p]; return i!==undefined && LINES[i].charAt(0)==='X';}
+function paint(){var n=0;
+  for(var k in AT){if(LINES[AT[k]].charAt(0)==='X')n++;}
+  document.getElementById('nx').textContent=n;
+  tiles.forEach(function(t,ix){var p=t.getAttribute('data-p'),on=isOn(p);
+    t.classList.toggle('on',on); t.classList.toggle('sel',ix===cur);
+    var b=t.querySelector('.tg'); if(b)b.textContent=on?'bin':'keep';});}
+function toggle(p){mark(p,!isOn(p)); paint();}
+tiles.forEach(function(t,ix){t.addEventListener('click',function(e){
+  cur=ix; toggle(t.getAttribute('data-p')); e.preventDefault();});});
+document.getElementById('ball').onclick=function(){SUGG.forEach(function(p){mark(p,true);});paint();};
+document.getElementById('bnone').onclick=function(){
+  for(var k in AT){if(SUGG.indexOf(k)>=0||ORIG[AT[k]].charAt(0)==='.')mark(k,false);}paint();};
+document.getElementById('breset').onclick=function(){LINES=ORIG.slice();paint();};
+document.getElementById('bdl').onclick=function(){
+  var txt=LINES.join(CRLF?'\r\n':'\n'), blob=new Blob([CRLF?'﻿'+txt:txt],
+      {type:'text/plain;charset=utf-8'}), u=URL.createObjectURL(blob),
+      a=document.createElement('a'); a.href=u; a.download=NAME; a.click();
+  setTimeout(function(){URL.revokeObjectURL(u);},2000);};
+document.addEventListener('keydown',function(e){
+  if(e.target.tagName==='INPUT')return;
+  if(e.key==='ArrowRight'||e.key==='j'){cur=Math.min(cur+1,tiles.length-1);}
+  else if(e.key==='ArrowLeft'||e.key==='k'){cur=Math.max(cur-1,0);}
+  else if(e.key==='x'||e.key==='X'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'));return;}
+  else return;
+  paint(); if(tiles[cur])tiles[cur].scrollIntoView({block:'nearest',inline:'center'});
+  e.preventDefault();});
+paint();
+''')
+        A('</script>')
+    A('</html>')
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(P))
 
 
 def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                           tier_a, tier_b, root, info_b=None):
+    """Writes the list and the three recyclers.
+
+    Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
+    three so the report can offer the same edits in a browser:
+      lines         the list exactly as written, so the page rebuilds the
+                    file by flipping one character rather than re-deriving
+                    a format that would then be free to drift from this one
+      editable_at   relative path -> index into `lines` of its mark line
+      suggested_b   Tier B paths this scan would have marked, had Tier B
+                    been the sort of match that may be acted on unreviewed
+    """
     def info(i, keeper):
         r = recs[i]
         t = '%dx%d, %.2f MB' % (shown_dims(r) + (r['b'] / 1048576.0,))
@@ -1533,6 +1649,13 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
 
     plan, home = build_emission_plan(tier_a, tier_b, recs, info_b)
     check_emission(plan, home)
+    # Real Tier B clusters carry suggested drops; info_b groups carry none,
+    # and the plan cannot tell them apart because both use key 'B'. So take
+    # the suggestion from where it was actually decided.
+    b_sugg = set()
+    for _k, _drops, _m in tier_b:
+        b_sugg.update(_drops)
+    editable_at, suggested_b = {}, []
 
     L = ['# ' + '=' * 74,
          '#  DUPLICATE SELECTION LIST',
@@ -1580,7 +1703,8 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                 # witnesses; a reference-only cluster has nothing to delete,
                 # so it gets no manifest rows at all
                 rows.append({'rel': recs[i]['p'], 'size': recs[i]['b'],
-                             'sha': recs[i]['sha'], 'cl': cl_id, 'home': home[i]})
+                             'sha': recs[i]['sha'], 'cl': cl_id, 'home': home[i],
+                             't': key})
         for i in ([keeper] + [m for m in editable if m != keeper] if editable else []):
             is_keeper = (i == keeper)
             if list_safe(recs[i]['p']) != recs[i]['p']:
@@ -1599,8 +1723,15 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             else:
                 mark = '.' if (is_keeper or key == 'B') else 'X'
                 L.append('%s  %s   [%s]' % (mark, recs[i]['p'], info(i, is_keeper)))
-            rows.append({'rel': recs[i]['p'], 'size': recs[i]['b'],
-                         'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id})
+                editable_at[recs[i]['p']] = len(L) - 1
+            sd = 1 if (key == 'B' and not is_keeper and i in b_sugg) else 0
+            if sd and recs[i]['p'] in editable_at:
+                suggested_b.append(recs[i]['p'])
+            row = {'rel': recs[i]['p'], 'size': recs[i]['b'],
+                   'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key}
+            if sd:
+                row['sd'] = 1
+            rows.append(row)
     L.append('')
     write_text_file(list_path, L)
 
@@ -1635,7 +1766,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
         os.chmod(sh_path, 0o755)
     except OSError:
         pass
-    return len(rows)
+    return len(rows), L, editable_at, suggested_b
 
 
 def write_text_file(path, lines):
@@ -1760,6 +1891,69 @@ def read_marks():
     return marks, unknown
 
 
+def offer_tier_b(marks):
+    """Tier B is left unmarked on purpose, so acting on it means editing
+    hundreds of lines by hand. Offer the bulk choice out loud instead.
+
+    Only ever ADDS marks, only to rows the scan itself nominated, and only
+    after an explicit answer. The default is still Tier A alone: pressing
+    Enter, piping from a script, or running with no terminal all leave Tier
+    B exactly as the list has it. Everything chosen here still goes through
+    the same survivor and hash checks below - this decides what to propose,
+    not what is safe."""
+    pend = [e for e in MANIFEST
+            if e.get('sd') and marks.get(e['rel']) != 'X']
+    if not pend:
+        return marks
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        print('')
+        print('  Note: %d Tier B file(s) the scan flagged are still marked '
+              'keep.' % len(pend))
+        print('        Run this from a terminal to decide about them, or '
+              'mark them in')
+        print('        the report or the list. Continuing with Tier A only.')
+        return marks
+    size = sum(e['size'] for e in pend) / 1048576.0
+    print('')
+    print('  Tier B -- crop / variant, %d file(s), %.1f MB' % (len(pend), size))
+    print('  These are structurally the same picture with genuinely '
+          'different pixels:')
+    print('  a crop, a re-edit, a frame from the same burst. The scan '
+          'nominated a copy')
+    print('  to drop in each, but did NOT mark them, because these are the '
+          'ones where')
+    print('  it is most often wrong.')
+    print('')
+    print('    [Enter]  Tier A only, and leave Tier B alone   (default)')
+    print('    b        also bin the %d Tier B file(s) above' % len(pend))
+    print('    q        quit now, so you can go through them first')
+    print('')
+    try:
+        a = input('  Choose: ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print('')
+        return marks
+    if a == 'q':
+        print('')
+        print('  Nothing deleted. Open the report, click the ones you want '
+              'gone, download')
+        print('  the list over this one, and run this again.')
+        raise SystemExit(0)
+    if a == 'b':
+        for e in pend:
+            marks[e['rel']] = 'X'
+        print('  -> Tier B included. They are still checked like everything '
+              'else: a cluster')
+        print('     that would lose every copy is refused, and so is a file '
+              'whose bytes')
+        print('     changed since the scan.')
+    return marks
+
+
 def main():
     if not os.path.isfile(LIST_FILE):
         print('')
@@ -1773,6 +1967,7 @@ def main():
         return 1
 
     marks, unknown = read_marks()
+    marks = offer_tier_b(marks)
     nx = sum(1 for v in marks.values() if v == 'X')
     nk = sum(1 for v in marks.values() if v == '.')
     print('')
@@ -2384,9 +2579,9 @@ def main():
                            ' and CLIP cosine >= %.3f' % args.tier_a_cos if used_clip else ''))}
     plan, home = build_emission_plan(tier_a, tier_b, recs, info_b)
     check_emission(plan, home)
-    write_report(rep, recs, tier_a, tier_b, root, stats, plan, home)
 
     if nothing:
+        write_report(rep, recs, tier_a, tier_b, root, stats, plan, home)
         # Writing a selection list and a Recycle-Bin script with an empty
         # manifest is worse than writing nothing: it looks like a loaded tool
         # that silently does nothing, and a stale one from an earlier run is
@@ -2414,8 +2609,15 @@ def main():
         print('')
         return 0
 
-    nrows = write_list_and_script(lst, rpy, bat, sh, recs, tier_a, tier_b,
-                                  root, info_b)
+    # The list is written first so the report can carry a copy of it. The
+    # page edits the very lines this wrote; rendering the format a second
+    # time in JavaScript would leave two implementations free to drift, and
+    # this project has been bitten by exactly that before.
+    nrows, llines, editable_at, suggested_b = write_list_and_script(
+        lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b)
+    write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
+                 list_lines=llines, editable_at=editable_at,
+                 suggested_b=suggested_b, list_name=os.path.basename(lst))
     print('')
     print('Wrote:')
     for q in (rep, lst, rpy, bat, sh):
