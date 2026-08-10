@@ -1352,6 +1352,70 @@ def self_test():
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # A name the list refuses to make editable must not be reachable by the
+    # recycler's bulk Tier B answer either. The list promises "always kept"
+    # about these; that promise has to survive every route to deletion, not
+    # just the one it is printed next to.
+    try:
+        import re as _re
+        import shutil as _sh
+        import tempfile
+        recs_n = [{'p': 'keeper.png', 'b': 900, 'sha': 'a' * 64, 'w': 40, 'h': 40},
+                  {'p': 'bad\nname.png', 'b': 100, 'sha': 'b' * 64, 'w': 20, 'h': 20}]
+        td = tempfile.mkdtemp()
+        _n, _L, _at, sug, _all = write_list_and_script(
+            os.path.join(td, 'l.txt'), os.path.join(td, 'r.py'),
+            os.path.join(td, 'r.bat'), os.path.join(td, 'r.sh'),
+            recs_n, [], [(0, [1], [0, 1])], td)
+        src = open(os.path.join(td, 'r.py'), encoding='utf-8').read()
+        man = json.loads(_re.search(r'MANIFEST = (\[.*?\n\])\n', src, _re.S).group(1))
+        flagged = [r for r in man if r.get('sd')]
+        safe = not sug and not flagged
+        print('  [%s] an uneditable name is never a bulk-delete suggestion'
+              % ('PASS' if safe else 'FAIL'))
+        ok = ok and safe
+        _sh.rmtree(td, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A path may legally contain "</script>" on Linux - one directory called
+    # `a<` and a file called `script>`. Generate a real report through the
+    # real writer and check the browser would still see one whole script.
+    try:
+        import shutil as _sh2
+        import tempfile
+        buf = io.BytesIO()
+        Image.fromarray(np.zeros((8, 8, 3), np.uint8)).save(buf, 'JPEG')
+        tb = base64.b64encode(buf.getvalue()).decode('ascii')
+        evil = 'a</script>x.png'
+        recs_s = [{'p': 'keep.png', 'b': 900, 'sha': 'a' * 64, 'w': 40, 'h': 40, 'tb': tb},
+                  {'p': evil, 'b': 100, 'sha': 'b' * 64, 'w': 20, 'h': 20, 'tb': tb}]
+        ta_s = [(0, [1], [0, 1])]
+        td = tempfile.mkdtemp()
+        _n, LL, at_s, sg_s, all_s = write_list_and_script(
+            os.path.join(td, 'l.txt'), os.path.join(td, 'r.py'),
+            os.path.join(td, 'r.bat'), os.path.join(td, 'r.sh'),
+            recs_s, ta_s, [], td)
+        pl_s, hm_s = build_emission_plan(ta_s, [], recs_s)
+        rp = os.path.join(td, 'r.html')
+        write_report(rp, recs_s, ta_s, [], td,
+                     {'n': 2, 'exact': 0, 'headline': 'x', 'method': 'y'},
+                     pl_s, hm_s, list_lines=LL, editable_at=at_s,
+                     suggested_b=sg_s, tier_b_all=all_s, list_name='l.txt')
+        page = open(rp, encoding='utf-8').read()
+        body = page[page.find('<script>'):]
+        # exactly one closing tag, and it comes after the code that runs
+        whole = (body.count('</script>') == 1
+                 and body.find('paint();') < body.find('</script>'))
+        print('  [%s] a path cannot close the report\'s script block'
+              % ('PASS' if whole else 'FAIL'))
+        ok = ok and whole
+        _sh2.rmtree(td, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
     # fallback suite away the moment anything above it failed
@@ -1387,7 +1451,7 @@ def small_b64(rec, maxw=150):
 
 def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                  list_lines=None, editable_at=None, suggested_b=None,
-                 list_name=None):
+                 tier_b_all=None, list_name=None):
     def mb(x):
         return '%.2f MB' % (x / 1048576.0)
 
@@ -1581,10 +1645,23 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
         # character of a line it was told is editable. It cannot invent a
         # line, reorder one, or touch a comment, so the file it hands back
         # is the one this run wrote with some marks flipped - nothing else.
+        def js(o):
+            """JSON safe to sit inside a <script> element.
+
+            A path may legally contain "</script>" on Linux - one directory
+            called `a<` and a file called `script>` is all it takes - and a
+            literal one closes the element early, killing every control on
+            the page and spilling the rest of the code out as text. HTML
+            does not parse escapes inside a script, so the fix has to happen
+            in the JSON: \\u003c is the same string to JavaScript and no
+            longer a tag to the parser. Structural JSON never contains these
+            characters, so only string contents are touched."""
+            return (json.dumps(o).replace('<', '\\u003c').replace('>', '\\u003e')
+                    .replace('&', '\\u0026'))
         A('<script>')
-        A('var LINES=%s,AT=%s,SUGG=%s,NAME=%s,CRLF=%s;'
-          % (json.dumps(list_lines), json.dumps(editable_at),
-             json.dumps(suggested_b or []), json.dumps(list_name or 'duplicates-list.txt'),
+        A('var LINES=%s,AT=%s,SUGG=%s,TIERB=%s,NAME=%s,CRLF=%s;'
+          % (js(list_lines), js(editable_at), js(suggested_b or []),
+             js(tier_b_all or []), js(list_name or 'duplicates-list.txt'),
              'true' if os.name == 'nt' else 'false'))
         A(r'''
 var ORIG=LINES.slice(), tiles=[].slice.call(document.querySelectorAll('.it[data-p]')), cur=0;
@@ -1601,8 +1678,7 @@ function toggle(p){mark(p,!isOn(p)); paint();}
 tiles.forEach(function(t,ix){t.addEventListener('click',function(e){
   cur=ix; toggle(t.getAttribute('data-p')); e.preventDefault();});});
 document.getElementById('ball').onclick=function(){SUGG.forEach(function(p){mark(p,true);});paint();};
-document.getElementById('bnone').onclick=function(){
-  for(var k in AT){if(SUGG.indexOf(k)>=0||ORIG[AT[k]].charAt(0)==='.')mark(k,false);}paint();};
+document.getElementById('bnone').onclick=function(){TIERB.forEach(function(p){mark(p,false);});paint();};
 document.getElementById('breset').onclick=function(){LINES=ORIG.slice();paint();};
 document.getElementById('bdl').onclick=function(){
   var txt=LINES.join(CRLF?'\r\n':'\n'), blob=new Blob([CRLF?'﻿'+txt:txt],
@@ -1655,7 +1731,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     b_sugg = set()
     for _k, _drops, _m in tier_b:
         b_sugg.update(_drops)
-    editable_at, suggested_b = {}, []
+    editable_at, suggested_b, tier_b_all = {}, [], []
 
     L = ['# ' + '=' * 74,
          '#  DUPLICATE SELECTION LIST',
@@ -1724,9 +1800,18 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                 mark = '.' if (is_keeper or key == 'B') else 'X'
                 L.append('%s  %s   [%s]' % (mark, recs[i]['p'], info(i, is_keeper)))
                 editable_at[recs[i]['p']] = len(L) - 1
-            sd = 1 if (key == 'B' and not is_keeper and i in b_sugg) else 0
-            if sd and recs[i]['p'] in editable_at:
+            # A file with control characters in its name gets NO editable
+            # line, and the list says of it "always kept". Flagging it as a
+            # suggestion anyway would let the recycler's bulk Tier B answer
+            # mark it X and delete it - the one thing that branch promises
+            # cannot happen. So the suggestion is conditional on the file
+            # having a line to be suggested in.
+            sd = 1 if (key == 'B' and not is_keeper and i in b_sugg
+                       and recs[i]['p'] in editable_at) else 0
+            if sd:
                 suggested_b.append(recs[i]['p'])
+            if key == 'B' and not is_keeper and recs[i]['p'] in editable_at:
+                tier_b_all.append(recs[i]['p'])
             row = {'rel': recs[i]['p'], 'size': recs[i]['b'],
                    'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key}
             if sd:
@@ -1766,7 +1851,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
         os.chmod(sh_path, 0o755)
     except OSError:
         pass
-    return len(rows), L, editable_at, suggested_b
+    return len(rows), L, editable_at, suggested_b, tier_b_all
 
 
 def write_text_file(path, lines):
@@ -2613,11 +2698,12 @@ def main():
     # page edits the very lines this wrote; rendering the format a second
     # time in JavaScript would leave two implementations free to drift, and
     # this project has been bitten by exactly that before.
-    nrows, llines, editable_at, suggested_b = write_list_and_script(
+    nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
         lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b)
     write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
                  list_lines=llines, editable_at=editable_at,
-                 suggested_b=suggested_b, list_name=os.path.basename(lst))
+                 suggested_b=suggested_b, tier_b_all=tier_b_all,
+                 list_name=os.path.basename(lst))
     print('')
     print('Wrote:')
     for q in (rep, lst, rpy, bat, sh):

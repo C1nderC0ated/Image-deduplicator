@@ -440,7 +440,13 @@ def build_fast_preprocess(proc):
     if not all(getattr(proc, f, False) for f in
                ('do_resize', 'do_center_crop', 'do_rescale', 'do_normalize')):
         return None
-    if int(getattr(proc, 'resample', -1)) != int(Image.Resampling.BICUBIC):
+    try:
+        # A processor may carry resample=None, and int(None) raises rather
+        # than declining - which would take the whole stage down instead of
+        # falling back, exactly inverting what this function is for.
+        if int(getattr(proc, 'resample', -1)) != int(Image.Resampling.BICUBIC):
+            return None
+    except (TypeError, ValueError):
         return None
     scale = getattr(proc, 'rescale_factor', None)
     mean, std = getattr(proc, 'image_mean', None), getattr(proc, 'image_std', None)

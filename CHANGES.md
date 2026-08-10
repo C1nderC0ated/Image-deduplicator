@@ -3,7 +3,52 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.2f — 2026-08-10 (current)
+## v4.3.2g — 2026-08-10 (current)
+
+**An audit of yesterday's two releases, which found four defects, all four
+of them introduced by those releases.** One could have deleted a file the
+tool promises in writing to keep.
+
+- **HIGH. The bulk Tier B answer could delete a file the list calls
+  "always kept".** A name containing control characters gets no editable
+  line on purpose, so it cannot be marked and cannot be deleted through the
+  list. But the manifest row was flagged as a Tier B suggestion anyway, and
+  the recycler's new `b` answer marks by manifest row, not by list line. So
+  the one route added yesterday walked straight around a guarantee the file
+  prints two lines above itself. Reachable on Linux, where a newline in a
+  filename is legal; not on Windows, which forbids the characters. The flag
+  is now conditional on the file actually having a line to be suggested in,
+  and a self-test pins it.
+- **MEDIUM. A path containing `</script>` broke the whole report.** One
+  directory called `a<` and a file called `script>` is all it takes, and it
+  is legal on Linux. The list is embedded in the page as JSON, and a
+  literal `</script>` inside a string closes the element early: every
+  control dies and the rest of the code spills onto the page as text. HTML
+  does not parse escapes inside a script, so the fix is in the JSON -
+  `<` is the same string to JavaScript and not a tag to the parser.
+  Also pinned, by generating a real report from a hostile path.
+- **MEDIUM. `build_fast_preprocess` crashed instead of declining.** A
+  processor carrying `resample=None` reached `int(None)`, which raises -
+  and the call sits outside the try that catches everything else, so it
+  took the whole embedding stage down. That inverts the entire point of a
+  function whose job is to refuse anything it does not recognise. Only
+  reachable with a non-default `--model`.
+- **LOW. "Clear every Tier B mark" cleared more than Tier B.** It unmarked
+  every line that started as `.`, which includes Tier A keepers - so moving
+  an `X` onto a keeper by hand, then clearing Tier B, silently undid the
+  edit. It now clears exactly the Tier B lines, and a manual Tier A mark
+  survives it.
+
+Checked and found sound: the `.bat` interpreter dance in
+`Find-Duplicates.bat` (a failed probe clears `PYTHON_CMD` and the restore
+works), quote and non-ASCII handling in the tile attributes, and whether
+bulk-marking can strand a cluster with no survivor (it cannot - the
+existing per-cluster check catches it and refuses).
+
+The selection list is still byte-identical to what v4.3.2 wrote for the
+same inventory.
+
+## v4.3.2f — 2026-08-10
 
 **Tier B stopped being homework.** Reviewing it meant reading a few
 hundred lines of text and moving characters by hand, which is why almost
