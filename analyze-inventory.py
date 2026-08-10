@@ -1534,21 +1534,20 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     live = bool(list_lines and editable_at)
     if live:
         A('<div class="bar">'
-          '<button id="ball">Mark all Tier B suggestions</button>'
-          '<button id="bnone">Clear every Tier B mark</button>'
-          '<button id="breset">Reset to as-scanned</button>'
+          '<button id="ball">Mark all Tier B suggested</button>'
+          '<button id="bnone">Clear Tier B</button>'
+          '<button id="breset">Reset to scan defaults</button>'
           '<span class="sp"></span>'
-          '<span class="tally"><b id="nx">0</b> marked for the bin</span>'
+          '<span class="tally"><b id="nx">0</b> marked X</span>'
           '<button class="go" id="bdl">Download %s</button></div>'
           % esc(list_name or 'duplicates-list.txt'))
     A('<h1>Duplicate report</h1>')
     if live:
-        A('<p class="hint">Click any thumbnail to mark or unmark it, or use '
-          '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move and <kbd>X</kbd> to toggle. '
-          'Nothing is deleted here &mdash; when the marks look right, download the '
-          'list, put it back beside the images, and run the recycler. '
-          'The keeper of a cluster refuses to be marked, so a group can never be '
-          'emptied from this page.</p>')
+        A('<p class="hint">Click a thumbnail to mark or unmark it. '
+          '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move, <kbd>X</kbd> toggles. '
+          'Nothing is deleted here: download the list, save it beside the images, '
+          'and run the recycler. Keepers cannot be marked, so every cluster '
+          'retains at least one copy.</p>')
     if not tier_a and not tier_b:
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
           'No duplicates found &mdash; every image in this folder is distinct. '
@@ -2011,10 +2010,7 @@ def offer_tier_b(marks):
         n = sum(1 for e in MANIFEST
                 if e.get('t') == 'B' and marks.get(e['rel']) == 'X')
         print('')
-        print('  Tier B: using your edits (%d marked X). Not asking about '
-              'the rest -' % n)
-        print('          leaving one on "." is a decision, and this takes it '
-              'as one.')
+        print('  Tier B: using your edits (%d marked X, rest untouched).' % n)
         return marks
     pend = [e for e in MANIFEST
             if e.get('sd') and marks.get(e['rel']) != 'X']
@@ -2026,31 +2022,26 @@ def offer_tier_b(marks):
         interactive = False
     if not interactive:
         print('')
-        print('  Note: Tier B is untouched; %d file(s) the scan flagged are '
-              'still kept.' % len(pend))
-        print('        Mark them in the report or the list, or run this from '
-              'a terminal')
-        print('        to decide here. Going with the list as it stands.')
+        print('  Tier B: untouched, %d flagged file(s) kept. Using the list '
+              'as it is.' % len(pend))
+        print('          Mark them in the report, or run from a terminal to '
+              'choose here.')
         return marks
     size = sum(e['size'] for e in pend) / 1048576.0
     print('')
-    print('  Tier B -- crop / variant, %d file(s), %.1f MB, none marked yet'
-          % (len(pend), size))
-    print('  These are structurally the same picture with genuinely '
-          'different pixels:')
-    print('  a crop, a re-edit, a frame from the same burst. The scan '
-          'nominated a copy')
-    print('  to drop in each, but did NOT mark them, because these are the '
-          'ones where')
-    print('  it is most often wrong.')
+    print('  Tier B: %d file(s), %.1f MB, none marked.' % (len(pend), size))
+    print('  Crop or variant matches - same subject, different pixels. The '
+          'scan picked')
+    print('  a copy to drop in each but left them unmarked; this tier is '
+          'where it is')
+    print('  least reliable.')
     print('')
-    print('    [Enter]  go with the list exactly as it stands   (default)')
-    print('    b        also bin the %d Tier B file(s) above' % len(pend))
-    print('    q        stop, so you can go through them first')
+    print('    [Enter]  use the list as it is      (default)')
+    print('    b        also trash all %d' % len(pend))
+    print('    q        exit without deleting')
     print('')
-    print('  Marking them individually in the report is the better route:')
-    print('  click the ones to bin, download the list over this one, and '
-          'this stops asking.')
+    print('  Marking per file in the report is more precise, and stops this '
+          'prompt.')
     print('')
     try:
         a = input('  Choose: ').strip().lower()
@@ -2059,18 +2050,16 @@ def offer_tier_b(marks):
         return marks
     if a == 'q':
         print('')
-        print('  Nothing deleted. Open the report, click the ones you want '
-              'gone, download')
-        print('  the list over this one, and run this again.')
+        print('  Nothing deleted. Mark them in the report, save the list over '
+              'this one,')
+        print('  and run again.')
         raise SystemExit(0)
     if a == 'b':
         for e in pend:
             marks[e['rel']] = 'X'
-        print('  -> Tier B included. They are still checked like everything '
-              'else: a cluster')
-        print('     that would lose every copy is refused, and so is a file '
-              'whose bytes')
-        print('     changed since the scan.')
+        print('  -> %d added. Same checks apply: every cluster keeps at least '
+              'one copy,' % len(pend))
+        print('     and files whose bytes changed since the scan are skipped.')
     return marks
 
 

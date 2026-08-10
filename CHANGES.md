@@ -24,8 +24,10 @@ a genuinely untouched Tier B, which is the case it was added for.
   included. Marking Tier B files and then pressing a key that promises to
   leave them alone would have deleted them. It now reads `go with the list
   exactly as it stands`, which is what it has always done.
-- The prompt also points at the report as the better route, since marking
-  files individually is both more precise and what stops it asking.
+- The prompt points at the report as the more precise route, since marking
+  per file is what stops it asking.
+- Wording throughout the prompt, the review bar and the launcher was cut
+  back to what is happening, without the commentary around it.
 
 The selection list is unchanged - the new field lives in the recycler's
 manifest, and the list is still byte-identical to v4.3.2's for the same

@@ -77,14 +77,12 @@ if defined TORCH_CMD (
     %TORCH_CMD% "%~dp0embed-images.py" "%INV%"
     if errorlevel 1 (
         echo.
-        echo [skip] The embedding stage did not finish. Carrying on without
-        echo        it - the scan below still works, with pixels only.
+        echo [skip] Embedding did not finish. Continuing with pixels only.
     )
 ) else (
-    echo PyTorch is not installed for this Python, so this stage is skipped.
-    echo The scan still finds duplicates by pixel comparison. What it loses
-    echo is the semantic pass, which is what catches a recoloured or heavily
-    echo cropped copy. Run Check-Image-Tools.bat to add it.
+    echo PyTorch not installed for this Python - stage skipped.
+    echo Pixel comparison still runs. Without CLIP, recoloured and heavily
+    echo cropped copies are not detected. Run Check-Image-Tools.bat to add it.
 )
 
 echo.
@@ -96,8 +94,8 @@ if errorlevel 1 goto :failed
 
 echo.
 for %%R in ("%TARGET%\duplicates-report.html") do if exist "%%~fR" (
-    echo Opening the report. Mark what you want gone, download the list over
-    echo the old one, then run the recycler beside it.
+    echo Opening the report. Mark files to delete, download the list over the
+    echo old one, then run the recycler beside it.
     start "" "%%~fR"
 )
 echo.
@@ -107,7 +105,7 @@ exit /b 0
 :failed
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
-echo That stage failed, so the later ones were not run.
+echo Stage failed. The later stages were not run.
 echo.
 pause
 exit /b %EXIT_CODE%
