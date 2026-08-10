@@ -3,7 +3,35 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.2g — 2026-08-10 (current)
+## v4.3.2h — 2026-08-11 (current)
+
+**The recycler could not tell "not read yet" from "read, and keeping
+it".** Reported from real use, and correct: after marking some Tier B
+files in the report and putting the list back, it still offered to bin
+every Tier B file left on `.` - which is exactly the set just spared on
+purpose. The edits were read correctly, and a file marked `X` was
+excluded, but nothing distinguished a deliberate keep from an unreviewed
+one, so a reviewed list looked ignored.
+
+Every editable row now records the mark this run wrote. If any Tier B row
+reads differently, the list has been through a human and it wins outright:
+no question is asked, and it says so. The bulk answer is offered only for
+a genuinely untouched Tier B, which is the case it was added for.
+
+- **A mislabel in the dangerous direction, found while fixing the above.**
+  The default read `[Enter] Tier A only, and leave Tier B alone`, but it
+  never did that - it proceeded with the list as written, Tier B `X` marks
+  included. Marking Tier B files and then pressing a key that promises to
+  leave them alone would have deleted them. It now reads `go with the list
+  exactly as it stands`, which is what it has always done.
+- The prompt also points at the report as the better route, since marking
+  files individually is both more precise and what stops it asking.
+
+The selection list is unchanged - the new field lives in the recycler's
+manifest, and the list is still byte-identical to v4.3.2's for the same
+inventory.
+
+## v4.3.2g — 2026-08-10
 
 **An audit of yesterday's two releases, which found four defects, all four
 of them introduced by those releases.** One could have deleted a file the

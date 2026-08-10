@@ -216,7 +216,8 @@ goes wrong, since it lets you re-run one stage without redoing the others.
 6. Run `Recycle-Duplicates.bat` (Windows) or `./Recycle-Duplicates.sh`
    (Linux/macOS), read the preview, answer `y`. Both just run
    `Recycle-Duplicates.py`, which is where every safety rule lives.
-   If Tier B files the scan flagged are still unmarked it asks first:
+   If Tier B is untouched it asks first (once you have marked any Tier B
+   file yourself, it stops asking and just uses your list):
    `Enter` for Tier A only (the default, and what happens with piped input
    or no terminal), `b` to include them, `q` to stop and review. Either way
    they go through the same survivor and hash checks as everything else.
@@ -618,7 +619,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.2g** (2026-08-10). Full history, including every bug and what it
+**v4.3.2h** (2026-08-11). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

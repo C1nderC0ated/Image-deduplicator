@@ -1796,6 +1796,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                          ' always kept]')
                 L.append('#    %s   [%s]' % (list_safe(recs[i]['p']),
                                              info(i, is_keeper)))
+                mark = None
             else:
                 mark = '.' if (is_keeper or key == 'B') else 'X'
                 L.append('%s  %s   [%s]' % (mark, recs[i]['p'], info(i, is_keeper)))
@@ -1816,6 +1817,10 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                    'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key}
             if sd:
                 row['sd'] = 1
+            if mark is not None:
+                # the mark THIS run wrote, so the recycler can tell an
+                # untouched list from a reviewed one
+                row['m0'] = mark
             rows.append(row)
     L.append('')
     write_text_file(list_path, L)
@@ -1976,16 +1981,41 @@ def read_marks():
     return marks, unknown
 
 
-def offer_tier_b(marks):
-    """Tier B is left unmarked on purpose, so acting on it means editing
-    hundreds of lines by hand. Offer the bulk choice out loud instead.
+def tier_b_reviewed(marks):
+    """True when the Tier B part of the list is not as this scan wrote it.
 
-    Only ever ADDS marks, only to rows the scan itself nominated, and only
-    after an explicit answer. The default is still Tier A alone: pressing
-    Enter, piping from a script, or running with no terminal all leave Tier
-    B exactly as the list has it. Everything chosen here still goes through
-    the same survivor and hash checks below - this decides what to propose,
-    not what is safe."""
+    Every editable row carries `m0`, the mark this run put there. If any
+    Tier B row now reads differently, a human has been through it, and a
+    file left on '.' means "I looked, and I am keeping this" - not "not yet
+    read". Those two are opposite instructions and the old code could not
+    tell them apart, so it kept offering to bin files that had just been
+    deliberately spared."""
+    for e in MANIFEST:
+        if e.get('t') != 'B' or 'm0' not in e:
+            continue
+        if marks.get(e['rel'], e['m0']) != e['m0']:
+            return True
+    return False
+
+
+def offer_tier_b(marks):
+    """Tier B is written unmarked, so acting on it used to mean editing
+    hundreds of lines by hand. Offer the bulk answer for that case only.
+
+    It never overrides a decision. If the list has been edited at all in
+    Tier B the list wins outright and nothing is asked. Otherwise it may
+    only ADD marks, only to rows the scan itself nominated, and only after
+    an explicit answer. Everything still passes the same survivor and hash
+    checks below; this decides what to propose, not what is safe."""
+    if tier_b_reviewed(marks):
+        n = sum(1 for e in MANIFEST
+                if e.get('t') == 'B' and marks.get(e['rel']) == 'X')
+        print('')
+        print('  Tier B: using your edits (%d marked X). Not asking about '
+              'the rest -' % n)
+        print('          leaving one on "." is a decision, and this takes it '
+              'as one.')
+        return marks
     pend = [e for e in MANIFEST
             if e.get('sd') and marks.get(e['rel']) != 'X']
     if not pend:
@@ -1996,15 +2026,16 @@ def offer_tier_b(marks):
         interactive = False
     if not interactive:
         print('')
-        print('  Note: %d Tier B file(s) the scan flagged are still marked '
-              'keep.' % len(pend))
-        print('        Run this from a terminal to decide about them, or '
-              'mark them in')
-        print('        the report or the list. Continuing with Tier A only.')
+        print('  Note: Tier B is untouched; %d file(s) the scan flagged are '
+              'still kept.' % len(pend))
+        print('        Mark them in the report or the list, or run this from '
+              'a terminal')
+        print('        to decide here. Going with the list as it stands.')
         return marks
     size = sum(e['size'] for e in pend) / 1048576.0
     print('')
-    print('  Tier B -- crop / variant, %d file(s), %.1f MB' % (len(pend), size))
+    print('  Tier B -- crop / variant, %d file(s), %.1f MB, none marked yet'
+          % (len(pend), size))
     print('  These are structurally the same picture with genuinely '
           'different pixels:')
     print('  a crop, a re-edit, a frame from the same burst. The scan '
@@ -2013,9 +2044,13 @@ def offer_tier_b(marks):
           'ones where')
     print('  it is most often wrong.')
     print('')
-    print('    [Enter]  Tier A only, and leave Tier B alone   (default)')
+    print('    [Enter]  go with the list exactly as it stands   (default)')
     print('    b        also bin the %d Tier B file(s) above' % len(pend))
-    print('    q        quit now, so you can go through them first')
+    print('    q        stop, so you can go through them first')
+    print('')
+    print('  Marking them individually in the report is the better route:')
+    print('  click the ones to bin, download the list over this one, and '
+          'this stops asking.')
     print('')
     try:
         a = input('  Choose: ').strip().lower()
