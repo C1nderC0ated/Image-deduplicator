@@ -65,6 +65,34 @@ GPU was never the constraint - eight decode threads were.
   4.0 and 12.0 gates across 8,654 real pairs, and the full run is
   byte-identical.
 
+### Collecting: measured, and left alone
+
+Nothing here got faster, which is the honest result rather than a gap.
+
+Almost all of it is one thing: the lossless-WebP attempt costs 135x the
+JPEG encode on a real library (21.97 ms against 0.16 ms) and wins **2 times
+in 2,000**. Skipping it looks like a 2x win for a rounding error's worth of
+thumbnails, and it is still refused, because "which encoder wins" decides
+the stored pixels: WebP is lossless where JPEG q78 is not.
+
+The tempting fix is to predict the winner and only attempt WebP when it
+might. It does not work, and the counterexample is the one already named in
+`make_thumb`'s comment. A smooth RGB gradient has **every pixel unique** -
+a distinct-colour ratio of 1.0000, indistinguishable by that measure from
+photographic noise - and lossless WebP still beats JPEG on it by 23x. Any
+threshold cheap enough to be worth computing skips that image. On real
+content the two populations overlap directly: WebP wins up to a ratio of
+0.0195 and starts losing at 0.0169.
+
+Worker count is exhausted too. The default is already `min(8, cpu_count)`,
+and 8 against 12 against 16 workers on 6,282 real images came out 57.1 s,
+56.5 s, 56.4 s - 1.01x, inside the noise - with byte-identical inventories
+at every setting.
+
+So the only lever in this stage is the existing `--fast-thumbs`, which
+trades those ~0.1% of thumbnails for roughly twice the speed. That stays a
+choice rather than a default.
+
 Rejected after measuring, recorded so they are not tried again: folding
 the luma into one matmul (5% for 2.3e-05 of drift), cv2 for the
 post-matmul luma MAD (faster but no more accurate), thread pinning (a win
