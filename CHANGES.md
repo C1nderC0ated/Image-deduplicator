@@ -5,10 +5,40 @@ because half of these guards only exist since something broke for real.
 
 ## v4.3.2 — 2026-08-10 (current)
 
-**The analyzer got a third faster, and the output did not move by one
-byte.** On the 36,410-image reference library the whole stage went from
-242 s to 162 s, and `duplicates-list.txt` came out with the same md5 it
+**Embedding and analysis both got substantially faster, and neither
+output moved by one byte.** On the 36,410-image reference library:
+embedding 8.3 min to 4.8 min, analysis 242 s to 162 s. All 36,410 CLIP
+vectors came out byte-identical, and `duplicates-list.txt` kept the md5 it
 had before, down to every intermediate count.
+
+### Embedding: the card was waiting on the CPU
+
+Preprocessing costs 36 ms per image against 10.5 ms of wall time, so the
+GPU was never the constraint - eight decode threads were.
+
+- **Most of the image processor's time was not spent processing images.**
+  Its four operations, called directly, cost 14.35 ms against 22.96 ms
+  through `proc()`: about 8.6 ms per image of validation, list wrapping,
+  dtype probing and channel-format negotiation. `build_fast_preprocess`
+  does the same four operations itself, and throughput went from 95 to 126
+  images per second.
+- **Two details decide whether it is exact.** `rescale` upcasts to float64
+  before multiplying and casts down to float32 only at the end, and
+  `normalize` then runs in float32 with mean and std cast to the image's
+  dtype. Multiplying in float32 directly - the obvious way to write it -
+  is off by one ULP, ~5e-07. That is small enough to look like nothing and
+  still move which pairs the analyzer nominates, so it is not tolerated:
+  measured byte-identical across 1,500 images spanning 295 distinct sizes,
+  then across all 36,410 vectors of a full run.
+- **It refuses rather than guesses.** The fast path engages only when every
+  processor setting matches what it replicates, and then only after being
+  checked byte-for-byte at startup against the processor it stands in for,
+  across five shapes: both orientations, already-square, an extreme aspect
+  ratio, and an upscale. Any mismatch or exception and the real processor
+  is used, with a printed note. A different model gets the slow path, not
+  wrong vectors.
+
+### Analysis
 
 - **The hottest function in the tool was on the slow path.** v4.2f gave
   `absdiff_mean` a fast OpenCV route, but `mad_pair` carried its own copy

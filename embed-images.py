@@ -121,6 +121,7 @@ except ImportError:
     print('Run Check-Image-Tools.bat - it lists every Python on this machine')
     print('and prints the exact pip command for the one you want to use.')
     sys.exit(2)
+import numpy as np           # torch depends on it, so it is here if torch is
 
 
 def _defuse_stale_torchvision():
@@ -397,6 +398,78 @@ def model_input_edge(proc):
     return 224
 
 
+def _cfg(obj, *keys):
+    """First present key of a transformers SizeDict / plain dict."""
+    for k in keys:
+        v = getattr(obj, k, None) if not isinstance(obj, dict) else obj.get(k)
+        if isinstance(v, int):
+            return v
+    return None
+
+
+def build_fast_preprocess(proc):
+    """A bit-identical stand-in for `proc(images=im)`, or None.
+
+    The processor spends most of its time not resizing. Measured on 1,500
+    images from a real library: 22.96 ms inside `proc()` against 14.35 ms
+    for the same four operations called directly, so roughly 8.6 ms per
+    image is framework overhead - validation, list wrapping, dtype probing,
+    channel-format negotiation - on a stage that is CPU-bound, not GPU-bound
+    (36 ms of preprocessing per image against 10.5 ms of wall time means the
+    card is waiting on threads).
+
+    Matching it EXACTLY means copying two details that look like noise:
+
+      * rescale upcasts to float64 before multiplying and only then casts
+        down to float32. Multiplying in float32 directly is off by one ULP.
+      * normalize then runs in float32, mean and std cast to the image
+        dtype - not the other way around.
+
+    Get either wrong and the vectors shift by ~5e-07, which is small enough
+    to look like nothing and still change which pairs the analyzer nominates.
+    So this refuses to engage unless every setting matches what it
+    replicates, and the caller proves it byte-for-byte before use."""
+    size, crop = getattr(proc, 'size', None), getattr(proc, 'crop_size', None)
+    edge = _cfg(size, 'shortest_edge')
+    ch = _cfg(crop, 'height')
+    cw = _cfg(crop, 'width')
+    if edge is None or ch is None or cw != ch:
+        return None
+    if _cfg(size, 'height') or _cfg(size, 'width') or _cfg(size, 'longest_edge'):
+        return None                      # a fixed-size processor, not this one
+    if not all(getattr(proc, f, False) for f in
+               ('do_resize', 'do_center_crop', 'do_rescale', 'do_normalize')):
+        return None
+    if int(getattr(proc, 'resample', -1)) != int(Image.Resampling.BICUBIC):
+        return None
+    scale = getattr(proc, 'rescale_factor', None)
+    mean, std = getattr(proc, 'image_mean', None), getattr(proc, 'image_std', None)
+    if not isinstance(scale, float) or not mean or not std:
+        return None
+    if len(mean) != 3 or len(std) != 3:
+        return None
+    mean = np.array(mean, dtype=np.float32)
+    std = np.array(std, dtype=np.float32)
+    bicubic = Image.Resampling.BICUBIC
+
+    def fast(im):
+        w, h = im.size
+        # transformers' get_resize_output_image_size with default_to_square
+        # False: scale the short side to `edge`, truncate the long side.
+        if w <= h:
+            nw, nh = edge, int(edge * h / w)
+        else:
+            nh, nw = edge, int(edge * w / h)
+        im = im.resize((nw, nh), bicubic)
+        left, top = (nw - cw) // 2, (nh - ch) // 2
+        a = np.asarray(im.crop((left, top, left + cw, top + ch)))
+        a = (a.astype(np.float64) * scale).astype(np.float32)
+        a = (a - mean) / std
+        return torch.from_numpy(np.ascontiguousarray(a.transpose(2, 0, 1)))
+
+    return fast
+
+
 def _result(fut):
     """An untimed Future.result() cannot be interrupted by Ctrl+C on
     Windows; the short timed wait keeps KeyboardInterrupt deliverable.
@@ -611,6 +684,29 @@ def main():
 
     draft_px = 0 if args.no_draft else model_input_edge(proc) * 4
 
+    # Matching the processor's settings is necessary but not sufficient, so
+    # the claim gets tested rather than assumed: five shapes covering both
+    # orientations, the already-square case, an extreme aspect ratio and an
+    # upscale, each compared byte-for-byte against the processor it stands
+    # in for. Any mismatch, any exception, and the real processor is used.
+    fast_prep = build_fast_preprocess(proc)
+    if fast_prep is not None:
+        try:
+            rng = np.random.default_rng(0)
+            for w, h in ((640, 480), (480, 640), (224, 224), (1000, 233), (37, 41)):
+                probe = Image.fromarray(
+                    rng.integers(0, 256, (h, w, 3), dtype=np.uint8), 'RGB')
+                if not torch.equal(
+                        proc(images=probe, return_tensors='pt')['pixel_values'][0],
+                        fast_prep(probe)):
+                    fast_prep = None
+                    break
+        except Exception:
+            fast_prep = None
+    if fast_prep is None:
+        print('   note: preprocessing through the image processor '
+              '(the direct path does not match this model exactly).')
+
     def prep_one(r):
         """Decode + preprocess one image off the main thread.
         Returns (rec, pixel_tensor, error_or_None, path_used). Tries every
@@ -680,7 +776,8 @@ def main():
                         bg.paste(rgba, (0, 0), rgba)
                         im = bg
                     im = im.convert('RGB')
-                    px = proc(images=im, return_tensors='pt')['pixel_values'][0]
+                    px = (fast_prep(im) if fast_prep is not None else
+                          proc(images=im, return_tensors='pt')['pixel_values'][0])
                 return r, px, None, rel
             except Exception as e:
                 last, last_rel = rel + ': ' + str(e)[:200], rel
