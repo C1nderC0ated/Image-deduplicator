@@ -420,7 +420,7 @@ more:
 |---|---|---|
 | `--thumb N` | 128 | thumbnail max side, px |
 | `--workers N` | auto (≤ 8) | parallel hash/decode/thumbnail threads |
-| `--fast-thumbs` | off | skip the lossless-WebP thumbnail attempt (~2.7× faster). Thumbnails become always-JPEG, so flat/UI content stores slightly different pixels — don't mix with a default-built inventory |
+| `--lossless-thumbs` | off | also try a lossless WebP thumbnail and keep it when smaller. ~2.2× slower. Across 36,410 images it changed no duplicate decision, which is why it is no longer the default — but a collection that is mostly screenshots, UI captures or pixel art has a far larger share of qualifying thumbnails, and this keeps their pixels exact |
 | `--split-mb N` | 200 | roll output to a new `.partN` past this size |
 | `--resume` / `--no-resume` | ask | reuse previous inventory for unchanged files |
 | `--out FILE` | `<folder>/image-inventory.jsonl` | output path |
@@ -619,7 +619,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.2h** (2026-08-11). Full history, including every bug and what it
+**v4.3.3** (2026-08-11). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

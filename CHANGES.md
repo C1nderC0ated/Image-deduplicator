@@ -3,7 +3,69 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.2h — 2026-08-11 (current)
+## v4.3.3 — 2026-08-11 (current)
+
+**Scanning is 2.16x faster, and the duplicate decisions did not move.**
+382.1 s to 176.5 s on the 36,410-image library. The lossless-WebP
+thumbnail attempt is no longer the default; `--lossless-thumbs` brings it
+back.
+
+That attempt cost 135x the JPEG encode (21.97 ms against 0.16 ms) and won
+2 times in 2,000, so it was most of the scan for a tenth of a percent of
+the thumbnails. Dropping it is not free in principle - those thumbnails
+become lossy - so it was settled by running the whole pipeline both ways:
+
+| | default | `--lossless-thumbs` |
+| --- | --- | --- |
+| collect | **176.5 s** | 382.1 s |
+| list lines | 350 | 350 |
+| marks that differ | \- | **0** |
+| Tier A clusters / droppable | 3 / 4 | 3 / 4 |
+| Tier B clusters | 95 | 95 |
+| candidate pairs | 376,663 | 376,660 |
+
+Three extra candidate *pairs* appeared. That is the thumbnail noise
+showing up in the prefilter and stopping short of any verdict, and it is
+recorded here rather than rounded away.
+
+**Why it is safe is worth stating, because two earlier attempts to reason
+about it were wrong.** The obvious measurement - how much noise JPEG
+injects into one thumbnail - gives a median of 4.437, which is *above* the
+4.0 Tier A gate and would suggest the tool cannot work at all. It does
+work, because JPEG is deterministic: two copies of one picture thumbnail
+to byte-identical output, so the error cancels rather than accumulating.
+What reaches the gate is the *differential* between two similar images,
+and measured on real pairs that tops out at **1.66** against a gate of
+4.0, with zero verdict flips in 478 pairs.
+
+`--fast-thumbs` still runs, and now does nothing, so existing commands and
+scripts keep working.
+
+Also measured and declined, from a set of externally suggested
+optimisations:
+
+- **`cv2.resize(INTER_AREA)` for the 8x8 signatures** is real - 2.49x on
+  that step, and zero prefilter changes across 4,295 pairs. It is declined
+  anyway: `decode_signatures` is ~12.5 s of a 164 s analyze, so it buys
+  under 1% of the pipeline, while the pair distances it produces differ by
+  up to 4.786 against a sweep cut of 8.0. Perturbing a recall gate that
+  fails *silently* to buy 1% is the wrong trade.
+- **Raising `ONE_READ_LIMIT`** to avoid double-reading large files: 8 of
+  36,420 images exceed the current 32 MB. Median file is 0.14 MB.
+- **Skipping EXIF on PNG**: `getexif()` costs 147 ms on a PNG against
+  0.0037 ms on a JPEG, which looks decisive until measured end to end -
+  125.55 ms with it, 126.21 ms without. It was only paying the decode
+  `make_thumb` needs anyway.
+- **`os.scandir` to avoid a `stat` per file**: `os.stat` is 0.013 ms,
+  0.03% of per-image cost.
+- **More workers**: 8/12/16 gave 57.1/56.5/56.4 s, and a deeper in-flight
+  window 64.3 s against 64.6 s. Both inside the noise on an 8-core box.
+- **Keeping OpenCV's native BGR buffers**: saves a `cvtColor`, but
+  `gray_small` feeds `convert('L')`, which would apply the red weight to
+  the blue channel. Crop-matching scores shift, so the 0.92 NCC gate would
+  need recalibrating for ~1 ms per thumbnail.
+
+## v4.3.2h — 2026-08-11
 
 **The recycler could not tell "not read yet" from "read, and keeping
 it".** Reported from real use, and correct: after marking some Tier B

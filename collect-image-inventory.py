@@ -28,6 +28,10 @@ Options:
                       hashed + decoded + thumbnailed off the main thread)
     --split-mb N      start a new .partN file when the current one
                       exceeds N megabytes               (default 200)
+    --lossless-thumbs also try a lossless WebP thumbnail and keep it when
+                      smaller. ~2.2x slower; changed no duplicate decision
+                      across 36,410 images. Worth it for collections that
+                      are mostly screenshots, UI captures or pixel art
     --resume          reuse records from previous image-inventory*.jsonl
                       in the scanned folder for unchanged files
     --no-resume       never reuse, ignore previous inventories
@@ -429,7 +433,7 @@ def truncated(data):
     return False
 
 
-def make_thumb(im, thumb_px, fast=False):
+def make_thumb(im, thumb_px, fast=True):
     """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
     that is actually smaller (flat/UI content compresses better losslessly)."""
     # exif_transpose ends in `return image.copy()` even when the image has
@@ -540,13 +544,25 @@ def make_thumb(im, thumb_px, fast=False):
     im2.save(bj, 'JPEG', quality=78)
     best, flag = bj.getvalue(), ''
     if fast:
-        # The lossless-WebP attempt is 44x the cost of the JPEG encode and
-        # takes a photo library's per-image work from 13 ms to 35 ms. It is
-        # worth it by default - it genuinely wins on flat/UI content - but
-        # no cheap test predicts the winner: measured over 180 images, JPEG
-        # size overlaps in both directions and a smooth gradient has every
-        # pixel unique yet still compresses 30x better losslessly. So this
-        # is a choice, not a guess.
+        # The default, since v4.3.3. The lossless-WebP attempt below costs
+        # 135x the JPEG encode on a real library (21.97 ms against 0.16 ms)
+        # and wins 2 times in 2,000, so it was most of the scan for a tenth
+        # of a percent of the thumbnails.
+        #
+        # Dropping it is not free in principle - those thumbnails become
+        # lossy - so it was settled by running the whole pipeline both ways
+        # on 36,410 images: same 350 list lines, same marks, same 3 Tier A
+        # clusters, same 95 Tier B clusters. Three extra candidate PAIRS
+        # appeared, which is the noise showing up in the prefilter and
+        # stopping short of any verdict.
+        #
+        # What made it safe is that JPEG is deterministic: two copies of one
+        # picture thumbnail to identical bytes, so the error cancels instead
+        # of accumulating. Measured on real pairs, |MAD(lossless) -
+        # MAD(jpeg)| tops out at 1.66 against a 4.0 gate.
+        #
+        # --lossless-thumbs brings it back for libraries where a larger
+        # share of thumbnails qualify: screenshots, UI captures, pixel art.
         return flag, im2.size[0], im2.size[1], base64.b64encode(best).decode('ascii')
     try:
         bw = io.BytesIO()
@@ -563,7 +579,7 @@ def make_thumb(im, thumb_px, fast=False):
     return flag, im2.size[0], im2.size[1], base64.b64encode(best).decode('ascii')
 
 
-def process_one(full, rel, thumb_px, fast=False):
+def process_one(full, rel, thumb_px, fast=True):
     rec = {'p': rel}
     st = os.stat(full)
     rec['b'] = st.st_size
@@ -670,7 +686,7 @@ def process_one(full, rel, thumb_px, fast=False):
     return rec
 
 
-def work_one(full, rel, thumb_px, fast=False):
+def work_one(full, rel, thumb_px, fast=True):
     """Thread-pool task: never raises (KeyboardInterrupt stays in the main
     thread). Returns (kind, record, ext_on_error)."""
     try:
@@ -800,12 +816,16 @@ def main():
     ap.add_argument('folder', nargs='?', help="folder to scan (default: this script's folder)")
     ap.add_argument('--out', help='output file path')
     ap.add_argument('--thumb', type=int, default=128, help='thumbnail max side, px')
+    ap.add_argument('--lossless-thumbs', action='store_true',
+                    help='also try a lossless WebP thumbnail and keep it when '
+                         'it is smaller. Costs ~2.2x the scan time; measured '
+                         'on a 36,410-image library it changed no duplicate '
+                         'decision at all. Worth it for a collection that is '
+                         'mostly screenshots, UI captures or pixel art, where '
+                         'a larger share of thumbnails qualify')
     ap.add_argument('--fast-thumbs', action='store_true',
-                    help='skip the lossless-WebP thumbnail attempt (~2.7x '
-                         'faster scanning). Thumbnails are then always JPEG; '
-                         'flat/UI content loses the smaller lossless copy, so '
-                         'its stored pixels differ slightly from a default run '
-                         '- do not mix the two in one resumed inventory')
+                    help=argparse.SUPPRESS)      # now the default; kept so
+    #                                              existing commands still run
     ap.add_argument('--workers', type=int, default=0,
                     help='parallel worker threads (default: auto)')
     ap.add_argument('--split-mb', type=float, default=200.0,
@@ -973,7 +993,7 @@ def main():
                 pending.append(('reused', rec, None))
             else:
                 pending.append(pool.submit(work_one, full, rel, args.thumb,
-                                           args.fast_thumbs))
+                                           not args.lossless_thumbs))
             if len(pending) > window:
                 drain(block=True, keep=window)
             else:
