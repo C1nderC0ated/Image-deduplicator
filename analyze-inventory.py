@@ -843,6 +843,26 @@ def anim_compatible(ra, rb):
 # to 62 keeps unrelated animations out regardless.
 FRAME_CUT = 6.0
 
+# A second, separate question: does any ONE sampled frame disagree badly?
+# The mean above answers "do these animations look alike overall", and it is
+# blind to a short stretch being different, because 24 agreeing frames
+# divide the one that does not. Measured on 39 real animations against
+# themselves with a stretch replaced, the mean alone missed 14 - 36% - and
+# every one of those shares frame 0, so its thumbnail and CLIP vector agree
+# too and nothing else would have caught it.
+#
+# Set from the same real corpus, not guessed:
+#   same clip, re-encoded (70 pairs)      worst frame up to 47.09
+#   same clip, stretch replaced (39)      worst frame up to 127.13
+#   genuinely different clips (494)       worst frame never below 24.89
+# 60 clears every real re-encode by 13 points and still catches 38 of 39
+# planted differences. It costs nothing: the 2 re-encodes it blocks already
+# fail the mean test, whose own worst real value is 6.65.
+#
+# Both must pass. The mean catches wholesale differences, the worst frame
+# catches local ones, and neither is asked to do the other's job.
+FRAME_WORST_CUT = 60.0
+
 
 def frames_agree(ra, rb):
     """Do two animations still match once you look past frame 0?
@@ -871,7 +891,16 @@ def frames_agree(ra, rb):
         return True
     if A.size != B.size:
         return ra.get('anim') == rb.get('anim')
-    return float(np.abs(A.astype(np.float32) - B.astype(np.float32)).mean()) <= FRAME_CUT
+    d = np.abs(A.astype(np.float32) - B.astype(np.float32))
+    if float(d.mean()) > FRAME_CUT:
+        return False
+    # ...and no single sampled frame may disagree badly, which is the part
+    # the mean cannot see. Only when the fingerprint is tile-shaped: an
+    # inventory written before this existed still gets the mean test alone
+    # rather than a reshape that would misread its bytes.
+    if d.size % 192 == 0:
+        return float(d.reshape(-1, 192).mean(1).max()) <= FRAME_WORST_CUT
+    return True
 
 
 def shown_dims(r):
@@ -1409,6 +1438,36 @@ def self_test():
         print('  [%s] a size-mismatched fingerprint is not consent'
               % ('PASS' if strict else 'FAIL'))
         ok = ok and strict
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # One frame that clearly disagrees must veto the match, even when every
+    # other sampled frame is identical. That is the case the mean cannot
+    # see - it divides the difference by however many frames agreed - and
+    # it missed 36% of them on a real corpus before the worst-frame test
+    # was added.
+    try:
+        K = 25
+        base = np.zeros((K, 192), dtype=np.uint8)
+        base[:] = 100
+        other = base.copy()
+        other[K // 2] = 240              # a single sampled frame goes wrong
+        ra = {'fsig': base64.b64encode(base.tobytes()).decode(), 'anim': 60}
+        rb = {'fsig': base64.b64encode(other.tobytes()).decode(), 'anim': 60}
+        vetoed = not frames_agree(ra, rb)
+        print('  [%s] one clearly different frame is not consent'
+              % ('PASS' if vetoed else 'FAIL'))
+        ok = ok and vetoed
+        # ...while an even, mild difference everywhere still reads as the
+        # same animation, which is what a re-encode looks like.
+        mild = base.copy().astype(np.int16) + 3
+        rc = {'fsig': base64.b64encode(mild.astype(np.uint8).tobytes()).decode(),
+              'anim': 60}
+        agrees = frames_agree(ra, rc)
+        print('  [%s] a mild difference everywhere still matches'
+              % ('PASS' if agrees else 'FAIL'))
+        ok = ok and agrees
     except Exception as exc:
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False

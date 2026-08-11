@@ -3,7 +3,69 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.4 — 2026-08-11 (current)
+## v4.3.4f — 2026-08-11 (current)
+
+**Two animations that differ in the middle were being called the same, and
+on a real corpus that happened 36% of the time.** Examining the last two
+unexamined constants found one sound and one hiding a false-delete path.
+
+`FRAME_SAMPLES` was 5. Five samples of a 60-frame animation look at frames
+0, 15, 30, 44 and 59 - eight per cent of the timeline - so a change
+anywhere else is invisible. Six of eight planted differences scored
+**0.0000**: byte-identical fingerprints for animations that genuinely
+differ. Sharing frame 0 they also share a thumbnail and a CLIP vector, so
+nothing else would have caught it and one of them was a Tier A delete.
+
+Sampling is now 25 frames, which costs nothing - GIF seeking replays from
+frame 0, so once the walk to the last frame is paid for the samples along
+the way are free, and K=5 and K=25 both measure ~15 ms on a 120-frame GIF.
+
+**But more samples alone made it worse**, which is the part worth
+remembering. The comparison took the mean over the whole fingerprint, so
+one bad frame was divided by however many agreed: with the mean, 5 samples
+missed 6 of 8 and 17 samples missed 7 of 8. Sampling harder diluted the
+evidence.
+
+So the fingerprint is now judged on two questions, neither asked to do the
+other's job. The **mean** answers "do these look alike overall" and keeps
+its 6.0 cut. A new **worst-frame** test asks whether any single sampled
+frame disagrees badly, at 60.0. Both must pass.
+
+Calibrated on 603 real animation pairs from a live library, not on
+synthetic ones - which mattered, because two plausible fixes died there:
+
+| | mean | worst frame |
+| --- | --- | --- |
+| same clip, re-encoded (70 pairs) | up to 6.65 | up to 47.09 |
+| same clip, stretch replaced (39) | up to 13.51 | up to 127.13 |
+| genuinely different (494) | never below 22.82 | never below 24.89 |
+
+Planted differences missed: **14 of 39 before, 1 of 39 now**. Different
+clips wrongly allowed: 0 of 494. The two re-encodes it blocks already fail
+the mean test today, so the new check costs nothing.
+
+Rejected after measuring, both of which looked right on synthetic data:
+
+- **Worst-frame alone**, dropping the mean. On real animations the
+  distributions overlap - re-encoded copies reach 47.09 while genuinely
+  different clips start at 34.40 - because palette quantisation moves
+  single frames a lot. That is exactly the noise the mean absorbs.
+- **Segment averaging**, folding every frame into one of K buckets so
+  nothing goes unsampled. It fixes coverage and breaks trim tolerance: the
+  buckets cover different frames when the length changes, so a genuinely
+  trimmed copy scored 13.9 against a weakest real difference of 12.4.
+  Point sampling picks frames by FRACTION of the timeline, which is what
+  survives a trim.
+
+Fingerprints are now 4,800 bytes rather than 960, so an inventory written
+by an older version is a different size and falls through the existing
+size-mismatch path rather than being misread.
+
+`HUGE_PX` (80 M pixels) was examined and left alone: it only annotates a
+record and prints a summary, gating nothing, and 80 M warns just below
+Pillow's own 89.5 M bomb threshold, which is the right side to err on.
+
+## v4.3.4 — 2026-08-11
 
 **Crops are found far more often, review clusters explain themselves, and
 the suggested keeper stopped being a fixture.** Scanning is 2.16x faster

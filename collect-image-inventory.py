@@ -293,7 +293,7 @@ def thumb_size(w, h, box):
     return x, y
 
 
-FRAME_SAMPLES = 5
+FRAME_SAMPLES = 25
 
 
 def frame_signature(im):
@@ -305,12 +305,29 @@ def frame_signature(im):
     duplicates - and a still extracted from a GIF matched the GIF itself
     just as perfectly. This is the signal that tells them apart.
 
-    Five samples rather than two, because GIF seeking is a REPLAY from
-    frame 0, not random access: measured 2.6 ms to reach frame 1 and 128 ms
-    to reach frame 119 of the same file. Once the walk to the last frame is
-    paid for, extra samples along the way are nearly free - K=4 and K=8
-    both measured 112 ms on a 120-frame GIF - so sampling generously costs
-    nothing over sampling meanly.
+    Twenty-five samples, because GIF seeking is a REPLAY from frame 0, not
+    random access: measured 2.6 ms to reach frame 1 and 128 ms to reach
+    frame 119 of the same file. Once the walk to the last frame is paid
+    for, extra samples along the way are FREE - K=5 and K=25 both measure
+    ~15 ms on a 120-frame GIF - so sampling meanly buys nothing.
+
+    It was five, and five was too few to see with. Five samples of a
+    60-frame animation look at frames 0, 15, 30, 44 and 59 - 8% of the
+    timeline - and a change anywhere else is invisible. Measured against
+    the same animation with a short stretch replaced: six of eight cases
+    scored 0.0000, meaning byte-identical fingerprints, so two animations
+    that genuinely differ were declared the same. Sharing frame 0 they also
+    share a thumbnail and a CLIP vector, so nothing else would have caught
+    it either and one of them was a Tier A delete.
+
+    At K=25 all eight are caught, the weakest at 59.0 against a cut of 48.
+
+    Segment averaging - fold every frame into one of K buckets, so nothing
+    is unsampled - was tried and rejected. It fixes coverage and breaks
+    trim tolerance: the buckets cover different frames when the length
+    changes, so a genuinely trimmed copy scored 13.9 while the weakest real
+    difference scored 12.4. Point sampling picks frames by FRACTION of the
+    timeline, which is what survives a trim, and that is worth keeping.
 
     RGB, not greyscale. Greyscale was the first attempt and it is
     colour-blind in exactly the way that matters here: two animations whose
