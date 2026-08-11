@@ -26,7 +26,7 @@ Options:
                          auto-raised to 2x --tier-a-mad when that is higher;
                          an explicit value is always used verbatim)
     --clip-neighbors N   nearest neighbours each image contributes from the
-                         embeddings (default 32); bounds the candidate set
+                         embeddings (default 16); bounds the candidate set
                          on large libraries. A binding cap is reported.
     --no-orient          skip rotation/mirror matching (faster; rotated and
                          mirrored copies will be missed)
@@ -2444,7 +2444,7 @@ def main():
     ap.add_argument('--no-orient', action='store_true',
                     help='skip rotation/mirror matching (faster sweep; '
                          'rotated and mirrored copies will be missed)')
-    # 32, lowered from 48 after measuring what the cap actually cuts. On a
+    # 16, lowered from 48 in two steps after measuring what the cap cuts. On a
     # 36,410-image library the cosine of the LAST neighbour kept sits at
     # 0.9269 median / 0.9627 max with K=48, and moves all of 0.003 by
     # K=16 - the neighbours are packed in a narrow band, so a bigger K buys
@@ -2466,7 +2466,7 @@ def main():
     # near-identical whatever it shows. The pixel tiers do the real work
     # there, and without this cap those images alone would contribute
     # 2.7 million pairs.
-    ap.add_argument('--clip-neighbors', type=int, default=32,
+    ap.add_argument('--clip-neighbors', type=int, default=16,
                     help='how many nearest neighbours each image contributes '
                          'from the embeddings (default 48). Bounds the '
                          'candidate set on large libraries, where a flat '
