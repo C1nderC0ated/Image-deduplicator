@@ -60,7 +60,7 @@ Generated at run time, next to your images:
 |------|-----------|------------|
 | `image-inventory.jsonl` (+ `.partN` above ~200 MB) | Collect | One JSON line per image: path, size, SHA-256, dimensions, EXIF, JPEG quality fingerprint, AI-generation text chunks, 128 px thumbnail |
 | `image-embeddings.jsonl` | Embed | One CLIP vector per unique image, keyed by SHA-256 |
-| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, grey = editable in another cluster. Dark-themed, so the thumbnails stay the brightest thing on screen |
+| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper; the last surviving copy refuses. Dark-themed, so the thumbnails stay the brightest thing on screen |
 | `<name>-list.txt` | Analyze | The selection list you edit: first character `X` = delete, `.` = keep |
 | `Recycle-Duplicates.py` + `.bat` / `.sh` | Analyze | The only thing that deletes — after verification and your y/N. The `.py` holds every rule; the `.bat`/`.sh` only find a Python. Versioned (`Recycle-Duplicates-2.*`) when the inventory is, so each stays bound to its own list |
 
@@ -474,9 +474,9 @@ more:
 | `--tier-a-mad N` | 4.0 | pixel-difference ceiling for Tier A |
 | `--tier-a-cos N` | 0.99 | CLIP floor for Tier A |
 | `--tier-b-mad N` | 4.0 | pixel floor for the review tier |
-| `--tier-b-cos N` | 0.94 | CLIP floor before a pair may enter Tier B |
+| `--tier-b-cos N` | 0.90 | CLIP floor before a pair may enter Tier B. Matches the floor that nominates neighbours, so no pair is scored and then discarded on it. Raise to 0.94 for a shorter review list that misses about half of all moderate crops |
 | `--sig-cut N` | 8.0 | signature prefilter ceiling (default auto-raises to 2× `--tier-a-mad`; an explicit value is used verbatim) |
-| `--clip-neighbors N` | 48 | nearest neighbours each image contributes from the embeddings; bounds the candidate set on large libraries (a binding cap is reported) |
+| `--clip-neighbors N` | 16 | nearest neighbours each image contributes from the embeddings; bounds the candidate set on large libraries (a binding cap is reported). Cannot cost a Tier A candidate — the cut line never approaches the 0.99 that tier needs |
 | `--no-orient` | off | skip rotation/mirror matching — faster, but rotated and mirrored copies are missed |
 | `--no-embeddings` | off | ignore embeddings even if present |
 | `--self-test` | — | run the invariant + sweep-equality tests and exit |
@@ -646,7 +646,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.3** (2026-08-11). Full history, including every bug and what it
+**v4.3.4** (2026-08-11). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---

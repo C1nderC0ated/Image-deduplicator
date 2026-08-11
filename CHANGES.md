@@ -3,7 +3,113 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.3 — 2026-08-11 (current)
+## v4.3.4 — 2026-08-11 (current)
+
+**Crops are found far more often, review clusters explain themselves, and
+the suggested keeper stopped being a fixture.** Scanning is 2.16x faster
+as well. Every number below was measured on the same 36,410-image library,
+and Tier A came out at 3 clusters / 4 droppable in every single run - no
+change here made anything newly deletable.
+
+### The crop tier was failing in three places at once
+
+- **A hole in the scale grid.** Acceptance was not monotonic in crop size:
+  a 90% crop was accepted 79% of the time while an 80% crop managed 84%.
+  That is what a gap looks like, not a threshold set wrong -
+  `NCC_SCALES` stepped 0.85 -> 0.9 -> 0.95 and a 90% crop fell between the
+  teeth. Filling it with 0.88/0.92/0.97 took 90% crops to 97%.
+- **The gate was set for a grid that had holes.** 0.92 -> 0.90, which with
+  the filled grid gives 90% crops 100%, 85% 98%, 80% 91%, 70% 94%.
+  Unrelated pairs top out at 0.816 over 296 samples, so the margin is
+  0.084, and this gate feeds Tier B - never deleted without review.
+- **The CLIP floor was throwing away what the pixels had accepted.**
+  `--tier-b-cos` was 0.94 while neighbours are nominated at 0.90, so every
+  pair in that band was decoded, template-matched and then discarded on a
+  criterion it could never satisfy. It was the binding constraint: 56% of
+  80% crops died there *after* passing the template match. Now 0.90.
+
+**Letterbox bars are trimmed before matching.** Phone screenshots of
+vertical artwork carry big black bars, identical between unrelated
+pictures and most of the frame, so template matching correlated on them:
+with 30% bars at each end 2% of unrelated pairs cleared the gate, with 40%
+bars 11% did, against 1% bare. Removing them is also net *additive* on
+real data, because it aligns genuinely letterboxed pairs that previously
+failed to match.
+
+### Review clusters now say why each file is in them
+
+A review cluster is a connected component, so a member can be there
+because it matches the keeper or because it matches something that
+matches the keeper. The report drew both the same way, which is how
+eighteen screenshots read as a bug rather than as a chain. **REVIEW**
+matched the keeper; **LINKED**, dashed violet, arrived through another
+file. On the reference library that is 257 of 601 review tiles - 43% -
+which measures how much the old display was hiding. The list says it too.
+
+Cliques were tried first and rejected after testing: forcing every member
+to match every other splits a chain into groups that each elect their own
+keeper, so the same picture gets proposed for keeping several times and
+the relation between the pieces disappears.
+
+### The suggested keeper can be overruled
+
+The keeper tile had no toggle, so preferring the other copy could not be
+expressed in the report at all - the one decision the list exists to let
+you make. Every tile is toggleable now; what the page refuses is binning
+the *last remaining copy* in a cluster, which is the rule the recycler
+enforces anyway. References count as members for that check, because the
+recycler treats an unmarked reference as a surviving copy.
+
+### Scanning
+
+**`--fast-thumbs` is the default; `--lossless-thumbs` brings the old
+behaviour back.** The lossless-WebP attempt cost 135x the JPEG encode and
+won 2 times in 2,000 - most of the scan for a tenth of a percent of the
+thumbnails. Settled by running the whole pipeline both ways: collect
+382.1 s -> 176.5 s, same 350 list lines, same marks, same clusters. Three
+extra candidate *pairs* appeared, which is the noise reaching the
+prefilter and stopping short of a verdict.
+
+Two attempts to reason about that were wrong before it was measured
+properly, and both are worth remembering. Absolute JPEG noise has a
+median of 4.437, *above* the 4.0 gate, which would say the tool cannot
+work at all; it works because JPEG is deterministic, so two copies of one
+picture thumbnail to identical bytes and the error cancels. What reaches
+the gate is the *differential* between two similar images: max 1.66 over
+478 real pairs, zero verdict flips.
+
+### Smaller
+
+- **`--clip-neighbors` 48 -> 16.** Going from 48 to 16 moves the cut line
+  by 0.003 - the neighbours sit in a narrow cosine band, so a bigger K
+  buys near-identical matches rather than better ones, and the cut never
+  approaches the 0.99 Tier A needs at any K from 16 to 64. Confirmed on
+  the real library: no visible difference, and faster.
+- **The dense clusters that make the cap necessary are screenshots**: 21
+  of the 25 densest images, and 2,047 of the 3,070 with 500+ neighbours,
+  came from Screenshots folders. Without the cap they alone contribute
+  2.7 million pairs.
+- **Skipping the embed stage costs crops, and now says so.** Without
+  embeddings a copy trimmed to 90% never reaches the crop matcher 74% of
+  the time, 80% -> 97%. A Tier B section still appeared, which is what
+  made the silence misleading.
+
+### Measured and declined
+
+`cv2.resize(INTER_AREA)` for the signatures (2.49x on that step, but under
+1% of the pipeline against a silent recall gate); raising `ONE_READ_LIMIT`
+(8 files of 36,420 exceed it); skipping PNG EXIF (147 ms looked decisive,
+but end to end it is 125.55 vs 126.21 ms - it was only paying the decode
+`make_thumb` needs anyway); `os.scandir` (`stat` is 0.03%); more workers,
+deeper queues, process pools and thread pinning (all inside the noise, and
+processes are 4x *slower* - each reloads transformers); and keeping
+OpenCV's BGR buffers (would shift every crop score for ~1 ms a thumbnail).
+
+Embedding is at the hardware ceiling on the reference machine: 34.97 ms of
+CPU per image across 4 physical cores is 114 img/s, and it measures
+114-125. The GPU sustains ~390, waiting.
+
+## v4.3.3 — 2026-08-11
 
 **Scanning is 2.16x faster, and the duplicate decisions did not move.**
 382.1 s to 176.5 s on the 36,410-image library. The lossless-WebP
