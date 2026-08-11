@@ -639,7 +639,14 @@ def gray_small(TH, x):
 # grid must be fine near 1.0: a gentle crop (95% of the frame) needs ~0.95,
 # and with the old 0.9/1.0 spacing it scored 0.72 against a 0.92 gate - a
 # trivially-detectable crop missed purely by quantisation.
-NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)
+NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.92,
+              0.95, 0.97, 1.0)
+# 0.88/0.92/0.97 added after measuring the grid rather than reasoning about
+# it. The old spacing left a hole either side of 0.9, and acceptance was
+# NOT monotonic in crop size - a 90% crop was accepted 79% of the time
+# while an 80% crop managed 84%. Non-monotonic behaviour is what a gap in
+# the grid looks like, not a threshold that is set wrong. Filling it took
+# 90% crops from 79% to 97% at the old gate. Costs ~20 s on a 164 s run.
 
 
 def compute_nccs(TH, pairs, workers):
@@ -2567,7 +2574,15 @@ def main():
             # different pictures. Require decent semantic agreement too.
             if c is not None and c >= 0.995:
                 tierb_pairs.append((i, j))
-            elif (c is None or c >= args.tier_b_cos) and nccs.get((i, j), 0.0) >= 0.92:
+            # 0.90, not the old 0.92. Measured with the grid above on 150
+            # real images: an 80% crop goes from 84% accepted to 91%, an 85%
+            # crop 96% -> 98%, a 90% crop 97% -> 100%. Unrelated pairs top
+            # out at 0.816 over 296 samples, so the margin is still 0.084 -
+            # and this gate feeds Tier B, which is never deleted without
+            # review, so its failure mode is an extra line to look at.
+            # 0.85 was tried and rejected: it adds 399 review candidates on
+            # a 36k library to catch crops the grid fix already gets.
+            elif (c is None or c >= args.tier_b_cos) and nccs.get((i, j), 0.0) >= 0.90:
                 tierb_pairs.append((i, j))
             else:
                 fallback.append((i, j))
