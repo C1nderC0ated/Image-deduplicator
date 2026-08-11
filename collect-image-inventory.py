@@ -558,6 +558,23 @@ def make_thumb(im, thumb_px, fast=True):
     _t = thumb_size(im2.width, im2.height, (thumb_px, thumb_px))
     im2 = im2.resize(_t, Image.LANCZOS, reducing_gap=2.0) if _t else im2.copy()
     bj = io.BytesIO()
+    # 78, and 128 px above, set the noise floor of every pixel comparison
+    # the analyzer makes. What reaches its 4.0 gate is the DIFFERENTIAL
+    # between two similar images, not the error in one, and measured over
+    # 290 real pairs that is:
+    #
+    #     128 q78 (this)   median 0.447   p99 2.04   max 2.15   3.8 KB/img
+    #     128 q92          median 0.193   p99 0.86   max 1.18   5.9 KB/img
+    #     192 q78          median 0.331   p99 1.75   max 2.07   6.8 KB/img
+    #
+    # So quality buys far more than size: 128->192 px costs 78% more
+    # storage to move the worst case by 0.08, while q78->q92 costs 56% and
+    # nearly halves it. The current setting spends 54% of the decision
+    # budget on thumbnail compression, which sounds alarming and is not:
+    # a full run of a 36,410-image library flipped no verdict at all.
+    # Raising it buys margin, not corrections, and costs 56% of the
+    # inventory - a trade worth making deliberately rather than drifting
+    # into. (q85 measured WORSE than q78, max 6.07, which is unexplained.)
     im2.save(bj, 'JPEG', quality=78)
     best, flag = bj.getvalue(), ''
     if fast:
