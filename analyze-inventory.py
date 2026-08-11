@@ -624,9 +624,63 @@ def compute_luma_mads(TH, pairs, workers):
     return out
 
 
+def trim_bars(a, tol=1.0, keep=0.25, minfrac=0.08):
+    """Drop a uniform band from the edges of a thumbnail.
+
+    Phone screenshots of vertical artwork carry big black bars top and
+    bottom, and those bars are IDENTICAL between unrelated pictures. They
+    are also most of the frame, so template matching correlates on them and
+    two unrelated screenshots score like a crop of one another. Measured on
+    real images dropped into a shared 1080x2388 frame: with 30% bars at
+    each end, 2% of unrelated pairs clear the 0.90 gate, and with 40% bars,
+    11% do - against 1% for the same images with no bars.
+
+    The bars carry no information, so they are removed before matching.
+
+    Everything here is about NOT firing on ordinary pictures. `tol` of 1.0
+    is strict enough that a plain sky or a dark vignette fails it; a band
+    under `minfrac` of the dimension is left alone, because nudging one
+    side of a pair by a few pixels costs alignment for no gain; and `keep`
+    stops a genuinely flat image being reduced to a sliver. On 70 real
+    images it fires on 3, and real crops are unaffected: 90% crops stay at
+    100% accepted, 70% at 99%.
+    """
+    g = a.astype(np.float32).mean(2)
+    h, w = g.shape
+    t, b, l, r = 0, h, 0, w
+    while t < int(h * (1 - keep)) and g[t].std() < tol \
+            and abs(g[t].mean() - g[0].mean()) < tol:
+        t += 1
+    while b > int(h * keep) + 1 and g[b - 1].std() < tol \
+            and abs(g[b - 1].mean() - g[h - 1].mean()) < tol:
+        b -= 1
+    while l < int(w * (1 - keep)) and g[:, l].std() < tol \
+            and abs(g[:, l].mean() - g[:, 0].mean()) < tol:
+        l += 1
+    while r > int(w * keep) + 1 and g[:, r - 1].std() < tol \
+            and abs(g[:, r - 1].mean() - g[:, w - 1].mean()) < tol:
+        r -= 1
+    if t < h * minfrac:
+        t = 0
+    if h - b < h * minfrac:
+        b = h
+    if l < w * minfrac:
+        l = 0
+    if w - r < w * minfrac:
+        r = w
+    if b - t < 8 or r - l < 8 or (t == 0 and b == h and l == 0 and r == w):
+        return a
+    return np.ascontiguousarray(a[t:b, l:r])
+
+
 def gray_small(TH, x):
-    """Grayscale copy of thumb x, downscaled to max side 64 (as float32)."""
-    g = np.asarray(Image.fromarray(TH[x]).convert('L'), dtype=np.float32)
+    """Grayscale copy of thumb x, downscaled to max side 64 (as float32).
+
+    Letterbox bars are trimmed first - see trim_bars. This affects only the
+    crop tier; the pixel scores and the signature sweep see the untouched
+    thumbnail."""
+    g = np.asarray(Image.fromarray(trim_bars(TH[x])).convert('L'),
+                   dtype=np.float32)
     s = 64.0 / max(g.shape)
     if s < 1.0:
         g = np.asarray(Image.fromarray(g.astype('uint8')).resize(
