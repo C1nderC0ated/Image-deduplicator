@@ -1534,11 +1534,14 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
       '.it.sel{outline:2px solid #5b7cfa;outline-offset:3px;border-radius:8px}'
       '.it .tg{margin-top:5px;width:100%;padding:5px 0;font-size:11px}'
       '.it.on .tg{background:#4a1f1f;border-color:#7a3030;color:#ffd6d6}'
+      '.it .tg.no{background:#4a3a1f;border-color:#7a6030;color:#ffe9c0}'
       '.hint{color:var(--dim);font-size:12.5px;margin:0 0 14px}'
       'kbd{background:#232833;border:1px solid var(--line);border-bottom-width:2px;'
       'border-radius:4px;padding:0 5px;font:11px ui-monospace,monospace;color:#cdd3e0}'
       '</style><div class="wrap">')
     live = bool(list_lines and editable_at)
+    clusters = {}                 # cluster id -> the paths that count as its
+    #                               surviving copies, refs included
     if live:
         A('<div class="bar">'
           '<button id="ball">Mark all Tier B suggestions</button>'
@@ -1553,8 +1556,9 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
         A('<p class="hint">Click a thumbnail to mark or unmark it. '
           '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move, <kbd>X</kbd> toggles. '
           'Nothing is deleted here: download the list, save it beside the images, '
-          'and run the recycler. Keepers cannot be marked, so every cluster '
-          'retains at least one copy.</p>')
+          'and run the recycler. Any copy can be marked, including the suggested '
+          'keeper &mdash; the last remaining copy in a cluster cannot, so a group '
+          'is never emptied.</p>')
     if not tier_a and not tier_b:
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
           'No duplicates found &mdash; every image in this folder is distinct. '
@@ -1618,10 +1622,26 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
               '<span class="cnt">&middot; %d files</span></b>'
               '<span>%s</span></div><div class="strip">'
               % (cl_id, cl_id, esc(label), len(members), note))
+            # The suggested keeper is a suggestion, not a fixture. It gets a
+            # toggle like everything else; what the page refuses is emptying
+            # a cluster, which is the rule that actually matters and the one
+            # the recycler enforces too. Pinning the keeper instead meant
+            # that preferring the other copy could not be expressed here at
+            # all, and the whole point of the list is that the choice is
+            # yours.
             if keeper is not None:
-                A('<div class="it k"><img src="data:image/jpeg;base64,%s" alt="">'
-                  '<div class="lb">KEEP</div><div class="fn">%s<br>%s</div></div>'
-                  % (small_b64(recs[keeper]), meta(keeper), esc(recs[keeper]['p'][:44])))
+                krel = recs[keeper]['p']
+                ktog = ''
+                if live and krel in (editable_at or {}):
+                    ktog = ('<button class="tg" data-p="%s">keep</button>'
+                            % esc(krel))
+                if cl_id is not None:
+                    clusters.setdefault(cl_id, []).append(krel)
+                A('<div class="it k"%s%s><img src="data:image/jpeg;base64,%s" alt="">'
+                  '<div class="lb">KEEP</div><div class="fn">%s<br>%s</div>%s</div>'
+                  % ((' data-p="%s"' % esc(krel)) if ktog else '',
+                     (' data-cl="%s"' % cl_id) if ktog else '',
+                     small_b64(recs[keeper]), meta(keeper), esc(krel[:44]), ktog))
             for d in [m for m in editable if m != keeper]:
                 cls = 'd' if key == 'A' else 'n'
                 lab = 'DROP' if key == 'A' else 'REVIEW'
@@ -1631,12 +1651,21 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 if live and rel in (editable_at or {}):
                     tog = ('<button class="tg" data-p="%s">%s</button>'
                            % (esc(rel), 'bin' if key == 'A' else 'keep'))
-                A('<div class="it %s%s"%s><img src="data:image/jpeg;base64,%s" alt="">'
+                if cl_id is not None:
+                    clusters.setdefault(cl_id, []).append(rel)
+                A('<div class="it %s%s"%s%s><img src="data:image/jpeg;base64,%s" alt="">'
                   '<div class="lb">%s</div><div class="fn">%s<br>%s</div>%s</div>'
                   % (cls, on,
                      (' data-p="%s"' % esc(rel)) if tog else '',
+                     (' data-cl="%s"' % cl_id) if tog else '',
                      small_b64(recs[d]), lab, meta(d), esc(rel[:44]), tog))
             for r in refs:
+                # Counted as a member here even though it is edited
+                # elsewhere: the recycler treats an unmarked reference as a
+                # surviving copy, so the page must too, or it would refuse
+                # an edit the recycler would have allowed.
+                if cl_id is not None and recs[r]['p'] in (editable_at or {}):
+                    clusters.setdefault(cl_id, []).append(recs[r]['p'])
                 A('<div class="it r"><img src="data:image/jpeg;base64,%s" alt="">'
                   '<div class="lb">IN CLUSTER %s</div><div class="fn">%s<br>%s</div></div>'
                   % (small_b64(recs[r]), home.get(r, '?') if home else '?',
@@ -1665,9 +1694,10 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             return (json.dumps(o).replace('<', '\\u003c').replace('>', '\\u003e')
                     .replace('&', '\\u0026'))
         A('<script>')
-        A('var LINES=%s,AT=%s,SUGG=%s,TIERB=%s,NAME=%s,CRLF=%s;'
+        A('var LINES=%s,AT=%s,SUGG=%s,TIERB=%s,CLUSTERS=%s,NAME=%s,CRLF=%s;'
           % (js(list_lines), js(editable_at), js(suggested_b or []),
-             js(tier_b_all or []), js(list_name or 'duplicates-list.txt'),
+             js(tier_b_all or []), js(clusters),
+             js(list_name or 'duplicates-list.txt'),
              'true' if os.name == 'nt' else 'false'))
         A(r'''
 var ORIG=LINES.slice(), tiles=[].slice.call(document.querySelectorAll('.it[data-p]')), cur=0;
@@ -1680,10 +1710,25 @@ function paint(){var n=0;
   tiles.forEach(function(t,ix){var p=t.getAttribute('data-p'),on=isOn(p);
     t.classList.toggle('on',on); t.classList.toggle('sel',ix===cur);
     var b=t.querySelector('.tg'); if(b)b.textContent=on?'bin':'keep';});}
-function toggle(p){mark(p,!isOn(p)); paint();}
+var CLOF={};                     // path -> the cluster it is counted in
+for(var c in CLUSTERS){CLUSTERS[c].forEach(function(p){if(!(p in CLOF))CLOF[p]=c;});}
+function survivors(cl){var m=CLUSTERS[cl]||[],n=0;
+  for(var i=0;i<m.length;i++){if(!isOn(m[i]))n++;} return n;}
+// The only rule: a cluster keeps at least one copy. WHICH one is yours to
+// pick, the suggested keeper included. Refusing to mark the keeper was
+// simpler and wrong - preferring the other copy could not be said at all.
+function canBin(p){var cl=CLOF[p];
+  return cl===undefined || survivors(cl)>1;}
+function say(t,msg){var b=t&&t.querySelector('.tg'); if(!b)return;
+  var old=b.textContent; b.textContent=msg; b.classList.add('no');
+  setTimeout(function(){b.textContent=old;b.classList.remove('no');},1400);}
+function toggle(p,t){
+  if(!isOn(p)&&!canBin(p)){say(t,'last copy'); return;}
+  mark(p,!isOn(p)); paint();}
 tiles.forEach(function(t,ix){t.addEventListener('click',function(e){
-  cur=ix; toggle(t.getAttribute('data-p')); e.preventDefault();});});
-document.getElementById('ball').onclick=function(){SUGG.forEach(function(p){mark(p,true);});paint();};
+  cur=ix; toggle(t.getAttribute('data-p'),t); e.preventDefault();});});
+document.getElementById('ball').onclick=function(){
+  SUGG.forEach(function(p){if(canBin(p))mark(p,true);});paint();};
 document.getElementById('bnone').onclick=function(){TIERB.forEach(function(p){mark(p,false);});paint();};
 document.getElementById('breset').onclick=function(){LINES=ORIG.slice();paint();};
 document.getElementById('bdl').onclick=function(){
@@ -1695,7 +1740,7 @@ document.addEventListener('keydown',function(e){
   if(e.target.tagName==='INPUT')return;
   if(e.key==='ArrowRight'||e.key==='j'){cur=Math.min(cur+1,tiles.length-1);}
   else if(e.key==='ArrowLeft'||e.key==='k'){cur=Math.max(cur-1,0);}
-  else if(e.key==='x'||e.key==='X'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'));return;}
+  else if(e.key==='x'||e.key==='X'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'),tiles[cur]);return;}
   else return;
   paint(); if(tiles[cur])tiles[cur].scrollIntoView({block:'nearest',inline:'center'});
   e.preventDefault();});
