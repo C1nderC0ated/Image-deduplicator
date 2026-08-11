@@ -788,6 +788,74 @@ class UF(object):
         return [sorted(v) for v in g.values() if len(v) > 1]
 
 
+def clique_groups(pairs):
+    """Group Tier B pairs so every member of a group matches every other.
+
+    Connected components chain: A matches B and B matches C puts all three
+    together even when A and C have nothing to do with each other, and with
+    enough links a review cluster grows into a bag of eighteen files whose
+    ends are unrelated. Every LINK in it is sound - which is why the pair
+    scores all look fine when you go hunting for the bad one - but the
+    cluster is not, and it is the cluster a person reads.
+
+    So a group here is a clique: mutually matching, no chaining. Maximal
+    cliques are NP-hard in general, but these graphs are tiny and sparse, so
+    a greedy pass is both adequate and predictable. Members are taken in
+    descending degree, seeding a group with the most-connected file and
+    admitting only files that match everything already in it; whatever is
+    left over seeds the next group, so no pair is silently dropped.
+
+    Determinism matters more than optimality here: the same inventory must
+    produce the same clusters every run, so ties break on index.
+    """
+    adj, edges = {}, set()
+    for i, j in pairs:
+        a, b = (i, j) if i < j else (j, i)
+        if a == b:
+            continue
+        edges.add((a, b))
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    # Growing one clique per FILE loses pairs: a file can need several to
+    # cover everything it matches. Four images in a ring - a-b, b-c, c-d,
+    # d-a, no diagonals - are four separate relationships, and seeding by
+    # file emits only three of them. So the loop below consumes EDGES, and
+    # runs until every one is inside some group.
+    out, remaining = [], set(edges)
+    for a, b in sorted(edges):
+        if (a, b) not in remaining:
+            continue
+        group = [a, b]
+        for cand in sorted(adj[a] & adj[b], key=lambda x: (-len(adj[x]), x)):
+            if all(cand in adj[m] for m in group):
+                group.append(cand)
+        group.sort()
+        for x in range(len(group)):
+            for y in range(x + 1, len(group)):
+                remaining.discard((group[x], group[y]))
+        out.append(group)
+
+    # Cliques overlap - one file can mutually match two different sets - but
+    # a file may be offered for deletion only ONCE, which check_invariants
+    # enforces and which the selection list depends on. So the cliques are
+    # made disjoint: biggest first, each file claimed by one group only.
+    #
+    # A subset of a clique is still a clique, so trimming a group keeps it
+    # mutually-matching; what it can cost is a group falling below two
+    # members and disappearing, taking its relation with it. That is the
+    # price of the rule, and it is the same rule that already stops a file
+    # being listed as a duplicate in two places at once.
+    out.sort(key=lambda g: (-len(g), g))
+    kept, claimed = [], set()
+    for g in out:
+        g2 = [x for x in g if x not in claimed]
+        if len(g2) >= 2:
+            claimed.update(g2)
+            kept.append(sorted(g2))
+    return sorted(kept)
+
+
 def quality_key(recs, i):
     r = recs[i]
     return (r['w'] * r['h'], r['b'], -r.get('qsum', 10 ** 9))
@@ -2806,10 +2874,7 @@ def main():
     a_drops = set(i for _, d, _ in tier_a for i in d)
     a_keeps = set(k for k, _, _ in tier_a)
 
-    uf_b = UF()
-    for i, j in tierb_pairs:
-        uf_b.union(i, j)
-    tier_b, info_b = build_tier_b(uf_b.groups(), recs, tier_a)
+    tier_b, info_b = build_tier_b(clique_groups(tierb_pairs), recs, tier_a)
 
     phase('')
     try:
