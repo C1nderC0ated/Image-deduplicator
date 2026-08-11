@@ -26,7 +26,7 @@ Options:
                          auto-raised to 2x --tier-a-mad when that is higher;
                          an explicit value is always used verbatim)
     --clip-neighbors N   nearest neighbours each image contributes from the
-                         embeddings (default 48); bounds the candidate set
+                         embeddings (default 32); bounds the candidate set
                          on large libraries. A binding cap is reported.
     --no-orient          skip rotation/mirror matching (faster; rotated and
                          mirrored copies will be missed)
@@ -2324,18 +2324,29 @@ def main():
     ap.add_argument('--no-orient', action='store_true',
                     help='skip rotation/mirror matching (faster sweep; '
                          'rotated and mirrored copies will be missed)')
-    # Measured on a 36,410-image library: 5,598 images (15.4%) bind against
-    # this cap. For those, the cosine of the LAST neighbour kept runs from
-    # 0.9006 to 0.9627, median 0.9269 - so the cap never cuts above 0.9627,
-    # and Tier A, which needs >= 0.99, cannot lose a candidate to it. What
-    # it trims is review candidates for images in dense clusters: 1,402 of
-    # the capped images (3.9% of the library) have a cut line above the 0.94
-    # Tier B floor.
+    # 32, lowered from 48 after measuring what the cap actually cuts. On a
+    # 36,410-image library the cosine of the LAST neighbour kept sits at
+    # 0.9269 median / 0.9627 max with K=48, and moves all of 0.003 by
+    # K=16 - the neighbours are packed in a narrow band, so a bigger K buys
+    # near-identical matches rather than better ones. Tier A needs >= 0.99
+    # and the cut line never approaches it at any K from 16 to 64, so this
+    # cannot cost a deletion candidate. (Structurally too: an image with 32
+    # neighbours above 0.99 is holding near-identical copies, and the exact
+    # ones are already caught by SHA before CLIP is consulted.)
     #
-    # It is clearly earning its place - median neighbour count above the
-    # floor is 0, but p99 is 2,466 and the maximum 2,672, so a few dense
-    # clusters would otherwise contribute millions of pairs by themselves.
-    ap.add_argument('--clip-neighbors', type=int, default=48,
+    # 48 -> 32 on that library: candidate pairs 376,660 -> 304,953, crop
+    # matches 76,770 -> 59,295, analyze 184 s -> 164 s, Tier A unchanged at
+    # 3 clusters / 4 droppable, Tier B 328 -> 323 candidates.
+    #
+    # The cap earns its place regardless: median neighbour count above the
+    # floor is 0, but p99 is 2,466 and the maximum 2,672. Those dense
+    # clusters are overwhelmingly SCREENSHOTS - 21 of the 25 densest images
+    # came from one Screenshots folder - which is CLIP working correctly and
+    # being unhelpful, since every capture of the same app is semantically
+    # near-identical whatever it shows. The pixel tiers do the real work
+    # there, and without this cap those images alone would contribute
+    # 2.7 million pairs.
+    ap.add_argument('--clip-neighbors', type=int, default=32,
                     help='how many nearest neighbours each image contributes '
                          'from the embeddings (default 48). Bounds the '
                          'candidate set on large libraries, where a flat '
