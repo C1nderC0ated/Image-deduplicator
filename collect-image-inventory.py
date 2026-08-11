@@ -563,19 +563,27 @@ def make_thumb(im, thumb_px, fast=True):
     # between two similar images, not the error in one, and measured over
     # 290 real pairs that is:
     #
-    #     128 q78 (this)   median 0.447   p99 2.04   max 2.15   3.8 KB/img
-    #     128 q92          median 0.193   p99 0.86   max 1.18   5.9 KB/img
-    #     192 q78          median 0.331   p99 1.75   max 2.07   6.8 KB/img
+    #     q      median   p95    p99    bytes/img
+    #     74      0.983  2.796  3.151     3334
+    #     78      0.610  1.484  1.905     3588
+    #     80      0.351  1.146  1.520     3732   <- here
+    #     82      0.399  1.239  1.946     3919
+    #     85      0.863  4.363  5.402     4250
+    #     92      0.235  0.895  1.829     5565
     #
-    # So quality buys far more than size: 128->192 px costs 78% more
-    # storage to move the worst case by 0.08, while q78->q92 costs 56% and
-    # nearly halves it. The current setting spends 54% of the decision
-    # budget on thumbnail compression, which sounds alarming and is not:
-    # a full run of a 36,410-image library flipped no verdict at all.
-    # Raising it buys margin, not corrections, and costs 56% of the
-    # inventory - a trade worth making deliberately rather than drifting
-    # into. (q85 measured WORSE than q78, max 6.07, which is unexplained.)
-    im2.save(bj, 'JPEG', quality=78)
+    # 80 rather than 78: 42% less median noise and 20% less at p99 for 4%
+    # more storage. It beats q92 at p99 while costing a third as much extra.
+    #
+    # The curve is NOT monotonic - 85 is worse than 78 on every percentile,
+    # and 88 and 92 both have fatter tails than 80 - so this is a measured
+    # point, not "higher is better". Two samples would have suggested the
+    # opposite; an earlier reading of only 78 and 92 concluded "quality buys
+    # more than size", which the full curve does not support.
+    #
+    # None of this is fixing a wrong answer. A full run of a 36,410-image
+    # library flipped no verdict at 78, so the gain is margin against the
+    # 4.0 gate rather than corrections.
+    im2.save(bj, 'JPEG', quality=80)
     best, flag = bj.getvalue(), ''
     if fast:
         # The default, since v4.3.3. The lossless-WebP attempt below costs

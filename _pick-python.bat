@@ -58,6 +58,23 @@ if errorlevel 1 goto :pp_venv
 for %%V in (3.14 3.13 3.12 3.11 3.10 3.9) do call :pp_try_ver %%V
 if defined PYTHON_CMD goto :pp_done
 
+rem  That list has an expiry date, so ask `py` for its own default before
+rem  giving up on the launcher. When 3.15 ships, `py -3.15` is not tried by
+rem  the loop above and this file would fall through to .venv and then bare
+rem  `python` - which on Windows is often a Store stub or missing entirely,
+rem  so a machine whose only Python was 3.15 could be told there is none
+rem  while `py -3.15` sat there working. `py -3` means "newest Python 3
+rem  this launcher knows about" and needs no editing ever.
+rem
+rem  It stays BELOW the explicit list rather than replacing it: the list is
+rem  ordered newest-first on purpose and each entry is probed functionally,
+rem  so if the newest interpreter cannot import what a stage needs, an older
+rem  one still wins. `py -3` alone would take the newest and stop.
+py -3 -c "%_PP_PROBE%" >nul 2>&1
+if errorlevel 1 goto :pp_venv
+set "PYTHON_CMD=py -3"
+goto :pp_done
+
 rem %~dp0 is THIS file's folder - the toolkit folder - and already ends in a
 rem backslash. It is deliberately not the caller's directory: the .venv sits
 rem beside the scripts, not beside whatever was dragged onto them.
