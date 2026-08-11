@@ -788,74 +788,6 @@ class UF(object):
         return [sorted(v) for v in g.values() if len(v) > 1]
 
 
-def clique_groups(pairs):
-    """Group Tier B pairs so every member of a group matches every other.
-
-    Connected components chain: A matches B and B matches C puts all three
-    together even when A and C have nothing to do with each other, and with
-    enough links a review cluster grows into a bag of eighteen files whose
-    ends are unrelated. Every LINK in it is sound - which is why the pair
-    scores all look fine when you go hunting for the bad one - but the
-    cluster is not, and it is the cluster a person reads.
-
-    So a group here is a clique: mutually matching, no chaining. Maximal
-    cliques are NP-hard in general, but these graphs are tiny and sparse, so
-    a greedy pass is both adequate and predictable. Members are taken in
-    descending degree, seeding a group with the most-connected file and
-    admitting only files that match everything already in it; whatever is
-    left over seeds the next group, so no pair is silently dropped.
-
-    Determinism matters more than optimality here: the same inventory must
-    produce the same clusters every run, so ties break on index.
-    """
-    adj, edges = {}, set()
-    for i, j in pairs:
-        a, b = (i, j) if i < j else (j, i)
-        if a == b:
-            continue
-        edges.add((a, b))
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
-
-    # Growing one clique per FILE loses pairs: a file can need several to
-    # cover everything it matches. Four images in a ring - a-b, b-c, c-d,
-    # d-a, no diagonals - are four separate relationships, and seeding by
-    # file emits only three of them. So the loop below consumes EDGES, and
-    # runs until every one is inside some group.
-    out, remaining = [], set(edges)
-    for a, b in sorted(edges):
-        if (a, b) not in remaining:
-            continue
-        group = [a, b]
-        for cand in sorted(adj[a] & adj[b], key=lambda x: (-len(adj[x]), x)):
-            if all(cand in adj[m] for m in group):
-                group.append(cand)
-        group.sort()
-        for x in range(len(group)):
-            for y in range(x + 1, len(group)):
-                remaining.discard((group[x], group[y]))
-        out.append(group)
-
-    # Cliques overlap - one file can mutually match two different sets - but
-    # a file may be offered for deletion only ONCE, which check_invariants
-    # enforces and which the selection list depends on. So the cliques are
-    # made disjoint: biggest first, each file claimed by one group only.
-    #
-    # A subset of a clique is still a clique, so trimming a group keeps it
-    # mutually-matching; what it can cost is a group falling below two
-    # members and disappearing, taking its relation with it. That is the
-    # price of the rule, and it is the same rule that already stops a file
-    # being listed as a duplicate in two places at once.
-    out.sort(key=lambda g: (-len(g), g))
-    kept, claimed = [], set()
-    for g in out:
-        g2 = [x for x in g if x not in claimed]
-        if len(g2) >= 2:
-            claimed.update(g2)
-            kept.append(sorted(g2))
-    return sorted(kept)
-
-
 def quality_key(recs, i):
     r = recs[i]
     return (r['w'] * r['h'], r['b'], -r.get('qsum', 10 ** 9))
@@ -1580,7 +1512,7 @@ def small_b64(rec, maxw=150):
 
 def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                  list_lines=None, editable_at=None, suggested_b=None,
-                 tier_b_all=None, list_name=None):
+                 tier_b_all=None, list_name=None, b_edges=None):
     def mb(x):
         return '%.2f MB' % (x / 1048576.0)
 
@@ -1627,6 +1559,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
       '.it.k img{border-color:var(--keep)}.it.d img{border-color:var(--drop)}'
       '.it.n img{border-color:var(--rev)}.it.r img{border-color:var(--ref);opacity:.55}'
       '.it.r .lb{color:var(--dim)}'
+      '.it.x img{border-color:#7d6a9e;border-style:dashed}'
+      '.it.x .lb{color:#b3a0d4}'
       '.clid{font:700 12px/1.7 ui-monospace,Menlo,Consolas,monospace;'
       'background:#1e2634;color:#a9bde8;padding:1px 8px;border-radius:5px;'
       'text-decoration:none;border:1px solid #2e3a4e}'
@@ -1724,7 +1658,11 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
              'largest file, then finest JPEG quantization. Pre-set to <code>X</code>.'),
             (tier_b, 'B', '#f0b64b', '#2a2113', 'CROP / VARIANT',
              'Structurally the same picture, genuinely different pixels. Nothing here is '
-             'deleted &mdash; pre-set to <code>.</code>.')):
+             'deleted &mdash; pre-set to <code>.</code>. '
+             '<b style="color:var(--rev)">REVIEW</b> matched the keeper directly; '
+             '<b style="color:#b3a0d4">LINKED</b> (dashed) matched another member '
+             'instead, so it is in this group by a chain and may have little to do '
+             'with the keeper.')):
         groups = plan_by_key[key] if plan else [
             (None, k, [k] + drops, []) for k, drops, members in tier]
         if not groups:
@@ -1767,6 +1705,16 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             for d in [m for m in editable if m != keeper]:
                 cls = 'd' if key == 'A' else 'n'
                 lab = 'DROP' if key == 'A' else 'REVIEW'
+                # A review cluster is a connected component, so a member can
+                # be here because it matches the keeper, or because it
+                # matches something that matches the keeper. Those are very
+                # different claims and the report used to make them look
+                # identical - which is how an eighteen-file cluster of
+                # unrelated screenshots reads as a bug rather than as a
+                # chain. Say which is which.
+                if (key == 'B' and b_edges is not None and keeper is not None
+                        and (keeper, d) not in b_edges):
+                    cls, lab = 'x', 'LINKED'
                 rel = recs[d]['p']
                 on = ' on' if key == 'A' else ''
                 tog = ''
@@ -1875,7 +1823,7 @@ paint();
 
 
 def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
-                          tier_a, tier_b, root, info_b=None):
+                          tier_a, tier_b, root, info_b=None, b_edges=None):
     """Writes the list and the three recyclers.
 
     Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
@@ -1887,13 +1835,18 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
       suggested_b   Tier B paths this scan would have marked, had Tier B
                     been the sort of match that may be acted on unreviewed
     """
-    def info(i, keeper):
+    def info(i, keeper, linked=False):
         r = recs[i]
         t = '%dx%d, %.2f MB' % (shown_dims(r) + (r['b'] / 1048576.0,))
         if 'qsum' in r:
             t += ', q%d' % r['qsum']
         if keeper:
             t += ' - suggested keeper'
+        elif linked:
+            # It is in this cluster through another member, not through the
+            # keeper. Worth saying in the file too - plenty of editing gets
+            # done here rather than in the report.
+            t += ' - linked via another file, not the keeper'
         return t
 
     plan, home = build_emission_plan(tier_a, tier_b, recs, info_b)
@@ -1956,6 +1909,8 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                              't': key})
         for i in ([keeper] + [m for m in editable if m != keeper] if editable else []):
             is_keeper = (i == keeper)
+            linked = (key == 'B' and not is_keeper and b_edges is not None
+                      and keeper is not None and (keeper, i) not in b_edges)
             if list_safe(recs[i]['p']) != recs[i]['p']:
                 # A control character in a filename (a newline above all)
                 # would let the file's own name FORGE mark lines: writing it
@@ -1968,11 +1923,12 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                 L.append('#  [not editable - name contains control characters;'
                          ' always kept]')
                 L.append('#    %s   [%s]' % (list_safe(recs[i]['p']),
-                                             info(i, is_keeper)))
+                                             info(i, is_keeper, linked)))
                 mark = None
             else:
                 mark = '.' if (is_keeper or key == 'B') else 'X'
-                L.append('%s  %s   [%s]' % (mark, recs[i]['p'], info(i, is_keeper)))
+                L.append('%s  %s   [%s]'
+                         % (mark, recs[i]['p'], info(i, is_keeper, linked)))
                 editable_at[recs[i]['p']] = len(L) - 1
             # A file with control characters in its name gets NO editable
             # line, and the list says of it "always kept". Flagging it as a
@@ -2874,7 +2830,22 @@ def main():
     a_drops = set(i for _, d, _ in tier_a for i in d)
     a_keeps = set(k for k, _, _ in tier_a)
 
-    tier_b, info_b = build_tier_b(clique_groups(tierb_pairs), recs, tier_a)
+    # Connected components, not cliques. Cliques were tried and reverted:
+    # forcing every member to match every other splits a chain into groups
+    # that each elect their own keeper, so the same picture is proposed for
+    # keeping several times over and the relation between the pieces is
+    # lost. The chaining is not the problem - not knowing WHY a file is in
+    # the cluster is. So the cluster stays whole and the report says which
+    # members match the keeper directly and which arrived through another
+    # file.
+    uf_b = UF()
+    for i, j in tierb_pairs:
+        uf_b.union(i, j)
+    tier_b, info_b = build_tier_b(uf_b.groups(), recs, tier_a)
+    b_edges = set()
+    for i, j in tierb_pairs:
+        b_edges.add((i, j))
+        b_edges.add((j, i))
 
     phase('')
     try:
@@ -2961,11 +2932,11 @@ def main():
     # time in JavaScript would leave two implementations free to drift, and
     # this project has been bitten by exactly that before.
     nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
-        lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b)
+        lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges)
     write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
                  list_lines=llines, editable_at=editable_at,
                  suggested_b=suggested_b, tier_b_all=tier_b_all,
-                 list_name=os.path.basename(lst))
+                 list_name=os.path.basename(lst), b_edges=b_edges)
     print('')
     print('Wrote:')
     for q in (rep, lst, rpy, bat, sh):
