@@ -21,7 +21,7 @@ Options:
     --tier-a-mad N       pixel-difference ceiling for Tier A   (default 4.0)
     --tier-a-cos N       CLIP floor for Tier A                 (default 0.99)
     --tier-b-mad N       pixel floor for the review tier       (default 4.0)
-    --tier-b-cos N       CLIP floor for the review tier        (default 0.94)
+    --tier-b-cos N       CLIP floor for the review tier        (default 0.90)
     --sig-cut N          8x8 signature prefilter ceiling       (default 8.0,
                          auto-raised to 2x --tier-a-mad when that is higher;
                          an explicit value is always used verbatim)
@@ -2314,9 +2314,30 @@ def main():
     ap.add_argument('--tier-a-mad', type=float, default=4.0)
     ap.add_argument('--tier-a-cos', type=float, default=0.99)
     ap.add_argument('--tier-b-mad', type=float, default=4.0)
-    ap.add_argument('--tier-b-cos', type=float, default=0.94,
-                    help='CLIP floor before a pair may enter the review tier; '
-                         'below this, structural similarity alone is too weak to mean much')
+    # 0.90, lowered from 0.94 so this agrees with the floor used to nominate
+    # neighbours in the first place. At 0.94 every pair between 0.90 and 0.94
+    # was decoded, template-matched and then discarded on a criterion it was
+    # never going to satisfy - wasted work and lost recall in one.
+    #
+    # It was the binding constraint on crops, not the pixel test. Measured on
+    # 180 real images against their own crops, the share clearing 0.94:
+    #
+    #     crop keeps 95%   92%        crop keeps 70%   21%
+    #     crop keeps 90%   76%        crop keeps 60%    5%
+    #     crop keeps 80%   44%
+    #
+    # so 56% of 80% crops were thrown away AFTER the template match had
+    # already accepted them. The NCC gate is what discriminates here: no
+    # unrelated pair out of 296 reached even 0.85 there, topping out at
+    # 0.816. On the 36,410-image library this takes Tier B from 323 to 592
+    # candidates and leaves Tier A untouched at 3 clusters / 4 droppable.
+    # Tier B is never deleted without review, so the cost is lines to look
+    # at, not files.
+    ap.add_argument('--tier-b-cos', type=float, default=0.90,
+                    help='CLIP floor before a pair may enter the review tier '
+                         '(default 0.90, matching the neighbour floor). Raise '
+                         'it to 0.94 for a shorter review list that misses '
+                         'about half of all moderate crops')
     ap.add_argument('--sig-cut', type=float, default=None,
                     help='signature prefilter ceiling (default: 8.0, raised to '
                          '2x --tier-a-mad when that is higher; an explicit '
