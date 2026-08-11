@@ -3,7 +3,67 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.4f — 2026-08-11 (current)
+## v4.3.5 — 2026-08-12 (current)
+
+**Thumbnail quality 78 -> 80, which found real crop and letterbox pairs
+the old setting was losing.** Confirmed on the 36,410-image library. The
+whole pipeline now runs in about **12 minutes**: collect ~3, embed ~5,
+analyze ~4.
+
+The quality curve is not monotonic, which two sample points had hidden.
+Mapped on 420 real thumbnails, differential noise reaching the 4.0 gate:
+
+| q | median | p95 | p99 | bytes/img |
+| --- | --- | --- | --- | --- |
+| 74 | 0.983 | 2.796 | 3.151 | 3334 |
+| 78 | 0.610 | 1.484 | 1.905 | 3588 |
+| **80** | **0.351** | **1.146** | **1.520** | **3732** |
+| 82 | 0.399 | 1.239 | 1.946 | 3919 |
+| 85 | 0.863 | 4.363 | 5.402 | 4250 |
+| 92 | 0.235 | 0.895 | 1.829 | 5565 |
+
+42% less median noise and 20% less at p99 for 4% more storage, and better
+than q92 at p99 for a third of the extra. 85 is worse than 78 on every
+percentile. An earlier reading of only 78 and 92 concluded "quality buys
+more than size"; the full curve does not support it, and the comment now
+carries the curve instead of that conclusion.
+
+**Why it surfaced letterbox pairs specifically**, which was not the
+intent: at q78 the ringing around a hard black-to-content edge smears the
+bar boundary, so `trim_bars` cuts in slightly different places on two
+copies of the same framed image and the trimmed regions no longer line
+up. Cleaner edges make the trim land consistently. The letterbox fix from
+v4.3.4 was being partly undone by the quality of the thumbnail feeding
+it.
+
+Existing inventories store q78 thumbnails, so a `--resume` scan mixes the
+two - the same caveat `--lossless-thumbs` carries, and for the same
+reason. Re-collect for a uniform set.
+
+**`_pick-python.bat` no longer expires.** It hardcoded `py -3.14` down to
+`-3.9` with nothing saying the list has a shelf life. When 3.15 ships it
+is never tried, and the file falls through to `.venv` and then bare
+`python` - often a Store stub or absent on Windows - so a machine whose
+only Python was 3.15 could be told there is none while `py -3.15` sat
+there working. `py -3` is tried after the explicit list now: it means
+"newest Python 3 the launcher knows about" and never needs editing. It
+sits below the list rather than replacing it, because each entry is
+probed functionally and an older interpreter should still win when the
+newest cannot import what a stage needs. `imgdedup.sh` carries the same
+list and degrades safely, since `python3` almost always is the newest,
+which is now stated rather than assumed.
+
+**Two constants gained the measurements they never had.** `gray_small`'s
+64 px cap looked like a cheapness with no accuracy check on record; it
+costs nothing (94% average crop acceptance against 93% at full 128 px,
+and half the time). `quality_key` - the rule that decides which of your
+files is proposed for deletion - had no docstring at all, and now names
+the blind spot it cannot see: area wins first, so a heavily-compressed
+upscale beats a pristine original and the ORIGINAL is the copy marked X.
+Still unmeasured, but written down as a heuristic rather than left
+looking like a result.
+
+## v4.3.4f — 2026-08-11
 
 **Two animations that differ in the middle were being called the same, and
 on a real corpus that happened 36% of the time.** Examining the last two
