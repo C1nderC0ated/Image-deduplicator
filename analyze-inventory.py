@@ -2490,6 +2490,18 @@ def main():
         V = None
     cand = sorted(cand)
     print('Candidate pairs: %d%s' % (len(cand), '' if used_clip else '  (no embeddings)'))
+    if not used_clip:
+        # Saying "no embeddings" understates it. Crops move the 8x8
+        # signature far more than a re-encode does, so without CLIP to
+        # nominate them they never survive the sweep and never reach the
+        # crop matcher. Measured on 200 real images: a copy trimmed to 90%
+        # is missed 74% of the time, to 80% is missed 97% of the time. A
+        # Tier B section still appears, which is exactly what makes the
+        # silence misleading, so it is said out loud instead.
+        print('   Cropped copies are mostly NOT found in this mode: a copy')
+        print('   trimmed to 90% is missed ~74% of the time, to 80% ~97%.')
+        print('   Everything else - exact, re-encoded, resized, rotated,')
+        print('   mirrored - is unaffected. Run the embed stage to catch crops.')
     if not _HAVE_CV2:
         print('  NOTE: OpenCV is not installed, so crop detection is limited to what')
         print('        CLIP alone can see. For the full crop tier:')

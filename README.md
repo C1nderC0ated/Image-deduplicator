@@ -18,7 +18,7 @@ your image folder
    ▼  Collect-Image-Inventory.bat        (hash + thumbnail + metadata scan)
 image-inventory.jsonl
    │
-   ▼  Embed-Images.bat                   (optional: CLIP semantic vectors)
+   ▼  Embed-Images.bat                   (CLIP vectors — skippable, but see below)
 image-embeddings.jsonl
    │
    ▼  Analyze-Inventory.bat              (pair sweep, tiers, safety invariants)
@@ -42,7 +42,7 @@ point, inspect everything in a text editor, and re-run stages independently.
 |------|------|
 | `Find-Duplicates.bat` | All three stages on one folder, then opens the report |
 | `Collect-Image-Inventory.bat` + `collect-image-inventory.py` | Stage 1 — scan a folder into `image-inventory.jsonl` |
-| `Embed-Images.bat` + `embed-images.py` | Stage 2 (optional) — CLIP embeddings for semantic matching |
+| `Embed-Images.bat` + `embed-images.py` | Stage 2 — CLIP embeddings. Skippable, but **cropped copies are only found with it** (see [Skipping the embed stage](#skipping-the-embed-stage)) |
 | `Analyze-Inventory.bat` + `analyze-inventory.py` | Stage 3 — find duplicates, write report / list / recycler |
 | `Check-Image-Tools.bat` + `check-image-tools.py` | Doctor — every Python on the machine and what each can actually do |
 | `imgdedup.sh` | POSIX launcher: `setup` / `collect` / `embed` / `analyze` / `doctor` |
@@ -204,7 +204,8 @@ goes wrong, since it lets you re-run one stage without redoing the others.
    on a thread pool; ~1,600 images take well under a minute on an SSD.
 3. *(Optional but worth it)* drag the new `image-inventory.jsonl`, or its
    folder, onto `Embed-Images.bat`. First run downloads the CLIP model
-   (~600 MB, cached forever after). This is what catches crops and edits.
+   (~600 MB, cached forever after). **Skip this and cropped copies are not
+   found** — see [Skipping the embed stage](#skipping-the-embed-stage).
 4. Drag the same folder onto `Analyze-Inventory.bat`.
 5. Open `<name>-report.html`, look at the pictures. Each group is labelled
    **`cluster N`**, the same number the list uses, search the .txt for
@@ -272,7 +273,7 @@ when that is smaller than JPEG.
   and never crash the scan. `Ctrl+C` aborts safely; a partial inventory is
   still usable.
 
-### Stage 2 — Embed (optional)
+### Stage 2 — Embed
 
 Opens each **original** image and computes a CLIP embedding
 (`openai/clip-vit-base-patch32` by default, `--model` to change). Output is
@@ -283,6 +284,32 @@ Why bother: pixel comparison cannot see that a cropped image is "the same
 picture", the pixels genuinely differ. CLIP can. In testing this stage
 caught a crop whose pixel difference was **nine times** the duplicate
 threshold; no pixel method would ever have flagged it.
+
+#### Skipping the embed stage
+
+Everything still runs without it, and exact, re-encoded, resized, rotated
+and mirrored duplicates are all still found — those are pixel work.
+**Cropped copies are not.** That is not a degradation, it is close to a
+total loss, and the report gives no sign of it: a Tier B section still
+appears, built from whatever crops happened to survive.
+
+The reason is the prefilter. Before any pixel comparison, all pairs are
+swept on an 8x8 colour signature and only those within `--sig-cut` (8.0 by
+default) go further; with embeddings, CLIP nominates candidates as well.
+A crop moves the signature far more than a re-encode does, so it is the
+CLIP path that carries crops through. Measured over 200 real images, the
+share of cropped copies whose signature exceeds the cut:
+
+| crop keeps | median signature distance | never reaches the crop matcher |
+| ---------- | -------------------------: | -----------------------------: |
+| 97%        | 3.15                       | 0%                             |
+| 90%        | 10.53                      | **74%**                        |
+| 80%        | 20.66                      | 97%                            |
+| 70%        | 30.20                      | 98%                            |
+
+So anything trimmed by more than a few percent needs CLIP. Raising
+`--sig-cut` is not a substitute: catching 90% crops needs roughly 30, and
+the sweep already keeps 96,255 pairs out of 662 million at 8.0.
 
 - **Pipelined.** Images are decoded and preprocessed on a thread pool that
   runs ahead of the model, so the GPU never waits for the disk; JPEGs
