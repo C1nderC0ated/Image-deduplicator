@@ -2324,11 +2324,24 @@ def main():
     ap.add_argument('--no-orient', action='store_true',
                     help='skip rotation/mirror matching (faster sweep; '
                          'rotated and mirrored copies will be missed)')
+    # Measured on a 36,410-image library: 5,598 images (15.4%) bind against
+    # this cap. For those, the cosine of the LAST neighbour kept runs from
+    # 0.9006 to 0.9627, median 0.9269 - so the cap never cuts above 0.9627,
+    # and Tier A, which needs >= 0.99, cannot lose a candidate to it. What
+    # it trims is review candidates for images in dense clusters: 1,402 of
+    # the capped images (3.9% of the library) have a cut line above the 0.94
+    # Tier B floor.
+    #
+    # It is clearly earning its place - median neighbour count above the
+    # floor is 0, but p99 is 2,466 and the maximum 2,672, so a few dense
+    # clusters would otherwise contribute millions of pairs by themselves.
     ap.add_argument('--clip-neighbors', type=int, default=48,
                     help='how many nearest neighbours each image contributes '
                          'from the embeddings (default 48). Bounds the '
                          'candidate set on large libraries, where a flat '
-                         'cosine floor admits a fifth of all pairs')
+                         'cosine floor admits a fifth of all pairs. Cannot '
+                         'cost a Tier A candidate; may trim review '
+                         'candidates inside dense clusters')
     ap.add_argument('--no-embeddings', action='store_true')
     ap.add_argument('--self-test', action='store_true')
     args = ap.parse_args()
