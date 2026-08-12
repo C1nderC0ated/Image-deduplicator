@@ -748,17 +748,50 @@ NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.92,
 # 90% crops from 79% to 97% at the old gate. Costs ~20 s on a 164 s run.
 
 
-# Below this many pairs the crop matcher stays on threads: four process
-# spawns plus imports cost ~6-8 s, and a small pair list is finished before
-# that is paid back.
+# Below this many pairs the crop matcher stays on threads: the process
+# spawns plus their imports cost ~6-8 s, and a small pair list is finished
+# before that is paid back.
 NCC_MP_MIN_PAIRS = 20000
+
+
+def _ncc_procs():
+    """How many worker processes the crop matcher gets, or 0 for threads.
+
+    Measured on the 168,120-pair reference workload against the 127 s
+    threaded baseline, replaying the captured pairs in isolation:
+
+        procs   2      4      6      8
+        wall    163.6  92.5   84.1   83.3
+
+    The floor is the part that matters. Two processes are SLOWER than the
+    threads they replace: each chunk redoes the per-image decode and
+    grayscale for every image its pairs touch (~2.6x duplication overall),
+    and at two workers that duplicated work costs more than the second
+    interpreter wins. A naive cores//2 would have handed exactly two
+    workers - a measured 0.78x, a regression - to every four-thread
+    machine. Below four logical cores there is no count that absorbs the
+    duplication, so it stays on threads entirely.
+
+    The exact count above the floor matters much less than the isolated
+    numbers suggest. In a real run the parent is also holding the whole
+    thumbnail store (~1.2 GB preloaded), so the extra workers compete for
+    memory bandwidth that the replay had free: end to end, six processes
+    finished crop matching in 87.7 s against four processes' 88.9 s -
+    inside the run-to-run spread. Six is kept because nothing measured
+    worse at it, not because 6 beats 4. The ceiling of eight leaves two
+    cores for the parent and the rest of the machine, and past six the
+    isolated curve is flat anyway (84.1 -> 83.3)."""
+    cpu = os.cpu_count() or 4
+    if cpu < 4:
+        return 0
+    return max(4, min(8, cpu - 2))
 
 
 class _TbView:
     """TH stand-in inside an NCC worker process: decodes a thumbnail from
     its shipped base64 string on access and keeps nothing - compute_nccs
     reads each index exactly once (to build its grayscale), so a cache
-    would only hold memory the four workers each pay for."""
+    would only hold memory every worker pays for."""
 
     def __init__(self, tbmap):
         self._tb = tbmap
@@ -785,8 +818,9 @@ def _nccs_mp(TH, pairs, procs):
     and at 168k pairs the glue alone serializes the stage - measured 28%
     parallel efficiency on 8 threads, 127 s of wall for ~200 core-seconds
     of actual work. Slicing the list across processes gives each chunk its
-    own interpreter: 92.7 s -> the same scores, bit for bit (the worker IS
-    compute_nccs), at 1.37x.
+    own interpreter: 84 s at the default worker count - the same scores,
+    bit for bit, because the worker IS compute_nccs. See _ncc_procs for
+    why that count is what it is.
 
     Contiguous slices, not component-packed ones: pairs arrive sorted, so
     neighbouring pairs share images and each chunk's template cache stays
@@ -838,7 +872,7 @@ def compute_nccs(TH, pairs, workers, procs=None):
     # four process starts.
     forced = procs is not None
     if procs is None:
-        procs = max(2, min(4, (os.cpu_count() or 4) // 2))
+        procs = _ncc_procs()
     if (procs and (forced or len(pairs) >= NCC_MP_MIN_PAIRS)
             and getattr(TH, '_recs', None) is not None):
         try:
