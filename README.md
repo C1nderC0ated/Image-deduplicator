@@ -322,6 +322,17 @@ the sweep already keeps 96,255 pairs out of 662 million at 8.0.
   CPU-only torch wheel (`+cpu` in the version), which can never use a GPU
   regardless of code. `--device cuda` forces the matter (clean error if
   impossible), `--device cpu` opts out of the lecture.
+- **Optional GPU preprocessing.** `--gpu-preprocess` moves resize and
+  normalization for opaque still images with a 2x-or-larger downscale onto
+  the accelerator. Smaller images, transparent images, animations, and
+  decoded RGB frames over 4 MP retain the established Pillow path. It can
+  help when CPU preprocessing is the bottleneck; it can be slower when
+  several fast CPU cores already keep the model fed, so it is never enabled
+  automatically.
+  Torch and Pillow use different bicubic kernels, so the mode has its own
+  provenance stamp and cannot resume into a Pillow-built embeddings file.
+  JPEG draft/full-resolution mode is stamped too, so changing `--no-draft`
+  also requires a fresh embeddings file.
 - **Resumable.** Re-running skips every SHA already embedded and appends;
   failed files are retried every run, like the collector. One pathological
   image cannot kill the run, a failed batch is retried one image at a
@@ -462,8 +473,9 @@ more:
 | `--root DIR` | from inventory header | override the image folder |
 | `--batch N` | 64 GPU / 8 CPU | batch size |
 | `--workers N` | auto (≤ 8) | decode/preprocess threads feeding the model |
-| `--no-draft` | off | decode JPEGs at full resolution (slower) |
+| `--no-draft` | off | decode JPEGs at full resolution (slower). Recorded in preprocessing provenance; changing it requires a fresh embeddings file |
 | `--fp16` | off | float16 on the GPU (~2.9× faster). Vectors shift by up to 0.0006 pairwise cosine — enough to move a pair sitting exactly on the Tier A floor into review. Recorded in the header; a resumed file of the other precision is refused |
+| `--gpu-preprocess` | off | move opaque 2x+ downscale and normalization to the GPU. Transparent, animated, smaller, and decoded-over-4-MP images stay on Pillow. Useful on CPU-constrained runs; not pixel-identical, so it has separate resume provenance and requires a fresh embeddings file |
 | `--device D` | auto | `auto` / `cuda` / `cpu` — auto prefers GPU and explains any fallback |
 | `--share` / `--mirror-dir` | off | as in Collect |
 
@@ -551,6 +563,11 @@ machine.
   trusting a number written here.
 - **Embed refuses to run: "built with a different model".** Deliberate, vectors from different models are not comparable. Re-run with the old
   `--model`, or move/delete the embeddings file to start fresh.
+- **Embed refuses to resume after changing `--gpu-preprocess` or
+  `--no-draft`.** Deliberate: Pillow/Torch resize and draft/full JPEG decode
+  can feed different pixels to the model, so mixing those vectors in one file
+  makes cosine comparisons inconsistent. Move the old embeddings file aside
+  and re-embed the inventory from scratch.
 - **The run says OpenCV is missing.** Crop detection degrades to what CLIP
   alone can see. `pip install opencv-python-headless` fixes it (on a
   distro-managed Python, `./imgdedup.sh setup`; see PEP 668 above).

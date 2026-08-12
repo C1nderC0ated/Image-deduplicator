@@ -19,6 +19,13 @@ Recycle-Duplicates*.sh
 .venv/
 venv/
 
+# Machine-local measurement data. The protocol under .benchmarks is tracked;
+# real-library baselines and legacy in-repo pilot runs contain private paths
+# and thumbnails, so they stay local. Canonical benchmark runs live outside
+# the repository by default.
+.baseline/
+.benchmarks/agent-control/runs/
+
 # Editors and OS clutter
 .vscode/
 .idea/

@@ -3,6 +3,43 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
+## Unreleased
+
+**Opt-in GPU preprocessing, with the unsafe surface cut away.**
+`embed-images.py --gpu-preprocess` moves antialiased bicubic resize and CLIP
+normalization to the accelerator only for opaque still images being
+downscaled by at least 2x. Transparent images, animations, smaller resizes,
+and decoded RGB frames over 4 MP stay on the existing byte-identical Pillow
+path. (JPEG draft decoding can bring a larger source below that decoded
+ceiling.)
+Torch's fractional bicubic result is clipped and rounded to match the uint8
+samples Pillow feeds into normalization. Raw source batches and GPU working
+sets are bounded: decoded futures have a 768 MiB ceiling and the active model
+batch has a separate 256 MiB ceiling.
+
+The separate `exif+pil+flat+torch-aa-down2x-opaque+jpeg-draft` provenance tag
+is load-bearing: adding or removing the flag on a resumed embeddings file
+stops before model load, because mixing two resize kernels would make cosine
+comparisons inconsistent. `--no-draft` has a distinct `jpeg-full` tag for the
+same reason.
+
+The accepted boundary took several rejected whole-library A/Bs to find.
+Torch upscales moved tiny pixel art badly; GPU-processed animations moved an
+unsafe GIF deletion; GPU-processed transparent sprites introduced two new
+`X` marks on facial-expression variants. All three classes now stay on
+Pillow. On the final 35,910-image A/B, 26,118 vectors were byte-identical and
+the 9,792 GPU vectors had median cosine 0.999945, minimum 0.995336, none below
+0.995. The decision gate then matched all 3,439 Tier A member sets and every
+one of the 9,335 editable Tier A `X` paths. Tier B kept 1,812 clusters and
+5,821 candidates; one information-only relation changed references only.
+
+It is not automatically faster. The hardened mixed-library run reached
+277.4 img/s against Pillow's 310.3 on a 24-thread Ryzen, 10.6% slower. A
+deterministic 2,623-image large-JPEG run limited to two decode threads reached
+226.4 img/s against 214.8–216.2, about 5% faster after bounding decoded
+run-ahead. The option therefore remains off by default and is documented for
+CPU-constrained preprocessing, not as a universal accelerator.
+
 ## v4.3.7 — 2026-08-12 (current)
 
 **The whole pipeline is about 25% faster, and every byte of output is
