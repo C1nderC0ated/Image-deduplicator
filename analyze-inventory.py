@@ -1644,6 +1644,63 @@ def self_test():
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # The page's four smaller promises, all in one generated report: a
+    # control-character name is not drawn as a deletion, "Clear Tier B
+    # marks" can reach a Tier B keeper, a file is protected in every
+    # cluster it appears in, and Ctrl+X is a copy shortcut rather than a
+    # deletion.
+    try:
+        import shutil as _sh3
+        import tempfile
+        buf = io.BytesIO()
+        Image.fromarray(np.zeros((8, 8, 3), np.uint8)).save(buf, 'JPEG')
+        tb64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        recs_p = [{'p': 'keepA.png', 'b': 900, 'sha': 'a' * 64, 'w': 40, 'h': 40, 'tb': tb64},
+                  {'p': 'bad\nname.png', 'b': 100, 'sha': 'b' * 64, 'w': 20, 'h': 20, 'tb': tb64},
+                  {'p': 'keepB.png', 'b': 800, 'sha': 'c' * 64, 'w': 40, 'h': 40, 'tb': tb64},
+                  {'p': 'otherB.png', 'b': 200, 'sha': 'd' * 64, 'w': 20, 'h': 20, 'tb': tb64}]
+        ta_p = [(0, [1], [0, 1])]
+        tb_p = [(2, [3], [2, 3])]
+        td = tempfile.mkdtemp()
+        _n, LL, at_p, sg_p, all_p = write_list_and_script(
+            os.path.join(td, 'l.txt'), os.path.join(td, 'r.py'),
+            os.path.join(td, 'r.bat'), os.path.join(td, 'r.sh'),
+            recs_p, ta_p, tb_p, td)
+        pl_p, hm_p = build_emission_plan(ta_p, tb_p, recs_p)
+        rp = os.path.join(td, 'r.html')
+        write_report(rp, recs_p, ta_p, tb_p, td,
+                     {'n': 4, 'exact': 0, 'headline': 'x', 'method': 'y'},
+                     pl_p, hm_p, list_lines=LL, editable_at=at_p,
+                     suggested_b=sg_p, tier_b_all=all_p, list_name='l.txt')
+        page = open(rp, encoding='utf-8').read()
+
+        # 1. the uneditable name says so, and is not styled as marked
+        hit = [c for c in page.split('<div class="it ') if 'ALWAYS KEPT' in c]
+        t1 = len(hit) == 1 and not hit[0].split('"', 1)[0].strip().endswith('on')
+        print('  [%s] a name the list cannot mark is not drawn as a deletion'
+              % ('PASS' if t1 else 'FAIL'))
+
+        # 2. the Tier B keeper is reachable by the clear-marks button
+        t2 = 'keepB.png' in (all_p or []) and 'otherB.png' in (all_p or [])
+        print('  [%s] clearing Tier B marks can reach the suggested keeper'
+              % ('PASS' if t2 else 'FAIL'))
+
+        # 3. a file is looked up in every cluster it belongs to, not one
+        t3 = 'CLOF[p].push(c)' in page and 'for(var i=0;i<cls.length;i++)' in page
+        print('  [%s] the last-copy guard checks every cluster a file is in'
+              % ('PASS' if t3 else 'FAIL'))
+
+        # 4. Ctrl+X / Cmd+X reaches the browser, not the mark toggle
+        t4 = 'if(e.ctrlKey||e.metaKey||e.altKey)return;' in page
+        print('  [%s] a modifier chord is not a marking keystroke'
+              % ('PASS' if t4 else 'FAIL'))
+
+        ok = ok and t1 and t2 and t3 and t4
+        _sh3.rmtree(td, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
     # fallback suite away the moment anything above it failed
@@ -1692,8 +1749,15 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
         return s
     P = []
     A = P.append
-    dn = sum(len(d) for _, d, _ in tier_a)
-    db = sum(recs[i]['b'] for _, d, _ in tier_a for i in d)
+    # "Droppable" and "reclaimable" mean what the LIST can actually act on.
+    # A file with control characters in its name gets no editable line and
+    # can never be binned, so counting it here promised space that no run
+    # could ever free. Without a list to check against (the no-duplicates
+    # branch) every drop still counts, which is the honest fallback.
+    def _markable(i):
+        return editable_at is None or recs[i]['p'] in editable_at
+    dn = sum(1 for _, d, _ in tier_a for i in d if _markable(i))
+    db = sum(recs[i]['b'] for _, d, _ in tier_a for i in d if _markable(i))
     A('<!doctype html><html lang="en"><meta charset="utf-8"><title>Duplicate report</title>')
     A('<meta name="viewport" content="width=device-width,initial-scale=1"><style>'
       # Dark by design: this report is looked at next to the pictures it is
@@ -1879,6 +1943,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             for d in [m for m in editable if m != keeper]:
                 cls = 'd' if key == 'A' else 'n'
                 lab = 'DROP' if key == 'A' else 'REVIEW'
+                on = ' on' if key == 'A' else ''
                 # A review cluster is a connected component, so a member can
                 # be here because it matches the keeper, or because it
                 # matches something that matches the keeper. Those are very
@@ -1893,11 +1958,18 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                     if key == 'A':
                         on = ''          # chained: not pre-marked any more
                 rel = recs[d]['p']
-                on = ' on' if key == 'A' else ''
                 tog = ''
                 if live and rel in (editable_at or {}):
                     tog = ('<button class="tg" data-p="%s">%s</button>'
                            % (esc(rel), 'bin' if key == 'A' else 'keep'))
+                elif live:
+                    # No editable line: a control character in the name, which
+                    # the list refuses to make markable and describes as
+                    # "always kept". The report used to draw it red, label it
+                    # DROP and style it as already marked, with no button -
+                    # promising a deletion that cannot happen and offering no
+                    # way to correct the display.
+                    cls, lab, on = 'r', 'ALWAYS KEPT', ''
                 if cl_id is not None:
                     clusters.setdefault(cl_id, []).append(rel)
                 A('<div class="it %s%s"%s%s><img src="data:image/jpeg;base64,%s" alt="">'
@@ -1957,15 +2029,26 @@ function paint(){var n=0;
   tiles.forEach(function(t,ix){var p=t.getAttribute('data-p'),on=isOn(p);
     t.classList.toggle('on',on); t.classList.toggle('sel',ix===cur);
     var b=t.querySelector('.tg'); if(b)b.textContent=on?'bin':'keep';});}
-var CLOF={};                     // path -> the cluster it is counted in
-for(var c in CLUSTERS){CLUSTERS[c].forEach(function(p){if(!(p in CLOF))CLOF[p]=c;});}
+// path -> EVERY cluster that counts it as a member, not just its home.
+// A file can be editable in one cluster and a reference tile in others,
+// and the recycler counts an unmarked reference as a surviving copy - so
+// binning it can empty a cluster it does not live in. Mapping to one
+// cluster let this sequence through: mark both members of cluster 2 where
+// one of them is only a reference, and cluster 2 downloads with nothing
+// unmarked, which the page's own hint says cannot happen.
+var CLOF={};
+for(var c in CLUSTERS){CLUSTERS[c].forEach(function(p){
+  if(!(p in CLOF))CLOF[p]=[]; CLOF[p].push(c);});}
 function survivors(cl){var m=CLUSTERS[cl]||[],n=0;
   for(var i=0;i<m.length;i++){if(!isOn(m[i]))n++;} return n;}
 // The only rule: a cluster keeps at least one copy. WHICH one is yours to
 // pick, the suggested keeper included. Refusing to mark the keeper was
 // simpler and wrong - preferring the other copy could not be said at all.
-function canBin(p){var cl=CLOF[p];
-  return cl===undefined || survivors(cl)>1;}
+function canBin(p){var cls=CLOF[p];
+  if(!cls)return true;
+  // every cluster this file counts in must keep someone, not just its home
+  for(var i=0;i<cls.length;i++){if(survivors(cls[i])<=1)return false;}
+  return true;}
 function say(t,msg){var b=t&&t.querySelector('.tg'); if(!b)return;
   var old=b.textContent; b.textContent=msg; b.classList.add('no');
   setTimeout(function(){b.textContent=old;b.classList.remove('no');},1400);}
@@ -1976,7 +2059,12 @@ tiles.forEach(function(t,ix){t.addEventListener('click',function(e){
   cur=ix; toggle(t.getAttribute('data-p'),t); e.preventDefault();});});
 document.getElementById('ball').onclick=function(){
   SUGG.forEach(function(p){if(canBin(p))mark(p,true);});paint();};
-document.getElementById('bnone').onclick=function(){TIERB.forEach(function(p){mark(p,false);});paint();};
+// Clears every Tier B line, KEEPERS INCLUDED. TIERB used to list only
+// non-keepers, which was right while the keeper tile had no toggle; now
+// that it has one, a keeper marked by hand survived "Clear Tier B marks"
+// and the only way back was Reset, which also discards Tier A edits.
+document.getElementById('bnone').onclick=function(){
+  TIERB.forEach(function(p){mark(p,false);});paint();};
 document.getElementById('breset').onclick=function(){LINES=ORIG.slice();paint();};
 document.getElementById('bdl').onclick=function(){
   var txt=LINES.join(CRLF?'\r\n':'\n'), blob=new Blob([CRLF?'﻿'+txt:txt],
@@ -1985,6 +2073,11 @@ document.getElementById('bdl').onclick=function(){
   setTimeout(function(){URL.revokeObjectURL(u);},2000);};
 document.addEventListener('keydown',function(e){
   if(e.target.tagName==='INPUT')return;
+  // Ignore anything with a modifier held. Ctrl+X after Ctrl+C is muscle
+  // memory, and it used to silently mark whatever tile was selected -
+  // nothing gets cut, so there is no visible cause. Alt+Left/Right is
+  // browser Back/Forward, which preventDefault was cancelling.
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
   if(e.key==='ArrowRight'||e.key==='j'){cur=Math.min(cur+1,tiles.length-1);}
   else if(e.key==='ArrowLeft'||e.key==='k'){cur=Math.max(cur-1,0);}
   else if(e.key==='x'||e.key==='X'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'),tiles[cur]);return;}
@@ -2133,7 +2226,10 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                        and recs[i]['p'] in editable_at) else 0
             if sd:
                 suggested_b.append(recs[i]['p'])
-            if key == 'B' and not is_keeper and recs[i]['p'] in editable_at:
+            # Keepers included: "Clear Tier B marks" has to be able to undo
+            # a mark the user put on a keeper, which became possible when
+            # the keeper tile gained a toggle.
+            if key == 'B' and recs[i]['p'] in editable_at:
                 tier_b_all.append(recs[i]['p'])
             row = {'rel': recs[i]['p'], 'size': recs[i]['b'],
                    'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key}
