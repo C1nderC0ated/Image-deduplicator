@@ -887,6 +887,20 @@ def main():
     root = os.path.abspath(args.folder) if args.folder else script_dir
     if not os.path.isdir(root):
         print('Not a folder: ' + root)
+        # A phone or camera on a cable is the likeliest way to land here, and
+        # "Not a folder" is a useless thing to say about it. Those connect
+        # over MTP, which is a shell namespace rather than a filesystem:
+        # Explorer shows "This PC\Phone\Internal storage\DCIM" and there is
+        # no drive letter behind it, so os.walk and open() cannot address it
+        # and neither can cmd. Dragging one onto a .bat hands over a shell
+        # item, not a path.
+        if not os.path.exists(root):
+            print('')
+            print('If that came from a phone or camera on a USB cable: those')
+            print('appear over MTP, which is not a drive - there is no path')
+            print('behind what Explorer shows, so nothing here can read it.')
+            print('Copy the folder to this PC first and scan the copy, or put')
+            print('the card in a reader, which does get a real drive letter.')
         sys.exit(2)
 
     prev_files, prev = ([], {})
