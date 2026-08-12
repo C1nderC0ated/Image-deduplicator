@@ -805,9 +805,27 @@ class UF(object):
         return [sorted(v) for v in g.values() if len(v) > 1]
 
 
+# PNG, BMP and TIFF store every pixel a photo can have, so a copy in one
+# of them has not been through a lossy generation. GIF is lossless too and
+# is NOT here: it is capped at 256 colours, so a GIF of a photograph is a
+# worse copy than the JPEG, not a better one. WEBP is absent because the
+# format is both things and the record does not say which - those stay
+# ranked by size, as before. A TIFF can carry JPEG-compressed tiles and
+# would be over-credited here; that is rare and costs one kept copy, not a
+# deletion, since the loser of this tiebreak is still the same picture.
+LOSSLESS_FMTS = ('PNG', 'BMP', 'TIFF')
+
+
 def quality_key(recs, i):
-    """Which copy of a duplicate group to KEEP: most pixels, then largest
-    file, then finest JPEG quantisation (a smaller qsum is finer).
+    """Which copy of a duplicate group to KEEP: most pixels, then a
+    lossless encoding over a lossy one, then largest file, then finest
+    JPEG quantisation (a smaller qsum is finer).
+
+    File size ranked second until now, and that quietly preferred the
+    re-save: a 2.1 MB JPEG exported from a 1.6 MB PNG original is bigger
+    than what it came from, so the original was the copy marked X and the
+    generation-lossy copy was kept. Size is a proxy for detail only within
+    one encoding; across two it is not one at all.
 
     This decides which file gets proposed for deletion, which makes it the
     most consequential rule here - and unlike the thresholds around it, it
@@ -826,7 +844,8 @@ def quality_key(recs, i):
     why it is still unmeasured rather than quietly assumed fine.
     """
     r = recs[i]
-    return (r['w'] * r['h'], r['b'], -r.get('qsum', 10 ** 9))
+    lossless = 1 if (r.get('fmt') or '').upper() in LOSSLESS_FMTS else 0
+    return (r['w'] * r['h'], lossless, r['b'], -r.get('qsum', 10 ** 9))
 
 
 def anim_compatible(ra, rb):
@@ -1576,6 +1595,23 @@ def self_test():
         print('  [%s] a mild difference everywhere still matches'
               % ('PASS' if agrees else 'FAIL'))
         ok = ok and agrees
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # The keeper rule, on the one case where the old rule chose backwards.
+    try:
+        same = dict(w=1000, h=1000, sha='a' * 64)
+        png = dict(same, p='orig.png', b=1_600_000, fmt='PNG')
+        jpg = dict(same, p='resave.jpg', b=2_100_000, fmt='JPEG', qsum=200)
+        pick = max([0, 1], key=lambda i: quality_key([png, jpg], i))
+        # and the tiebreak must not outrank pixels: a bigger JPEG still wins
+        big = dict(p='big.jpg', w=2000, h=2000, b=900_000, fmt='JPEG', sha='b' * 64)
+        pick2 = max([0, 1], key=lambda i: quality_key([png, big], i))
+        good = pick == 0 and pick2 == 1
+        print('  [%s] a lossless original outranks a larger lossy re-save'
+              % ('PASS' if good else 'FAIL'))
+        ok = ok and good
     except Exception as exc:
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
