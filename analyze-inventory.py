@@ -1478,6 +1478,38 @@ def self_test():
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # A Tier A member that never matched the KEEPER must not be pre-marked
+    # for deletion. Clusters are connected components, so a chain of
+    # near-misses collapses into one group whose ends are different
+    # pictures; pre-marking those is an active recommendation to delete
+    # something the survivor does not resemble.
+    try:
+        import tempfile as _tf3
+        import shutil as _sh4
+        td3 = _tf3.mkdtemp()
+        recs3 = [{'p': 'a.png', 'b': 300, 'sha': 'a' * 64, 'w': 40, 'h': 40},
+                 {'p': 'b.png', 'b': 200, 'sha': 'b' * 64, 'w': 40, 'h': 40},
+                 {'p': 'c.png', 'b': 100, 'sha': 'c' * 64, 'w': 40, 'h': 40}]
+        # a-b matched and b-c matched, but a-c never did: a chain
+        chain_edges = {(0, 1), (1, 0), (1, 2), (2, 1)}
+        _n, L3, _at, _sg, _al = write_list_and_script(
+            os.path.join(td3, 'l.txt'), os.path.join(td3, 'R.py'),
+            os.path.join(td3, 'R.bat'), os.path.join(td3, 'R.sh'),
+            recs3, [(0, [1, 2], [0, 1, 2])], [], td3, None, set(), chain_edges)
+        marks3 = {}
+        for ln3 in L3:
+            if len(ln3) > 3 and ln3[0] in 'X.' and ln3[1:3] == '  ':
+                marks3[ln3[3:].split('   ')[0]] = ln3[0]
+        # a is the keeper (largest); b matched it, c only chained through b
+        good = marks3.get('b.png') == 'X' and marks3.get('c.png') == '.'
+        print('  [%s] a chained Tier A member is not pre-marked for deletion'
+              % ('PASS' if good else 'FAIL'))
+        ok = ok and good
+        _sh4.rmtree(td3, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     # A mark must stay on the file it was written against. A leading space
     # is a legal filename that walk_images accepts, and the old parser
     # stripped it, so " p.jpg" and "p.jpg" collapsed to one key and the
@@ -1647,7 +1679,8 @@ def small_b64(rec, maxw=150):
 
 def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                  list_lines=None, editable_at=None, suggested_b=None,
-                 tier_b_all=None, list_name=None, b_edges=None):
+                 tier_b_all=None, list_name=None, b_edges=None,
+                 a_edges=None):
     def mb(x):
         return '%.2f MB' % (x / 1048576.0)
 
@@ -1790,7 +1823,13 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     for tier, key, colour, bg, title, lead in (
             (tier_a, 'A', '#3ddc97', '#12281e', 'DUPLICATE',
              'Same picture, re-encoded or resized. Keeper is highest resolution, then '
-             'largest file, then finest JPEG quantization. Pre-set to <code>X</code>.'),
+             'largest file, then finest JPEG quantization. '
+             '<b style="color:var(--drop)">DROP</b> matched the keeper directly and is '
+             'pre-set to <code>X</code>; '
+             '<b style="color:#b3a0d4">LINKED</b> (dashed) reached this cluster through '
+             'another member and is left on <code>.</code> &mdash; a chain of near-misses '
+             'can put two genuinely different pictures in one group, so those are shown '
+             'but never pre-marked.'),
             (tier_b, 'B', '#f0b64b', '#2a2113', 'CROP / VARIANT',
              'Structurally the same picture, genuinely different pixels. Nothing here is '
              'deleted &mdash; pre-set to <code>.</code>. '
@@ -1847,9 +1886,12 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 # identical - which is how an eighteen-file cluster of
                 # unrelated screenshots reads as a bug rather than as a
                 # chain. Say which is which.
-                if (key == 'B' and b_edges is not None and keeper is not None
-                        and (keeper, d) not in b_edges):
+                _edges = b_edges if key == 'B' else a_edges
+                if (_edges is not None and keeper is not None
+                        and (keeper, d) not in _edges):
                     cls, lab = 'x', 'LINKED'
+                    if key == 'A':
+                        on = ''          # chained: not pre-marked any more
                 rel = recs[d]['p']
                 on = ' on' if key == 'A' else ''
                 tog = ''
@@ -1958,7 +2000,8 @@ paint();
 
 
 def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
-                          tier_a, tier_b, root, info_b=None, b_edges=None):
+                          tier_a, tier_b, root, info_b=None, b_edges=None,
+                          a_edges=None):
     """Writes the list and the three recyclers.
 
     Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
@@ -2044,8 +2087,9 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                              't': key})
         for i in ([keeper] + [m for m in editable if m != keeper] if editable else []):
             is_keeper = (i == keeper)
-            linked = (key == 'B' and not is_keeper and b_edges is not None
-                      and keeper is not None and (keeper, i) not in b_edges)
+            edges = b_edges if key == 'B' else a_edges
+            linked = (not is_keeper and edges is not None
+                      and keeper is not None and (keeper, i) not in edges)
             if list_safe(recs[i]['p']) != recs[i]['p']:
                 # A control character in a filename (a newline above all)
                 # would let the file's own name FORGE mark lines: writing it
@@ -2061,7 +2105,21 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                                              info(i, is_keeper, linked)))
                 mark = None
             else:
-                mark = '.' if (is_keeper or key == 'B') else 'X'
+                # A Tier A member that never matched the KEEPER is not
+                # pre-marked. Clusters are connected components, so a chain
+                # - a burst, exported video frames, a scrolling screenshot
+                # series - collapses into one cluster where consecutive
+                # members are within the gate but the ends are plainly
+                # different pictures. Measured drops sat 34.30 MAD from the
+                # copy being kept, 8.6x outside the 4.0 gate, and on a real
+                # 36k library 37 of 116 Tier A drops were outside it.
+                #
+                # Pre-marking is an active recommendation to delete. Making
+                # that recommendation about a file the keeper never matched
+                # is the exact failure this tool exists to avoid, so those
+                # members stay in the cluster, stay visible, and stay on "."
+                # until a human says otherwise.
+                mark = '.' if (is_keeper or key == 'B' or linked) else 'X'
                 L.append('%s  %s   [%s]'
                          % (mark, recs[i]['p'], info(i, is_keeper, linked)))
                 editable_at[recs[i]['p']] = len(L) - 1
@@ -2874,6 +2932,7 @@ def main():
     # second keeps that set small: on a real library almost every candidate
     # exits above, and what remains is a rounding error next to the sweep.
     uf_a = UF()
+    a_edges = set()          # which Tier A members actually matched EACH OTHER
     tierb_pairs = []
     fallback = []
     dead_zone = oriented = 0
@@ -2884,6 +2943,8 @@ def main():
                   and anim_compatible(recs[i], recs[j]))
         if is_dup:
             uf_a.union(i, j)
+            a_edges.add((i, j))
+            a_edges.add((j, i))
         elif m <= args.tier_b_mad:
             # Pixels agree but CLIP does not. This used to fall through every
             # branch and vanish - the pair was neither marked nor reviewed.
@@ -2981,6 +3042,13 @@ def main():
     for members in exact:
         for i in members[1:]:
             uf_a.union(members[0], i)
+        # Byte-identical, so every member really does match every other -
+        # unlike a pixel-scored chain, an exact group is a genuine clique
+        # and each of its edges is real.
+        for a_ in members:
+            for b_ in members:
+                if a_ != b_:
+                    a_edges.add((a_, b_))
 
     tier_a = []
     for members in uf_a.groups():
@@ -3091,11 +3159,13 @@ def main():
     # time in JavaScript would leave two implementations free to drift, and
     # this project has been bitten by exactly that before.
     nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
-        lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges)
+        lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges,
+        a_edges)
     write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
                  list_lines=llines, editable_at=editable_at,
                  suggested_b=suggested_b, tier_b_all=tier_b_all,
-                 list_name=os.path.basename(lst), b_edges=b_edges)
+                 list_name=os.path.basename(lst), b_edges=b_edges,
+                 a_edges=a_edges)
     print('')
     print('Wrote:')
     for q in (rep, lst, rpy, bat, sh):
