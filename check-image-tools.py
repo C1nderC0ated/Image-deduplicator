@@ -105,6 +105,18 @@ try:
     o['cuda'] = bool(torch.cuda.is_available())
     o['hip'] = getattr(torch.version, 'hip', None)
     o['cuda_build'] = getattr(torch.version, 'cuda', None)
+    # The embedder runs on Intel Arc and on Apple Metal too. Reporting only
+    # CUDA told an Arc owner "CPU only - BUT a GPU is present" and handed
+    # them a reinstall command, about a setup that was already using the
+    # GPU. Collected here so the report can say which one.
+    try:
+        o['xpu'] = bool(torch.xpu.is_available())
+    except Exception:
+        o['xpu'] = False
+    try:
+        o['mps'] = bool(torch.backends.mps.is_available())
+    except Exception:
+        o['mps'] = False
 except Exception as e:
     o['embed_ok'] = False
     o['embed_err'] = type(e).__name__ + ': ' + str(e)[:110]
@@ -387,11 +399,16 @@ def main():
         tv = best_embed[2].get('torchver', '')
         hip = best_embed[2].get('hip')
         # HIP first: a ROCm build reports cuda.is_available() == True and
-        # torch.version.cuda is not a reliable discriminator.
+        # torch.version.cuda is not a reliable discriminator. XPU and Metal
+        # come after both, because neither sets torch.version.cuda and a
+        # build that does set it is the one being described.
         kind = ('ROCm/HIP %s' % hip if hip else
                 'CUDA %s' % best_embed[2].get('cuda_build')
-                if best_embed[2].get('cuda_build') else 'CPU-only')
-        if best_embed[2].get('cuda'):
+                if best_embed[2].get('cuda_build') else
+                'Intel XPU' if best_embed[2].get('xpu') else
+                'Apple Metal' if best_embed[2].get('mps') else 'CPU-only')
+        if (best_embed[2].get('cuda') or best_embed[2].get('xpu')
+                or best_embed[2].get('mps')):
             print('       GPU acceleration available  (%s build).' % kind)
         else:
             exe = best_embed[2].get('exe') or best_embed[0][0]
