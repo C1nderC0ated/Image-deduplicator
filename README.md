@@ -653,6 +653,10 @@ and the freedesktop trash layout exercised against real files.
 **v4.3.7** (2026-08-12). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
+Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change
+is held to, the settled defaults and why they are set where they are, and
+the list of optimisations already measured and rejected.
+
 ---
 
 ## License
