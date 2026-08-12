@@ -463,28 +463,56 @@ def sweep_candidates_cross(C, Ck, cut, rows=None):
     ridx = np.arange(n) if rows is None else np.asarray(rows)
     A = np.ascontiguousarray(C[ridx], dtype=np.float32)
     B = np.ascontiguousarray(Ck, dtype=np.float32)
-    sa, sb = (A * A).sum(1), (B * B).sum(1)
+    # The same mean-band the main sweep uses, applied to the cross case:
+    # mean|a-b| >= |mean(a) - mean(b)| holds whatever B is, so only B rows
+    # whose mean sits within `cut` of an A row's mean can qualify, and
+    # sorting both sides turns each full gram into a band. This is where
+    # the no-embeddings run spent most of its time - seven full n x n
+    # grams, 256 s of a ~356 s analyze on the reference library.
+    #
+    # One float32 wrinkle the main sweep does not have: there a pair's two
+    # means come from the same array, here B's rows are re-oriented copies
+    # whose SUMMATION ORDER differs, so the two float32 means of a true
+    # pair can disagree by rounding. The band is widened by 0.01 - means
+    # live in 0..255 where float32 mean error over 192 values is under
+    # 1e-3 - and every band survivor is still re-checked exactly below, so
+    # the widening can only cost a few extra exact checks, never a pair.
+    msA = A.mean(1)
+    msB = B.mean(1)
+    oA = np.argsort(msA, kind='stable')
+    oB = np.argsort(msB, kind='stable')
+    As = np.ascontiguousarray(A[oA])
+    Bs = np.ascontiguousarray(B[oB])
+    msAs, msBs = msA[oA], msB[oB]
+    sa, sb = (As * As).sum(1), (Bs * Bs).sum(1)
     lim = 255.0 * cut * w * 1.0001 + 1000.0
+    margin = cut + 0.01
     out = []
     block = max(64, min(2048, int(8_000_000 // max(1, n))))
-    for a in range(0, len(A), block):
-        b = min(len(A), a + block)
-        D2 = sa[a:b, None] + sb[None, :] - 2.0 * (A[a:b] @ B.T)
+    for a in range(0, len(As), block):
+        b = min(len(As), a + block)
+        lo = int(np.searchsorted(msBs, msAs[a] - margin, side='left'))
+        hi = int(np.searchsorted(msBs, msAs[b - 1] + margin, side='right'))
+        if lo >= hi:
+            continue
+        D2 = sa[a:b, None] + sb[None, lo:hi] - 2.0 * (As[a:b] @ Bs[lo:hi].T)
         ii, jj = np.nonzero(D2 <= lim)
-        gi = ridx[ii + a]
-        keep = gi != jj
+        gi = ridx[oA[ii + a]]
+        gj = oB[jj + lo]
+        keep = gi != gj
         if not keep.any():
             continue
-        lis, gis, jjs = (ii + a)[keep], gi[keep], jj[keep]
+        lis, gis = (ii + a)[keep], gi[keep]
+        ljs, gjs = (jj + lo)[keep], gj[keep]
         for s in range(0, len(gis), _EXACT_CHUNK):
-            ls, gs, js = (lis[s:s + _EXACT_CHUNK], gis[s:s + _EXACT_CHUNK],
-                          jjs[s:s + _EXACT_CHUNK])
-            t = A[ls]
-            np.subtract(t, B[js], out=t)
+            ls, gs = lis[s:s + _EXACT_CHUNK], gis[s:s + _EXACT_CHUNK]
+            lj, gj2 = ljs[s:s + _EXACT_CHUNK], gjs[s:s + _EXACT_CHUNK]
+            t = As[ls]
+            np.subtract(t, Bs[lj], out=t)
             np.abs(t, out=t)
             d = t.mean(1)
             sel = d <= cut
-            out.extend(zip(gs[sel].tolist(), js[sel].tolist()))
+            out.extend(zip(gs[sel].tolist(), gj2[sel].tolist()))
     return out
 
 
@@ -1522,6 +1550,32 @@ def self_test():
     print('  [%s] BLAS sweep == brute force on %d pairs (%d candidates)'
           % ('PASS' if sweep_ok else 'FAIL', 72 * 71 // 2, len(ref)))
     ok = ok and sweep_ok
+
+    # The cross-sweep now bands by mean too, and its extra hazard is a
+    # re-oriented row: same values, different float32 summation order, so
+    # the two means of a TRUE pair can differ by rounding. The oracle is
+    # brute force over every (row, oriented-row) pair; the fixture keeps
+    # the band-edge pairs above and adds a planted rotation. Checked for
+    # the full sweep and for a rows= subset, because the subset path is
+    # the one partial CLIP coverage runs.
+    def _cross_reference(Cm, Ckm, cut, rows=None):
+        rr = range(Cm.shape[0]) if rows is None else rows
+        r = set()
+        for gi in rr:
+            d = np.abs(Cm[gi][None, :] - Ckm).mean(1)
+            for gj in np.nonzero(d <= cut)[0]:
+                if gi != int(gj):
+                    r.add((gi, int(gj)))
+        return r
+    Ck1 = oriented_signatures(C, 1)
+    cross_ok = True
+    for rows_arg in (None, [0, 3, 8, 9, 40, 71]):
+        got = set(sweep_candidates_cross(C, Ck1, 8.0, rows=rows_arg))
+        want = _cross_reference(C, Ck1, 8.0, rows=rows_arg)
+        cross_ok = cross_ok and got == want
+    print('  [%s] banded cross-sweep == brute force (full and rows= subset)'
+          % ('PASS' if cross_ok else 'FAIL'))
+    ok = ok and cross_ok
 
     # The collector resizes into a new image instead of thumbnailing the
     # open file in place, using its own copy of Pillow's size arithmetic.
