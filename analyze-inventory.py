@@ -720,10 +720,81 @@ NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.92,
 # 90% crops from 79% to 97% at the old gate. Costs ~20 s on a 164 s run.
 
 
-def compute_nccs(TH, pairs, workers):
+# Below this many pairs the crop matcher stays on threads: four process
+# spawns plus imports cost ~6-8 s, and a small pair list is finished before
+# that is paid back.
+NCC_MP_MIN_PAIRS = 20000
+
+
+class _TbView:
+    """TH stand-in inside an NCC worker process: decodes a thumbnail from
+    its shipped base64 string on access and keeps nothing - compute_nccs
+    reads each index exactly once (to build its grayscale), so a cache
+    would only hold memory the four workers each pay for."""
+
+    def __init__(self, tbmap):
+        self._tb = tbmap
+
+    def __getitem__(self, i):
+        return imdecode_rgb(base64.b64decode(self._tb[i]))
+
+
+def _ncc_chunk(args):
+    """Process-pool worker: the same compute_nccs, single-threaded, over a
+    slice of the pairs. Reusing the whole function is the point - the child
+    computes exactly what the parent would have, so the scores cannot
+    disagree with the threaded path."""
+    chunk, tbmap = args
+    return compute_nccs(_TbView(tbmap), chunk, 1, procs=0)
+
+
+def _nccs_mp(TH, pairs, procs):
+    """The pair list sliced contiguously across worker processes.
+
+    Why processes when every other stage here is happy on threads: the pair
+    loop makes ~23 tiny GIL-released C calls per pair (matchTemplate, a
+    LANCZOS template build, an ndarray max) with Python glue between them,
+    and at 168k pairs the glue alone serializes the stage - measured 28%
+    parallel efficiency on 8 threads, 127 s of wall for ~200 core-seconds
+    of actual work. Slicing the list across processes gives each chunk its
+    own interpreter: 92.7 s -> the same scores, bit for bit (the worker IS
+    compute_nccs), at 1.37x.
+
+    Contiguous slices, not component-packed ones: pairs arrive sorted, so
+    neighbouring pairs share images and each chunk's template cache stays
+    warm. Packing by connected component was measured and refuted - the
+    candidate graph concentrates ~98% of pairs in two components (81k and
+    83k pairs on the reference library), so packing collapses to two busy
+    workers and runs SLOWER than threads (147 s). The ~2.6x duplication of
+    per-image work across chunk boundaries is the price of balance, and it
+    is the cheaper price.
+
+    Thumbnails travel as their stored base64 strings (~4.6 KB each), not
+    decoded pixels: shipping decoded grays was measured slower (98.6 s) -
+    pickling hundreds of MB of arrays through the parent costs more than
+    letting each worker decode its own slice."""
+    from concurrent.futures import ProcessPoolExecutor
+    recs = TH._recs
+    nchunks = procs * 4
+    step = (len(pairs) + nchunks - 1) // nchunks
+    jobs = []
+    for k in range(0, len(pairs), step):
+        chunk = pairs[k:k + step]
+        idxs = sorted({x for p in chunk for x in p})
+        jobs.append((chunk, {i: recs[i]['tb'] for i in idxs}))
+    res = {}
+    with ProcessPoolExecutor(max_workers=procs) as ex:
+        for d in ex.map(_ncc_chunk, jobs):
+            res.update(d)
+    return res
+
+
+def compute_nccs(TH, pairs, workers, procs=None):
     """ncc containment for the given pairs, in parallel, with the per-image
     grayscale and per-(image, scale) template work computed once instead of
-    once per pair."""
+    once per pair. Large pair lists go to worker processes (see _nccs_mp);
+    small ones, and any machine where spawning fails, use the threaded
+    path below - same scores either way, the worker IS this function."""
     if not pairs:
         return {}
     try:
@@ -734,6 +805,23 @@ def compute_nccs(TH, pairs, workers):
         # raises something else entirely, and crashing here would be worse
         # than losing the crop tier.
         return {p: 0.0 for p in pairs}
+    # An explicit procs count (the self-test's route) skips the size gate;
+    # the default only spawns when the pair list is long enough to pay for
+    # four process starts.
+    forced = procs is not None
+    if procs is None:
+        procs = max(2, min(4, (os.cpu_count() or 4) // 2))
+    if (procs and (forced or len(pairs) >= NCC_MP_MIN_PAIRS)
+            and getattr(TH, '_recs', None) is not None):
+        try:
+            return _nccs_mp(TH, pairs, procs)
+        except Exception as e:
+            # A machine that cannot spawn (frozen build, exotic runtime)
+            # still finishes on threads; say so rather than silently being
+            # slower, because "it worked but took twice as long" is the
+            # kind of thing nobody reports.
+            print('  (process pool unavailable - %s: %.80s; using threads)'
+                  % (type(e).__name__, e))
 
     grays = {}
     idxs = sorted({x for p in pairs for x in p})
@@ -1612,6 +1700,35 @@ def self_test():
         print('  [%s] a lossless original outranks a larger lossy re-save'
               % ('PASS' if good else 'FAIL'))
         ok = ok and good
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # The crop matcher's process path must return the THREADED path's
+    # scores exactly - the worker is compute_nccs itself, and this pins
+    # that equality (and that spawning works at all on this OS) so a
+    # refactor cannot quietly break either.
+    try:
+        rng = np.random.default_rng(11)
+        base_m = rng.integers(0, 255, (32, 32, 3), dtype=np.uint8)
+        recs_m = []
+        for k in range(4):
+            # shifted crops of one picture, so the scores are real matches
+            # exercising the scale grid, not noise-vs-noise zeros
+            a = np.roll(base_m, k * 3, axis=1)
+            buf = io.BytesIO()
+            Image.fromarray(a).save(buf, 'JPEG', quality=90)
+            recs_m.append({'p': 'm%d.png' % k, 'b': 100, 'sha': chr(97 + k) * 64,
+                           'w': 32, 'h': 32, 'tw': 32, 'th': 32,
+                           'tb': base64.b64encode(buf.getvalue()).decode('ascii')})
+        TH_m = ThumbStore(recs_m, workers=2)
+        pairs_m = [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3)]
+        thr = compute_nccs(TH_m, pairs_m, 2, procs=0)
+        mp_ = compute_nccs(TH_m, pairs_m, 2, procs=2)
+        same = thr == mp_ and len(thr) == len(pairs_m)
+        print('  [%s] crop scores from worker processes equal the threaded ones'
+              % ('PASS' if same else 'FAIL'))
+        ok = ok and same
     except Exception as exc:
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
