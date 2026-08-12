@@ -3,7 +3,131 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.6 — 2026-08-12 (current)
+## v4.3.7 — 2026-08-12 (current)
+
+**The whole pipeline is about 25% faster, and every byte of output is
+identical.** Measured end to end on the same 36,410-image library, same
+machine, nothing else running:
+
+| stage | v4.3.6 | v4.3.7 |
+| --- | --- | --- |
+| collect | ~2m 45 | ~2m 45 |
+| embed | 4m 55  (123 img/s) | 4m 18  (139 img/s) |
+| analyze (with CLIP) | 4m 03 | ~3m 00 |
+| analyze (`--no-embeddings`) | 5m 56 | 3m 03 |
+
+Every accepted change was gated the same way: run it on the real
+library and compare the output files byte for byte against the run
+before it. The inventory, all 36,234 stored vectors, and all five
+analyze outputs (list, report, and the three recycler scripts) are
+identical to what v4.3.6 produced. Nothing here trades a duplicate for
+a second.
+
+**The crop matcher got its own interpreters.** It was the one stage
+still cheated of its parallelism. Its pair loop makes about 23 tiny
+GIL-released C calls per pair — a template resize, a `matchTemplate`, a
+max — with Python glue between them, and at 168,120 pairs the glue is
+what runs. Eight threads measured 28% efficient: 127 s of wall clock
+for roughly 200 core-seconds of work. Large pair lists now slice across
+worker processes, and the worker *is* `compute_nccs` itself, so the
+scores cannot disagree with the threaded path — which is still what
+small lists and any machine that cannot spawn will use. Crop matching
+127 → 88 s; the stage 243 → ~180 s.
+
+The worker count has a floor of four, and that floor is the part worth
+reading. Replaying the same 168,120 pairs at two, four, six and eight
+workers gives 163.6, 92.5, 84.1 and 83.3 s — **two processes are slower
+than the threads they replace**, because each chunk redoes the decode
+and grayscale for every image its pairs touch and at two workers that
+duplicated work outweighs the second interpreter. The obvious
+`cores // 2` default would have handed exactly two workers, and a
+measured 0.78x, to every four-thread machine. Below four logical cores
+there is no count that absorbs the duplication, so those machines stay
+on threads. Above the floor the exact number matters far less than the
+isolated replay implies: in a real run the parent is also holding a
+~1.2 GB thumbnail store, and six workers finished in 87.7 s against
+four workers' 88.9 s, inside the run-to-run spread.
+
+Three plausible refinements on top of it were each implemented and each
+measured slower, so none of them shipped: packing pairs by connected
+component (147 s — the candidate graph puts 98% of pairs in two
+components, so packing collapses onto two busy workers), shipping
+decoded grayscales instead of the stored base64 (98.6 s — pickling
+hundreds of megabytes through the parent costs more than letting each
+worker decode its own slice), and tuning the inner loop with a
+size-keyed template cache and `cv2.minMaxLoc` (102.8 s — the 64 px
+scale steps rarely collide, so the cache bought nothing and paid dict
+overhead on every call).
+
+**The orientation cross-sweep got the band the main sweep has always
+had.** `mean|a-b| >= |mean(a)-mean(b)|` means rows whose signature
+means differ by more than the cut cannot pair, so sorting by mean turns
+every-pair into a band. The main sweep has done this since it existed;
+the cross-sweep — image *i* as stored against image *j* re-oriented —
+ran seven full n×n grams instead, because nothing about the bound cares
+that B is a permuted copy. That was 256 s of a 356 s `--no-embeddings`
+run, and it is 81 s now. With full CLIP coverage the cross-sweep never
+runs, so that path is untouched; partial coverage gets the same
+banding.
+
+One wrinkle the main sweep does not have: a re-oriented row sums in a
+different order, so the two float32 means of a *true* pair can differ
+by rounding. The band is widened by 0.01 — mean error over 192 values
+in 0..255 stays under 1e-3 — and every survivor is still re-checked
+exactly, so the widening can cost extra checks and never a pair. The
+self-test now holds the cross-sweep to a brute-force oracle, full sweep
+and `rows=` subset both.
+
+**Two hot paths stopped copying frames that were already RGB.** Pillow's
+`convert('RGB')` on an image that is already RGB is documented to
+return `self.copy()` — a full-frame allocate and memcpy.
+
+The embedder ran it on every drafted frame. JPEG decodes straight to
+RGB, and the draft lands larger than "4x the model input" suggests: a
+4000x3000 JPEG drafts to 2000x1500, because both edges must stay at or
+above 896 and 1/2 is then the deepest scale libjpeg will pick — so the
+wasted copy was about 9 MB per photo. The rescale-and-normalize chain
+was also computing per pixel what only 256 values can produce; it is
+now three per-channel table gathers, built in the exact scalar op order
+the processor uses. That order is not incidental: rescale upcasts to
+float64 before multiplying and normalize runs in float32, and getting
+either backwards shifts the vectors by ~5e-07, which is small enough to
+look like nothing and still change which pairs get nominated. The
+startup probe that proves the fast path byte-for-byte against the real
+processor is what makes that safe to assert, and it still runs every
+time. Together: 123 → 139 img/s, and a 250-file A/B across JPEG, PNG,
+WebP, GIF and BMP, alpha and grayscale included, matched tensors
+exactly.
+
+The collector's `frame_signature` ran the same copy on every sampled
+animation frame — and Pillow 9.1 and later already composite GIF frames
+after the first to RGB during the seek, so at `FRAME_SAMPLES` 25 that
+was up to 24 wasted full-frame copies per animation. Fingerprints
+byte-identical on 40 of 40 real animated files.
+
+**Two more candidates were measured and rejected**, recorded here
+because the measurements are the useful part.
+
+Memoizing the shape-mismatch resize across pairs looked obvious: nine
+of ten candidate pairs mix thumbnail shapes, and the LANCZOS resize in
+front of the comparison costs ~470 us against ~6 us for the comparison
+itself. A locked cache serialized the scorers that had been running
+eight wide and made the run *slower* (3m 33). Lock-free it reached 3m
+10, still worse than the 2m 58 it was trying to beat: the resizes
+release the GIL, so what looked like redundant work was already
+overlapping, and removing it removed the overlap.
+
+Deepening the collector's in-flight window was tested against a stall
+counter that reported 156 s of head-of-line blocking on the real
+library — which sounded decisive and was not. Alternating A/B/A/B: the
+current window ran 163 s and 173 s, the deep window 162 s and 168 s.
+The spread *within* one variant is larger than the gap between them.
+The counter measured how long the writer waited on the head future,
+which is not the same as workers going idle — they were busy on the
+other 31 in flight the whole time. A metric that is not the quantity
+reaching the decision, again.
+
+## v4.3.6 — 2026-08-12
 
 A bug audit, and then the bugs. Ten agents read the three stages and the
 launchers looking for defects rather than for improvements; twenty

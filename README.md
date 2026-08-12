@@ -559,7 +559,11 @@ machine.
 - **Analyze is slow on a huge library.** It prints per-stage times, so you
   can see where it is. `--no-orient` skips rotation matching; on 36k
   images the full default run measured ~19 minutes on an adversarial
-  synthetic set, and real libraries are faster.
+  synthetic set, and real libraries are faster. Since v4.3.7 the
+  rotation sweep is banded like the main one, so `--no-orient` buys much
+  less than it used to — try it only if the printed orientation stage is
+  actually where your run is spending its time. Embeddings skip that
+  stage outright: CLIP already nominates rotated and mirrored copies.
 - **Two inventories ended up in one folder.** Collect never overwrites: a
   second run writes `image-inventory-2.jsonl`. Embed and Analyze pick the
   newest automatically; the recycler and list carry the same `-2` suffix
@@ -646,7 +650,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.6** (2026-08-12). Full history, including every bug and what it
+**v4.3.7** (2026-08-12). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---
