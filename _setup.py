@@ -847,11 +847,19 @@ def main():
             raw = input('  Choose [1-%d, default 1]: ' % len(usable)).strip()
         except EOFError:
             raw = ''
+        # Range-checked rather than indexed: "0" is int 0, and usable[-1]
+        # is the LAST entry, so typing zero installed a build nobody asked
+        # for - on a mixed-vendor machine, quite possibly the wrong one.
+        # "-1" reached the one before it. Both looked like the menu had
+        # been obeyed.
         try:
-            pick = usable[int(raw) - 1] if raw else usable[0]
-        except (ValueError, IndexError):
+            n = int(raw) if raw else 1
+        except ValueError:
+            n = 0
+        if not 1 <= n <= len(usable):
             print('  Not a listed choice - nothing installed.')
             return 1
+        pick = usable[n - 1]
     print('  -> %s' % pick.label)
     if not show_and_run(pip_base(break_system=breaksys) + pick.args, args.yes,
                         'torch (%s)' % pick.key):
