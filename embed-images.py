@@ -458,6 +458,19 @@ def build_fast_preprocess(proc):
     std = np.array(std, dtype=np.float32)
     bicubic = Image.Resampling.BICUBIC
 
+    # The rescale+normalize chain maps each uint8 value through the same
+    # scalar arithmetic every time, so run that arithmetic 256 times here -
+    # in the EXACT op order the processor uses (float64 upcast for the
+    # multiply, float32 for normalize; see the docstring for why one ULP
+    # matters) - and the per-pixel work becomes three table gathers written
+    # straight into the (3, H, W) planes the model wants. That also deletes
+    # the transpose+ascontiguousarray copy the old chain needed. The caller
+    # still proves the whole path byte-for-byte against proc() before use,
+    # so a numpy that disagrees falls back rather than shipping a shifted
+    # vector.
+    v64 = (np.arange(256, dtype=np.float64) * scale).astype(np.float32)
+    luts = [(v64 - mean[c]) / std[c] for c in range(3)]
+
     def fast(im):
         w, h = im.size
         # transformers' get_resize_output_image_size with default_to_square
@@ -469,9 +482,10 @@ def build_fast_preprocess(proc):
         im = im.resize((nw, nh), bicubic)
         left, top = (nw - cw) // 2, (nh - ch) // 2
         a = np.asarray(im.crop((left, top, left + cw, top + ch)))
-        a = (a.astype(np.float64) * scale).astype(np.float32)
-        a = (a - mean) / std
-        return torch.from_numpy(np.ascontiguousarray(a.transpose(2, 0, 1)))
+        out = np.empty((3, ch, cw), dtype=np.float32)
+        for c in range(3):
+            np.take(luts[c], a[:, :, c], out=out[c])
+        return torch.from_numpy(out)
 
     return fast
 
@@ -781,7 +795,16 @@ def main():
                         bg = Image.new('RGB', rgba.size, (255, 255, 255))
                         bg.paste(rgba, (0, 0), rgba)
                         im = bg
-                    im = im.convert('RGB')
+                    if im.mode != 'RGB':
+                        # convert() on an already-RGB image is documented to
+                        # return self.copy() - a full-frame allocate+memcpy
+                        # of the DRAFTED image (a 4000x3000 JPEG drafts to
+                        # 2000x1500: both edges must stay >= 896, so 1/2 is
+                        # the deepest scale libjpeg may pick, ~9 MB copied
+                        # for nothing). JPEG decodes straight to RGB, so the
+                        # dominant case paid it on every image; the alpha
+                        # branch above already ends in an RGB `bg`.
+                        im = im.convert('RGB')
                     px = (fast_prep(im) if fast_prep is not None else
                           proc(images=im, return_tensors='pt')['pixel_values'][0])
                 return r, px, None, rel

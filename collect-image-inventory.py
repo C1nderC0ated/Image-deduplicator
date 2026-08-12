@@ -402,8 +402,13 @@ def frame_signature(im):
         tiles = {}
         for idx in sorted(set(want)):     # seek ascending - APNG demands it
             im.seek(idx)
-            tiles[idx] = im.convert('RGB').resize(
-                (8, 8), Image.BILINEAR).tobytes()
+            # Pillow >= 9.1 composites every GIF frame after the first to
+            # RGB during the seek, and convert('RGB') on an RGB frame is
+            # self.copy() - a full-frame memcpy the resize never needed.
+            # At FRAME_SAMPLES frames per animation that was up to 24
+            # wasted copies per GIF.
+            src = im if im.mode == 'RGB' else im.convert('RGB')
+            tiles[idx] = src.resize((8, 8), Image.BILINEAR).tobytes()
         for idx in want:
             out += tiles[idx]
     except Exception:
