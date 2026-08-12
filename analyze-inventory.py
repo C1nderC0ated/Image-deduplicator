@@ -1478,6 +1478,46 @@ def self_test():
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # A mark must stay on the file it was written against. A leading space
+    # is a legal filename that walk_images accepts, and the old parser
+    # stripped it, so " p.jpg" and "p.jpg" collapsed to one key and the
+    # later line silently overwrote the earlier - putting an X on a file
+    # whose own line read "." and "suggested keeper".
+    try:
+        import re as _re2
+        import tempfile as _tf2
+        import shutil as _sh3
+        td = _tf2.mkdtemp()
+        names = [' p.jpg', 'p.jpg', 'c1.jpg']
+        recs_w = [{'p': n, 'b': 900 + k, 'sha': chr(97 + k) * 64,
+                   'w': 40, 'h': 40} for k, n in enumerate(names)]
+        write_list_and_script(
+            os.path.join(td, 'l.txt'), os.path.join(td, 'R.py'),
+            os.path.join(td, 'R.bat'), os.path.join(td, 'R.sh'),
+            recs_w, [], [(1, [2], [1, 2]), (0, [], [0])], td, [[0, 1]], set())
+        src2 = open(os.path.join(td, 'R.py'), encoding='utf-8').read()
+        g2 = {'__file__': os.path.join(td, 'R.py'), '__name__': 'rec_selftest'}
+        exec(compile(src2, 'R.py', 'exec'), g2)
+        lines2 = open(os.path.join(td, 'l.txt'),
+                      encoding='utf-8-sig').read().split('\n')
+        flipped = 0
+        for k, ln2 in enumerate(lines2):
+            if ln2.startswith('.') and ln2[1:].startswith('   p.jpg'):
+                lines2[k] = 'X' + ln2[1:]
+                flipped += 1
+        open(os.path.join(td, 'l.txt'), 'w', encoding='utf-8',
+             newline='').write('\n'.join(lines2))
+        mk2, _unk = g2['read_marks']()
+        stayed = (flipped == 1 and mk2.get(' p.jpg') == 'X'
+                  and mk2.get('p.jpg') != 'X')
+        print('  [%s] a leading space keeps a mark on its own file'
+              % ('PASS' if stayed else 'FAIL'))
+        ok = ok and stayed
+        _sh3.rmtree(td, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     # One frame that clearly disagrees must veto the match, even when every
     # other sampled frame is identical. That is the case the mean cannot
     # see - it divides the difference by however many frames agreed - and
@@ -2195,9 +2235,33 @@ def read_marks():
             if not re.match(r'^[Xx.]\s', line):
                 continue
             mark = line[0].upper()
+            body = line[1:]
+            # The writer emits exactly "<mark><2 spaces><path>", so take the
+            # separator by width rather than by stripping whitespace.
+            #
+            # It used to do line[1:].strip(), which also ate any leading
+            # whitespace belonging to the PATH - and a leading space is a
+            # legal filename that walk_images accepts, because the extension
+            # check only looks at the tail. So " p.jpg" and "p.jpg" both
+            # became the key "p.jpg", the later line silently overwrote the
+            # earlier, and an X the user put on one file landed on the
+            # other. Nothing appeared in `unknown`, because the collapsed
+            # name did match a real manifest row - just the wrong one. The
+            # per-cluster survivor check and the sha check then both passed,
+            # and the recycler binned a file whose own line read "." and
+            # "suggested keeper".
+            exact = body[2:] if body.startswith('  ') else body.lstrip()
             # strip only the TRAILING "   [WxH, size]" block, anchored and
             # with no ']' inside, so a name like "photo  [final].jpg" is safe
-            rest = re.sub(r'\s{2,}\[[^\]]*\]\s*$', '', line[1:].strip())
+            rest = re.sub(r'\s{2,}\[[^\]]*\]\s*$', '', exact)
+            if rest not in by_rel:
+                # A hand-edited line whose spacing no longer matches what was
+                # written. Fall back to the forgiving parse, but only after
+                # the exact one has failed, so a path that really does begin
+                # with a space can never be captured by its trimmed twin.
+                alt = re.sub(r'\s{2,}\[[^\]]*\]\s*$', '', body.strip())
+                if alt in by_rel:
+                    rest = alt
             if rest in by_rel:
                 marks[rest] = mark
             elif mark == 'X':
