@@ -8,9 +8,13 @@ key EXIF fields, JPEG quality fingerprint, AI-generation text chunks (PNG),
 and a small base64 thumbnail (EXIF-rotation corrected). Files are hashed,
 decoded and thumbnailed on a thread pool, each read from disk exactly once;
 records still stream out in scan order, so the output is deterministic.
-Resumable: unchanged files (same size+mtime, same --thumb) are carried over
-from previous inventories, newest inventory first. Paths are stored with
-forward slashes, so an inventory travels between operating systems.
+Resumable: unchanged files (same size+mtime) are carried over from previous
+inventories, newest first - but only from an inventory written in the SAME
+record format (thumbnail size and quality, animation frame-sample count).
+An older format is listed as superseded and re-scanned instead, because
+mixing two formats in one inventory makes the analyzer compare across them.
+Paths are stored with forward slashes, so an inventory travels between
+operating systems.
 
 READ-ONLY: never modifies, moves, or deletes your images. Its own output
 files are the only thing it writes. Everything stays on this machine unless
@@ -296,6 +300,40 @@ def thumb_size(w, h, box):
 FRAME_SAMPLES = 25
 
 
+# THUMB_QUALITY and --thumb set the noise floor of every pixel comparison
+# the analyzer makes. What reaches its 4.0 gate is the DIFFERENTIAL
+# between two similar images, not the error in one, and measured over
+# 290 real pairs that is:
+#
+#     q      median   p95    p99    bytes/img
+#     74      0.983  2.796  3.151     3334
+#     78      0.610  1.484  1.905     3588
+#     80      0.351  1.146  1.520     3732   <- here
+#     82      0.399  1.239  1.946     3919
+#     85      0.863  4.363  5.402     4250
+#     92      0.235  0.895  1.829     5565
+#
+# 80 rather than 78: 42% less median noise and 20% less at p99 for 4%
+# more storage. It beats q92 at p99 while costing a third as much extra.
+#
+# The curve is NOT monotonic - 85 is worse than 78 on every percentile,
+# and 88 and 92 both have fatter tails than 80 - so this is a measured
+# point, not "higher is better". Two samples would have suggested the
+# opposite; an earlier reading of only 78 and 92 concluded "quality buys
+# more than size", which the full curve does not support.
+#
+# None of this is fixing a wrong answer. A full run of a 36,410-image
+# library flipped no verdict at 78, so the gain is margin against the
+# 4.0 gate rather than corrections.
+#
+# Named rather than inline because record_format() has to see it: an
+# inventory written at a different quality must not be reused by a
+# resumed scan, and a magic number in a save() call cannot be compared.
+THUMB_QUALITY = 80
+
+
+
+
 def frame_signature(im):
     """A compact fingerprint of an animation BEYOND its first frame.
 
@@ -558,32 +596,7 @@ def make_thumb(im, thumb_px, fast=True):
     _t = thumb_size(im2.width, im2.height, (thumb_px, thumb_px))
     im2 = im2.resize(_t, Image.LANCZOS, reducing_gap=2.0) if _t else im2.copy()
     bj = io.BytesIO()
-    # 78, and 128 px above, set the noise floor of every pixel comparison
-    # the analyzer makes. What reaches its 4.0 gate is the DIFFERENTIAL
-    # between two similar images, not the error in one, and measured over
-    # 290 real pairs that is:
-    #
-    #     q      median   p95    p99    bytes/img
-    #     74      0.983  2.796  3.151     3334
-    #     78      0.610  1.484  1.905     3588
-    #     80      0.351  1.146  1.520     3732   <- here
-    #     82      0.399  1.239  1.946     3919
-    #     85      0.863  4.363  5.402     4250
-    #     92      0.235  0.895  1.829     5565
-    #
-    # 80 rather than 78: 42% less median noise and 20% less at p99 for 4%
-    # more storage. It beats q92 at p99 while costing a third as much extra.
-    #
-    # The curve is NOT monotonic - 85 is worse than 78 on every percentile,
-    # and 88 and 92 both have fatter tails than 80 - so this is a measured
-    # point, not "higher is better". Two samples would have suggested the
-    # opposite; an earlier reading of only 78 and 92 concluded "quality buys
-    # more than size", which the full curve does not support.
-    #
-    # None of this is fixing a wrong answer. A full run of a 36,410-image
-    # library flipped no verdict at 78, so the gain is margin against the
-    # 4.0 gate rather than corrections.
-    im2.save(bj, 'JPEG', quality=80)
+    im2.save(bj, 'JPEG', quality=THUMB_QUALITY)
     best, flag = bj.getvalue(), ''
     if fast:
         # The default, since v4.3.3. The lossless-WebP attempt below costs
@@ -829,19 +842,46 @@ def walk_images(root, skip_names, on_relink=None):
             yield full
 
 
+def record_format():
+    """Everything about a stored record that must match before it is reused.
+
+    A resumed scan copies old records verbatim, so every one of these has to
+    agree or the inventory ends up holding two incompatible formats at once
+    and the analyzer compares across them.
+
+    This used to be just the thumbnail size, with the reasoning that mixing
+    sizes "would silently shift the analyzer's pixel scores" - correct, and
+    it applies word for word to the other two. Both changed underneath the
+    guard on 2026-08-11/12 and neither was noticed:
+
+      * THUMB_QUALITY 78 -> 80 shifts the same pixel scores the size guard
+        exists to protect, by ~2.35 MAD between a reused and a fresh record.
+      * FRAME_SAMPLES 5 -> 25 changes the fingerprint LENGTH, and
+        frames_agree cannot compare two lengths - it falls back to bare
+        frame-count equality, which two unrelated animations pass. Measured:
+        two different 40-frame GIFs sharing only frame 0 were put in one
+        Tier A cluster with one of them pre-marked X.
+
+    So the guard is now the whole format rather than one field of it, and
+    new fields belong here rather than beside it.
+    """
+    return {'thumb_q': THUMB_QUALITY, 'frames': FRAME_SAMPLES}
+
+
 def load_previous(root, thumb):
     """path -> record from any previous image-inventory*.jsonl in root.
     Read oldest-first so that when several inventories describe the same
     path, the NEWEST file's record wins. A file whose header records a
-    different --thumb (or none at all, e.g. v1) is listed as superseded but
-    its records are never reused - mixing thumbnail sizes would silently
-    shift the analyzer's pixel scores."""
+    different --thumb, thumbnail quality or frame-sample count (or none at
+    all, e.g. v1) is listed as superseded but its records are never reused -
+    see record_format for why each of those matters."""
     prev = {}
     files = sorted(glob.glob(os.path.join(glob.escape(root), 'image-inventory*.jsonl')))
     for fp in sorted(files, key=lambda p: (os.path.getmtime(p), p)):
         try:
             with open(fp, encoding='utf-8') as f:
                 file_thumb = None
+                file_fmt = None
                 recs = {}
                 for line in f:
                     try:
@@ -853,11 +893,19 @@ def load_previous(root, thumb):
                     if r.get('kind') == 'header' or 'schema' in r:
                         if isinstance(r.get('thumb'), int):
                             file_thumb = r['thumb']
+                        # An inventory written before the format was
+                        # recorded has no 'fmt' at all. Treat that as a
+                        # MISMATCH rather than as permission: those are
+                        # exactly the files whose thumbnail quality and
+                        # fingerprint length are unknown, and guessing
+                        # they match is how the animation false-delete
+                        # got in.
+                        file_fmt = r.get('fmt')
                         continue
                     if r.get('kind') is None \
                             and 'p' in r and 'sha' in r and 'tb' in r:
                         recs[r['p']] = r
-                if file_thumb == thumb:
+                if file_thumb == thumb and file_fmt == record_format():
                     prev.update(recs)
         except Exception:
             pass
@@ -1031,7 +1079,8 @@ def main():
     unreadable_why = {}          # exception type -> [count, [(path, msg), ..]]
     huge_seen = []               # (path, megapixels) for very large images
     header = {'schema': SCHEMA, 'root': root, 'files': total,
-              'thumb': args.thumb, 'started': int(time.time() * 1000)}
+              'thumb': args.thumb, 'fmt': record_format(),
+              'started': int(time.time() * 1000)}
     w = PartWriter(out, args.split_mb, header)
     pool = ThreadPoolExecutor(max_workers=workers)
     # In-flight window: results are written strictly in scan order, so the
