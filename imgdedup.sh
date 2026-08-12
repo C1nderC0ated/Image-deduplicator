@@ -151,4 +151,9 @@ if [ -z "$PYCMD" ]; then
     exit 1
 fi
 
-exec "$PYCMD" "$HERE/$SCRIPT" "$@"
+# ${1+"$@"} rather than "$@": under `set -u`, bash 3.2 - which is what
+# /bin/sh still is on macOS - treats an empty "$@" as an unbound variable
+# and aborts. Every subcommand here can be run with no arguments, so that
+# is `./imgdedup.sh doctor` failing before it starts. The guard is the
+# original Bourne idiom and expands identically everywhere else.
+exec "$PYCMD" "$HERE/$SCRIPT" ${1+"$@"}
