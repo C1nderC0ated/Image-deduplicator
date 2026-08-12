@@ -27,6 +27,13 @@ Options:
     --workers N     image decode/preprocess threads (default: auto).
                     Decoding runs ahead of the model on a thread pool, so
                     the GPU never waits for the disk.
+    --gpu-preprocess
+                    resize opaque 2x-or-larger downscales and normalize on
+                    the GPU with antialiased bicubic interpolation. Smaller,
+                    transparent, and animated images stay on the exact Pillow
+                    path. Faster on a CPU-bound run, but opt-in:
+                    the downscale kernel is not pixel-identical to Pillow and
+                    produces a separate, resume-incompatible vector set.
     --no-draft      decode JPEGs at full resolution instead of letting
                     libjpeg downscale to ~4x the model input during decode
                     (draft is the same trick the collector uses for
@@ -210,6 +217,27 @@ warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 #   +flat     transparent pixels composited onto white instead of having
 #             their alpha silently dropped.
 PRE_TAG = 'exif+pil+flat'
+GPU_PRE_TAG = PRE_TAG + '+torch-aa-down2x-opaque+jpeg-draft'
+GPU_FULL_JPEG_PRE_TAG = PRE_TAG + '+torch-aa-down2x-opaque+jpeg-full'
+FULL_JPEG_PRE_TAG = PRE_TAG + '+jpeg-full'
+
+# Deferred GPU resize keeps source pixels alive until a model batch flushes.
+# Bound one image, the accumulated model batch, and the decode run-ahead so a
+# folder of large lossless files cannot turn a speed option into unbounded
+# host memory use. Files above the per-image ceiling simply take the normal
+# Pillow path. The future window is derived from the worst-case RGB tensor,
+# making its count cap a byte cap even when every decode finishes early.
+GPU_RAW_IMAGE_PIXELS = 4_000_000        # 12 MB as RGB uint8
+GPU_RAW_BATCH_BYTES = 256 * 1024 * 1024
+GPU_RAW_QUEUE_BYTES = 768 * 1024 * 1024
+GPU_RAW_QUEUE_RESULTS = max(1, GPU_RAW_QUEUE_BYTES //
+                            (GPU_RAW_IMAGE_PIXELS * 3))
+
+
+def _strict_pre_tag(tag):
+    """Preprocessing populations which must never be mixed on resume."""
+    return bool(tag and ('+torch-aa-down2x-opaque' in tag or
+                         '+jpeg-full' in tag))
 
 
 def default_workers():
@@ -490,6 +518,100 @@ def build_fast_preprocess(proc):
     return fast
 
 
+def build_gpu_preprocess(proc, device, pixel_budget=32_000_000):
+    """Build the opt-in torch resize/normalize path, or return None.
+
+    Decode, EXIF handling, high-bit-depth scaling, and alpha compositing stay
+    on the CPU. This function takes the resulting RGB uint8 CHW tensors and
+    moves the expensive resize and normalization to the accelerator.
+
+    `antialias=True` is load-bearing. At the library's measured median 5.7x
+    downscale, torch's default fixed four-tap cubic aliases badly enough to
+    make the same image fall below the Tier A cosine gate. Antialiased bicubic
+    measured median 0.9997 / minimum 0.9953 against Pillow preprocessing, but
+    is still deliberately opt-in because torch's cubic kernel (a=-0.75) is
+    not Pillow's (a=-0.5).
+
+    Images in one model batch need not share a source shape. Equal shapes are
+    grouped so common sprite/photo dimensions resize together, and very large
+    groups are sliced by `pixel_budget` to cap the temporary float32 buffer.
+    The returned tensor is already on DEVICE in NCHW float32 form.
+    """
+    size, crop = getattr(proc, 'size', None), getattr(proc, 'crop_size', None)
+    edge = _cfg(size, 'shortest_edge')
+    ch = _cfg(crop, 'height')
+    cw = _cfg(crop, 'width')
+    if edge is None or ch is None or cw != ch:
+        return None
+    if _cfg(size, 'height') or _cfg(size, 'width') or _cfg(size, 'longest_edge'):
+        return None
+    if not all(getattr(proc, f, False) for f in
+               ('do_resize', 'do_center_crop', 'do_rescale', 'do_normalize')):
+        return None
+    scale = getattr(proc, 'rescale_factor', None)
+    mean = getattr(proc, 'image_mean', None)
+    std = getattr(proc, 'image_std', None)
+    if not isinstance(scale, float) or not mean or not std:
+        return None
+    if len(mean) != 3 or len(std) != 3:
+        return None
+
+    mean = torch.tensor(mean, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(std, dtype=torch.float32, device=device).view(1, 3, 1, 1)
+    budget = max(1, int(pixel_budget))
+
+    def gpu(tensors):
+        if not tensors:
+            return torch.empty((0, 3, ch, cw), dtype=torch.float32,
+                               device=device)
+        groups = collections.defaultdict(list)
+        for i, t in enumerate(tensors):
+            if (not torch.is_tensor(t) or t.dtype != torch.uint8 or
+                    t.ndim != 3 or t.shape[0] != 3):
+                raise ValueError('GPU preprocessing needs RGB uint8 CHW tensors')
+            groups[tuple(t.shape)].append((i, t))
+
+        out = torch.empty((len(tensors), 3, ch, cw), dtype=torch.float32,
+                          device=device)
+        with torch.inference_mode():
+            for (_, h, w), items in groups.items():
+                # Same geometry as transformers' Pillow processor: put the
+                # short edge at EDGE, truncate the long edge, center crop.
+                if w <= h:
+                    nw, nh = edge, int(edge * h / w)
+                else:
+                    nh, nw = edge, int(edge * w / h)
+                # Bound both the source and resized float32 working sets.
+                per = max(1, budget // max(h * w, nh * nw))
+                for start in range(0, len(items), per):
+                    chunk = items[start:start + per]
+                    cpu = torch.stack([t for _, t in chunk])
+                    if device == 'cuda':
+                        cpu = cpu.pin_memory()
+                        x = cpu.to(device, non_blocking=True)
+                    else:
+                        x = cpu.to(device)
+                    x = x.to(dtype=torch.float32)
+                    x = torch.nn.functional.interpolate(
+                        x, size=(nh, nw), mode='bicubic', align_corners=False,
+                        antialias=True)
+                    # Bicubic overshoots at sharp edges. Pillow writes the
+                    # resize back to uint8 before normalization, so clip and
+                    # quantize here too. Omitting the rounding preserves
+                    # fractional samples Pillow never feeds to CLIP and made
+                    # sparse graphics diverge much more than photographs.
+                    x.clamp_(0.0, 255.0).round_()
+                    left, top = (nw - cw) // 2, (nh - ch) // 2
+                    x = x[:, :, top:top + ch, left:left + cw]
+                    x.mul_(scale).sub_(mean).div_(std)
+                    indices = torch.tensor([i for i, _ in chunk],
+                                           dtype=torch.long, device=device)
+                    out.index_copy_(0, indices, x)
+        return out
+
+    return gpu
+
+
 def _result(fut):
     """An untimed Future.result() cannot be interrupted by Ctrl+C on
     Windows; the short timed wait keeps KeyboardInterrupt deliverable.
@@ -530,6 +652,13 @@ def main():
                          'change 0.0006, which can move a pair sitting exactly '
                          'on the Tier A cosine floor into the review tier. Off '
                          'by default for that reason')
+    ap.add_argument('--gpu-preprocess', action='store_true',
+                    help='resize opaque 2x-or-larger downscales and normalize '
+                         'on the GPU with antialiased bicubic interpolation '
+                         '(smaller/transparent/animated images retain Pillow). '
+                         'Faster but not pixel-identical, '
+                         'so it creates a resume-incompatible vector set and '
+                         'is off by default')
     ap.add_argument('--no-draft', action='store_true',
                     help='decode JPEGs at full resolution (slower, no draft)')
     ap.add_argument('--share', action='store_true',
@@ -574,6 +703,11 @@ def main():
     # file resumed without the flag) was caught correctly.
     device = resolve_device(args.device)
     use_half = args.fp16 and device in ('cuda', 'xpu')
+    use_gpu_preprocess = args.gpu_preprocess and device != 'cpu'
+    if use_gpu_preprocess:
+        pre_tag = (GPU_FULL_JPEG_PRE_TAG if args.no_draft else GPU_PRE_TAG)
+    else:
+        pre_tag = FULL_JPEG_PRE_TAG if args.no_draft else PRE_TAG
 
     done = set()
     prev_err = {}                     # sha -> last recorded error message
@@ -632,14 +766,25 @@ def main():
                 print('  Re-run %s --fp16, or move the file aside to start '
                       'fresh.' % ('with' if prev_prec == 'fp16' else 'without'))
             sys.exit(2)
-        if done and prev_pre != PRE_TAG:
+        if (done and prev_pre != pre_tag and
+                (_strict_pre_tag(prev_pre) or _strict_pre_tag(pre_tag))):
+            print('')
+            print('  [STOP] that file was built with different preprocessing:')
+            print('           existing: %s' % (prev_pre or 'unrecorded'))
+            print('           now:      %s' % pre_tag)
+            print('  --gpu-preprocess and --no-draft both change which pixels')
+            print('  reach the model. Mixing preprocessing populations would')
+            print('  make cosine comparisons inconsistent. Move the embeddings')
+            print('  file aside and re-embed the whole inventory.')
+            sys.exit(2)
+        if done and prev_pre != pre_tag:
             # Cumulative: name every change the existing file predates, so a
             # very old file is told all of them and a nearly-current one is
             # told only what actually differs.
             print('')
             print('  [WARN] Those vectors were built with different preprocessing')
             print('         (%s, this run uses %s):'
-                  % (prev_pre or 'an unrecorded version', PRE_TAG))
+                  % (prev_pre or 'an unrecorded version', pre_tag))
             print('')
             if not prev_pre:
                 print('         - EXIF orientation is applied before embedding now,')
@@ -702,27 +847,65 @@ def main():
     dim = getattr(model.config, 'projection_dim', 0) or 0
     print('Model ready.' + (' Declared embedding dim: ' + str(dim) if dim else ''))
 
-    draft_px = 0 if args.no_draft else model_input_edge(proc) * 4
+    input_edge = model_input_edge(proc)
+    draft_px = 0 if args.no_draft else input_edge * 4
 
-    # Matching the processor's settings is necessary but not sufficient, so
-    # the claim gets tested rather than assumed: five shapes covering both
-    # orientations, the already-square case, an extreme aspect ratio and an
-    # upscale, each compared byte-for-byte against the processor it stands
-    # in for. Any mismatch, any exception, and the real processor is used.
+    # The exact Pillow path remains available even in GPU mode: upscaling is
+    # cheap and is where the two cubic kernels differ most, so small images
+    # stay byte-identical to the default rather than taking a quality risk for
+    # no meaningful speed gain.
     fast_prep = build_fast_preprocess(proc)
     if fast_prep is not None:
         try:
             rng = np.random.default_rng(0)
-            for w, h in ((640, 480), (480, 640), (224, 224), (1000, 233), (37, 41)):
+            for w, h in ((640, 480), (480, 640), (224, 224),
+                         (1000, 233), (37, 41)):
                 probe = Image.fromarray(
                     rng.integers(0, 256, (h, w, 3), dtype=np.uint8), 'RGB')
                 if not torch.equal(
-                        proc(images=probe, return_tensors='pt')['pixel_values'][0],
+                        proc(images=probe,
+                             return_tensors='pt')['pixel_values'][0],
                         fast_prep(probe)):
                     fast_prep = None
                     break
         except Exception:
             fast_prep = None
+
+    gpu_prep = None
+    if use_gpu_preprocess:
+        gpu_prep = build_gpu_preprocess(proc, device)
+        if gpu_prep is None:
+            print('')
+            print('  [STOP] --gpu-preprocess does not support this model\'s image')
+            print('         processor settings. No vectors were written.')
+            sys.exit(2)
+        try:
+            rng = np.random.default_rng(0)
+            probe_images = [Image.fromarray(rng.integers(
+                0, 256, (h, w, 3), dtype=np.uint8), 'RGB')
+                for w, h in ((640, 480), (480, 640), (233, 1000))]
+            probes = [torch.from_numpy(np.array(im, copy=True)).permute(
+                2, 0, 1).contiguous() for im in probe_images]
+            got = gpu_prep(probes)
+            crop_edge = _cfg(getattr(proc, 'crop_size', None), 'height')
+            if (got.shape != (len(probes), 3, crop_edge, crop_edge) or
+                    got.dtype != torch.float32 or not torch.isfinite(got).all()):
+                raise ValueError('unexpected probe output')
+            reference = proc(images=probe_images,
+                             return_tensors='pt')['pixel_values']
+            if float((got.cpu() - reference).abs().mean()) > 0.02:
+                raise ValueError('GPU resize differs too far from Pillow')
+        except Exception as exc:
+            print('')
+            print('  [STOP] --gpu-preprocess failed its startup probe:')
+            print('         %s: %s' % (type(exc).__name__, str(exc)[:160]))
+            print('         No vectors were written.')
+            sys.exit(2)
+        print('Preprocess: GPU antialiased bicubic for opaque 2x+ downscales')
+        print('            (opt-in; Pillow retained for other images)')
+    else:
+        if args.gpu_preprocess:
+            print('(--gpu-preprocess ignored: it requires a GPU)')
     if fast_prep is None:
         print('   note: preprocessing through the image processor '
               '(the direct path does not match this model exactly).')
@@ -743,6 +926,15 @@ def main():
             full = os.path.join(root, *rel.split('/'))
             try:
                 with Image.open(full) as im:
+                    # Inventory metadata can be absent or stale. Ask the
+                    # opened file too, so a legacy animated GIF/WebP cannot
+                    # enter the GPU resize population that the A/B safety
+                    # gate intentionally excluded. Pillow calls multi-picture
+                    # JPEGs animated; the collector intentionally treats MPO
+                    # as a still JPEG, so preserve that exception here.
+                    opened_animated = (im.format != 'MPO' and
+                                       bool(getattr(im, 'is_animated', False)))
+                    is_animation = bool(r.get('anim') or opened_animated)
                     # 'MPO' as well - see process_one in the collector: a
                     # phone's dual-camera .jpg is a JPEG that Pillow
                     # relabels, and gating on 'JPEG' alone silently gave up
@@ -785,8 +977,9 @@ def main():
                     # composited onto white, not dropped. The two must agree
                     # exactly, or the pixel score and the CLIP vector are
                     # describing different pictures.
-                    if (im.mode in ('RGBA', 'LA', 'PA', 'La')
-                            or 'transparency' in im.info):
+                    had_alpha = (im.mode in ('RGBA', 'LA', 'PA', 'La')
+                                 or 'transparency' in im.info)
+                    if had_alpha:
                         # One buffer instead of three - see make_thumb.
                         if im.mode == 'La':
                             # see make_thumb: La converts only to LA
@@ -805,8 +998,26 @@ def main():
                         # dominant case paid it on every image; the alpha
                         # branch above already ends in an RGB `bg`.
                         im = im.convert('RGB')
-                    px = (fast_prep(im) if fast_prep is not None else
-                          proc(images=im, return_tensors='pt')['pixel_values'][0])
+                    if (gpu_prep is not None and not is_animation
+                            and not had_alpha
+                            and min(im.size) >= input_edge * 2
+                            and im.width * im.height <= GPU_RAW_IMAGE_PIXELS):
+                        # Keep transfer bandwidth at one byte/channel. The
+                        # accelerator performs float conversion, resize,
+                        # rescale, and normalize together at batch flush.
+                        # Animated files deliberately retain the default
+                        # vector path: on a real corpus, a tiny embedding
+                        # shift moved which of two background-dominated GIF
+                        # pairs crossed the automatic-delete boundary. Their
+                        # sampled-frame fingerprints were too coarse to veto
+                        # either false match, so animation safety must not
+                        # depend on a different resize kernel.
+                        a = np.array(im, dtype=np.uint8, copy=True)
+                        px = torch.from_numpy(a).permute(2, 0, 1).contiguous()
+                    else:
+                        px = (fast_prep(im) if fast_prep is not None else
+                              proc(images=im,
+                                   return_tensors='pt')['pixel_values'][0])
                 return r, px, None, rel
             except Exception as e:
                 last, last_rel = rel + ': ' + str(e)[:200], rel
@@ -830,11 +1041,41 @@ def main():
             print('           do not mix them in one embeddings file.')
 
         def infer(tensors):
-            inp = torch.stack(tensors)
-            if device == 'cuda':
-                inp = inp.pin_memory().to(device, non_blocking=True)
+            if gpu_prep is not None:
+                raw = [(i, t) for i, t in enumerate(tensors)
+                       if t.dtype == torch.uint8]
+                exact = [(i, t) for i, t in enumerate(tensors)
+                         if t.dtype != torch.uint8]
+                if raw and not exact:
+                    inp = gpu_prep([t for _, t in raw])
+                elif exact and not raw:
+                    inp = torch.stack([t for _, t in exact])
+                    if device == 'cuda':
+                        inp = inp.pin_memory().to(device, non_blocking=True)
+                    else:
+                        inp = inp.to(device)
+                else:
+                    crop_edge = exact[0][1].shape[-1]
+                    inp = torch.empty((len(tensors), 3, crop_edge, crop_edge),
+                                      dtype=torch.float32, device=device)
+                    moved = torch.stack([t for _, t in exact])
+                    if device == 'cuda':
+                        moved = moved.pin_memory().to(device, non_blocking=True)
+                    else:
+                        moved = moved.to(device)
+                    resized = gpu_prep([t for _, t in raw])
+                    exact_ix = torch.tensor([i for i, _ in exact],
+                                            dtype=torch.long, device=device)
+                    raw_ix = torch.tensor([i for i, _ in raw],
+                                          dtype=torch.long, device=device)
+                    inp.index_copy_(0, exact_ix, moved)
+                    inp.index_copy_(0, raw_ix, resized)
             else:
-                inp = inp.to(device)
+                inp = torch.stack(tensors)
+                if device == 'cuda':
+                    inp = inp.pin_memory().to(device, non_blocking=True)
+                else:
+                    inp = inp.to(device)
             with torch.inference_mode():
                 if use_half:
                     with torch.autocast(device, dtype=torch.float16):
@@ -898,7 +1139,7 @@ def main():
                 real_dim = int(v16.shape[1])
                 if not header_written:
                     f.write(json.dumps({'schema': 'img-emb/1', 'model': args.model,
-                                        'dim': real_dim, 'root': root, 'pre': PRE_TAG,
+                                        'dim': real_dim, 'root': root, 'pre': pre_tag,
                                         'prec': 'fp16' if use_half else 'fp32',
                                         'started': int(time.time() * 1000)}) + '\n')
                     header_written = True
@@ -926,10 +1167,13 @@ def main():
                       flush=True)
             f.flush()
 
-        metas, tensors = [], []
+        metas, tensors, raw_bytes = [], [], 0
         try:
-            for r, px, e, used in bounded_map(pool, prep_one, todo,
-                                              window=max(batch * 2, 16)):
+            for r, px, e, used in bounded_map(
+                    pool, prep_one, todo,
+                    window=(GPU_RAW_QUEUE_RESULTS
+                            if gpu_prep is not None
+                            else max(batch * 2, 16))):
                 if e is not None:
                     if prev_err.get(r['sha']) != e:
                         # only record a failure once per distinct message -
@@ -939,11 +1183,17 @@ def main():
                         prev_err[r['sha']] = e
                     err += 1
                     continue
+                px_bytes = px.numel() if px.dtype == torch.uint8 else 0
+                if (metas and px_bytes
+                        and raw_bytes + px_bytes > GPU_RAW_BATCH_BYTES):
+                    flush_batch(metas, tensors, False)
+                    metas, tensors, raw_bytes = [], [], 0
                 metas.append((r, used))
                 tensors.append(px)
+                raw_bytes += px_bytes
                 if len(metas) >= batch:
                     flush_batch(metas, tensors, False)
-                    metas, tensors = [], []
+                    metas, tensors, raw_bytes = [], [], 0
             flush_batch(metas, tensors, True)
         finally:
             pool.shutdown(wait=False, cancel_futures=True)

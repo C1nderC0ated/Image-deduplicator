@@ -135,7 +135,7 @@ argued about:
   loop: 102.8 s. The scale steps rarely collide at 64 px, so the cache
   bought nothing and paid dict overhead per call.
 
-## The open opportunity: GPU preprocessing
+## GPU preprocessing: implemented, opt-in, and bounded
 
 The embed stage is CPU-bound, not GPU-bound. It runs at ~139 img/s
 against a bare-GPU-forward ceiling of ~385, with the time going to
@@ -160,12 +160,47 @@ It is not free, and the numbers are measured rather than assumed
   against −0.110, and they sit up to 25.85/255 apart on an *upscale*,
   where antialiasing plays no part.
 
-So it belongs behind an opt-in flag beside `--fp16`, never as a default:
-the 0.9953 worst case sits close enough to the gate that a borderline
-pair could flip, and `PRE_TAG` — which the embedder refuses to resume
-across — means adopting it forces a full re-embed. Before trusting it,
-A/B the **tier decisions** on a real library, not the cosines. Cosines
-are not the quantity that reaches the gate.
+It now exists as `--gpu-preprocess`, behind an opt-in flag beside `--fp16`.
+It is intentionally narrower than the first prototype:
+
+- only opaque, non-animated images whose short edge is at least twice the
+  model input use Torch;
+- transparent images, animations, smaller resizes, and decoded RGB frames
+  over 4 MP retain the byte-identical Pillow path;
+- Torch clips **and rounds** its bicubic result to the uint8 samples Pillow
+  would feed the processor before rescaling and normalization;
+- queued raw data has a 768 MiB ceiling and an active raw batch has a separate
+  256 MiB ceiling; and
+- the embeddings header distinguishes Pillow/Torch and draft/full JPEG
+  populations. Resume across them stops with an explanation rather than
+  mixing them.
+
+Those boundaries came from failed A/Bs, not taste. Sending upscales through
+Torch produced a 0.9468 minimum cosine on tiny pixel art. Sending animations
+through it moved which of two background-dominated but genuinely different
+GIF scenes crossed Tier A. Sending transparent sprites through it made two
+facial-expression variants newly pre-marked `X`. Each risky class now stays
+on Pillow.
+
+The final full-library A/B covered 35,910 unique images on an AMD R9700. Of
+those, 26,118 vectors remained byte-identical and 9,792 took the GPU path.
+GPU-vs-Pillow cosine for the changed vectors was 0.999945 median and 0.995336
+minimum, with none below 0.995. More importantly, all 3,439 Tier A member
+sets and all 9,335 editable Tier A `X` paths matched the Pillow baseline.
+Tier B retained 1,812 review clusters and 5,821 candidates; one additional
+information-only relationship changed reference rows, not deletions. After
+the queue-memory bound and provenance hardening, the deterministic 2,623-image
+large-JPEG subset produced the same vectors byte for byte at 226.4 img/s with
+two decode threads, versus Pillow's 214.8–216.2 img/s.
+
+Performance is conditional. On this 24-thread machine the hardened mixed
+full-library run reached 277.4 img/s against Pillow's 310.3, 10.6% slower. On
+a deterministic 2,623-unique-image, 512px-or-larger JPEG subset limited to
+two decode threads, the hardened GPU path ran 226.4 img/s against Pillow's
+214.8–216.2, about 5% faster. With eight decode threads it was slower. That
+is why the flag is an explicit tool for CPU-constrained runs, not a new
+default or a generic
+“GPU = faster” claim.
 
 ## The lesson that has cost the most time
 
