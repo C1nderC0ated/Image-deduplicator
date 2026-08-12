@@ -44,16 +44,36 @@ the harness was first validated on a corpus built to contain the case
 the change was about, proving the experiment could detect a difference
 before its null result was believed.
 
-**Byte-parity is per-machine for the embed stage.** GPU floating-point
-kernels differ across vendors and architectures, so vectors produced on
-an AMD/ROCm box will not byte-match vectors from an NVIDIA/CUDA box.
-That is expected and is not a bug. Compare embed against a baseline
-produced on the *same* machine; across machines, compare tier decisions
-instead. The collect and analyze stages are CPU-side and should match
-anywhere, with the caveat that the signature sweep's prefilter runs
-through BLAS — its bound is deliberately widened and every survivor is
-re-checked exactly, so the candidate set is stable, but verify rather
-than assume it.
+**Byte-parity is a within-machine comparison, and that is all it needs
+to be.** Moving to a new machine does not weaken the gate: run the
+shipped code there once, and that run is your baseline. Every comparison
+after it is before-and-after on the same hardware, exactly as before.
+
+Comparing outputs *across* machines is a different and one-time
+question, and the answer is that they may legitimately differ. GPU
+floating-point kernels differ across vendors, so vectors from an
+AMD/ROCm box will not byte-match an NVIDIA/CUDA box — expected, not a
+bug. The more consequential difference is CPU-side: a different Pillow
+or libjpeg-turbo build can change the thumbnails, and thumbnails feed
+every downstream decision in both collect and analyze.
+
+**So re-collect on a new machine rather than carrying an inventory over
+and resuming it.** `record_format()` gates resume on thumbnail size,
+JPEG quality and frame count — it has no idea which Pillow produced the
+pixels. That is the v4.3.6 bug class exactly (q78 thumbnails beside q80
+ones, ~2.35 MAD apart against a 4.0 gate), and a library-version change
+would slip past the same guard, leaving one inventory holding two
+provenances. A fresh collect is under three minutes and removes the
+question. Same for embed: re-run rather than carrying vectors.
+
+If you want the cross-machine answer anyway, collect the same small
+folder on both and compare the inventories. Byte-identical means the two
+environments' Pillow and libjpeg agree, and the concern evaporates.
+
+The analyze stage is CPU-side and should match anywhere, with the caveat
+that the signature sweep's prefilter runs through BLAS — its bound is
+deliberately widened and every survivor is re-checked exactly, so the
+candidate set is stable, but verify rather than assume it.
 
 **Self-tests**: `python analyze-inventory.py --self-test`. It spawns real
 worker processes, holds both signature sweeps against brute-force
