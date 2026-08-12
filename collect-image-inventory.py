@@ -919,11 +919,16 @@ class PartWriter:
     # its own OS write call.
     def __init__(self, base_out, split_mb, header):
         self.stem, self.ext = strip_jsonl(base_out)
-        self.limit = max(1, int(split_mb)) * 1048576
+        # int() AFTER the multiply, not before: --split-mb is a float and
+        # truncating it first turned 1.7 into 1 without saying so, and any
+        # value under 1 into the max(1, ...) floor - so --split-mb 0.5 asked
+        # for half-megabyte parts and got one-megabyte ones.
+        self.limit = max(1, int(split_mb * 1048576))
         self.header = dict(header)
         self.part = 0
         self.paths = []
         self.f = None
+        self.roll = False
         self.nl = os.linesep.encode('ascii')
         self._open_next()
 
@@ -941,9 +946,17 @@ class PartWriter:
         self.f.write(json.dumps(hdr).encode('utf-8') + self.nl)
 
     def write(self, obj):
+        # The roll is decided when a part fills up but not performed until
+        # there is another record to put in the new one. Opening it eagerly
+        # meant the last record of a scan could leave behind a .partN with a
+        # header, a footer and nothing between them - a file that reads like
+        # a scan which found nothing.
+        if self.roll:
+            self._open_next()
+            self.roll = False
         self.f.write(json.dumps(obj, ensure_ascii=False).encode('utf-8') + self.nl)
         if self.f.tell() > self.limit:
-            self._open_next()
+            self.roll = True
 
     def close(self, footer):
         self.f.write(json.dumps(footer).encode('utf-8') + self.nl)
@@ -1016,6 +1029,17 @@ def main():
             print('Previous inventory found; pass --resume to reuse it. Rescanning fresh.')
 
     out = args.out or os.path.join(root, 'image-inventory.jsonl')
+    # The output file is not opened until the scan is over, so a --out into
+    # a folder that does not exist used to spend the whole walk - minutes,
+    # on a large library - and then end in a FileNotFoundError traceback
+    # with every read thrown away. Checked here, before anything is read.
+    out_dir = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(out_dir):
+        print('No such folder for --out: ' + out_dir)
+        print('')
+        print('Create it first, or give --out a path inside a folder that')
+        print('already exists. Nothing was scanned.')
+        sys.exit(2)
     # Canonicalize FIRST (an --out without .jsonl gets it appended), so the
     # path the collision guard checks is byte-identical to the path
     # PartWriter will actually open with 'wb'.
