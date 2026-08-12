@@ -3,7 +3,108 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.5 — 2026-08-12 (current)
+## v4.3.6 — 2026-08-12 (current)
+
+A bug audit, and then the bugs. Ten agents read the three stages and the
+launchers looking for defects rather than for improvements; twenty
+findings survived, nineteen of them after a second pass whose job was to
+refute the first. Nothing here came from a user report, which is the
+point: these are the failures that had not happened yet.
+
+### The five that could lose a file
+
+**A Windows junction made one folder look like two, and the copies
+inside it look like duplicates.** `os.walk` does not stop at a reparse
+point and `os.path.islink()` returns False for one, so a junction was
+followed and every file behind it inventoried a second time under a
+second path. Two paths, one file, identical SHA - which is exactly what
+an exact duplicate looks like, and the recycler would have deleted a
+"copy" that was the original seen twice. The walk now resolves each
+directory and visits each physical one once, whatever route reaches it,
+and says so when it skips a second route rather than quietly finding
+fewer files than you expect.
+
+**`--resume` reused records written in a format the run no longer
+uses.** The guard compared the thumbnail size and nothing else, so both
+of v4.3.5's changes went straight past it: thumbnails at quality 78 sat
+beside quality 80 ones (~2.35 MAD apart, against a 4.0 gate), and
+5-frame animation fingerprints beside 25-frame ones. `frames_agree`
+cannot compare two lengths and falls back to bare frame-count equality -
+two unrelated 40-frame GIFs sharing only their first frame passed it and
+landed in one Tier A cluster with one of them pre-marked X. The guard is
+now the whole record format, and a record with no format stamp counts as
+a mismatch.
+
+**A mark could move to the wrong file.** The recycler read the list back
+by stripping whitespace from each line, so a filename beginning with a
+space matched the line above it. The mark you put on ` photo.jpg` was
+read as a mark on the previous entry. The separator is now taken by
+width, because two spaces is the format and one leading space is a
+filename.
+
+**Tier A pre-marked files its keeper had never been compared with.** A
+cluster is a connected component: A matches B, B matches C, and C
+arrives with an X on it without anything ever having tested C against A.
+Those are still shown, still in the cluster, but no longer pre-marked -
+the report labels them LINKED and says which claim is which.
+
+**`Find-Duplicates.bat` ate exclamation marks and accepted a gutted
+PyTorch.** Delayed expansion was on in that one file and nowhere else in
+the fleet, so `D:\Wow! Photos` arrived as `D:\Wow Photos` and a folder
+named `!New` - the kind people create to sort first - became whatever
+`$New` happened to be. The torch probe checked only that the name
+imported, which an emptied install passes as a namespace package. Both
+now match what every other launcher does.
+
+### The rest
+
+**The keeper rule preferred a big JPEG over the PNG it was exported
+from.** After pixel count, `quality_key` ranked on file size - a fair
+proxy for detail within one encoding and no proxy at all across two,
+since a JPEG re-save of a PNG is routinely larger than its original.
+Demonstrated end to end: a gradient saved as a 10 KB PNG and re-saved as
+a 105 KB JPEG at the same size put the X on the PNG. A lossless format
+(PNG, BMP, TIFF - not GIF, whose 256-colour cap makes it the worse copy
+of a photo) now ranks between pixels and size. On the real library this
+flips nothing today - the two selection lists are byte-identical - so it
+is purely the guard for the day a re-save shows up.
+
+**Four promises the report page was not keeping.** A control-character
+filename was drawn red, labelled DROP and styled as already marked, with
+no button to change it - a deletion the list refuses to perform, offered
+with no way to decline. "Clear Tier B marks" skipped the keepers, so a
+mark you put on a Tier B keeper survived the button that says it clears
+them. The last-copy guard looked a file up in one cluster when a file
+can be in several, and emptying any of them is the thing it exists to
+prevent. Ctrl+X marked a file instead of copying, because the key
+handler ignored modifiers.
+
+**An Intel Arc owner was told they had no GPU.** Two places knew only
+`torch.cuda`. AMD was covered by accident - a ROCm build reuses the
+`torch.cuda` namespace - but XPU and Apple Metal set neither, so
+`Embed-Images.bat` sent an Arc machine down its CPU path with a message
+saying so, and the doctor offered a reinstall for a setup already using
+the GPU.
+
+**`./imgdedup.sh doctor` died before it started on macOS.** /bin/sh
+there is bash 3.2, which under `set -u` treats an empty `"$@"` as an
+unbound variable.
+
+**The setup menu counted backwards.** `usable[int(raw) - 1]` is a Python
+index, so typing `0` at a three-way PyTorch menu installed the last
+entry and `-1` the second-to-last, both silently. Verified against the
+old code: `0` gave the CPU build, `-1` gave ROCm.
+
+**Three ways the collector's output path misbehaved.** `--out` into a
+folder that does not exist was not discovered until the scan was over,
+because that is when the file is first opened - minutes of reading
+thrown away and then a traceback. `--split-mb` is a float and `int()`
+came before the multiply, so `0.5` meant 1 MB and `1.7` meant 1. And a
+new part was opened the instant the previous one filled, so a scan whose
+last record filled a part ended with a `.partN` holding a header, a
+footer and nothing else.
+
+## v4.3.5 — 2026-08-12
 
 **Thumbnail quality 78 -> 80, which found real crop and letterbox pairs
 the old setting was losing.** Confirmed on the 36,410-image library. The

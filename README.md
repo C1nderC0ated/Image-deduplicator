@@ -646,7 +646,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.5** (2026-08-12). Full history, including every bug and what it
+**v4.3.6** (2026-08-12). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 ---
