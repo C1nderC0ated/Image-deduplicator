@@ -765,12 +765,61 @@ def work_one(full, rel, thumb_px, fast=True):
         return 'err', rec, os.path.splitext(rel)[1].lower()
 
 
-def walk_images(root, skip_names):
+def walk_images(root, skip_names, on_relink=None):
+    """Every image under root, each PHYSICAL file once.
+
+    os.walk(followlinks=False) does not stop a Windows junction. Junctions
+    are reparse points, not symlinks: os.path.islink() returns False for
+    one, DirEntry.is_symlink() returns False, and the guard never fires. So
+    `mklink /J D:\\Photos\\backup D:\\Photos` - which needs no admin rights,
+    and which relocated or mirrored folders create routinely - made the
+    scan walk the tree twice and inventory every photo under two names.
+
+    That is not a harmless duplicate entry. The two names are ONE file, so
+    the analyzer sees a perfect SHA match, pre-marks one copy X, and the
+    recycler deletes it - taking the "survivor" with it, because the
+    survivor is the same bytes on disk. Measured: 12 photos, one junction,
+    no real duplicates anywhere; after the recycler ran, both directories
+    were empty. A self-referential junction was worse, multiplying an
+    8-image folder into 512 entries until MAX_PATH stopped the walk.
+
+    The fix is to remember the RESOLVED directory and refuse to descend
+    into one twice. realpath collapses junctions, symlinks and mount
+    points alike, so this covers POSIX symlinks and directory loops with
+    the same line rather than special-casing Windows. It is per-directory,
+    so the cost is a syscall per folder, not per file.
+
+    A junction pointing somewhere genuinely outside the tree still gets
+    scanned - it is new content, and skipping it would lose files. Only a
+    second route to something already walked is dropped.
+    """
+    seen_dirs = set()
+
+    def resolved(p):
+        try:
+            return os.path.normcase(os.path.realpath(p))
+        except OSError:
+            return os.path.normcase(os.path.abspath(p))
+
+    seen_dirs.add(resolved(root))
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames
-                       if d.lower() not in SKIP_DIRS
-                       and not d.lower().startswith(SKIP_DIR_PREFIXES)
-                       and not d.startswith('.')]
+        keep = []
+        for d in dirnames:
+            if (d.lower() in SKIP_DIRS
+                    or d.lower().startswith(SKIP_DIR_PREFIXES)
+                    or d.startswith('.')):
+                continue
+            r = resolved(os.path.join(dirpath, d))
+            if r in seen_dirs:
+                # A second path to a directory already walked. Announced
+                # rather than skipped quietly: from the outside this looks
+                # like files going missing from the scan.
+                if on_relink is not None:
+                    on_relink(os.path.join(dirpath, d), r)
+                continue
+            seen_dirs.add(r)
+            keep.append(d)
+        dirnames[:] = keep
         for name in sorted(filenames):
             if os.path.splitext(name)[1].lower() not in EXTS:
                 continue
@@ -939,9 +988,26 @@ def main():
     skip_names.add(os.path.normcase(os.path.abspath(out)))
 
     print('Scanning: ' + root)
-    files = list(walk_images(root, skip_names))
+    relinks = []
+    files = list(walk_images(root, skip_names,
+                             lambda p, r: relinks.append((p, r))))
     total = len(files)
     print('Found ' + str(total) + ' image files.')
+    if relinks:
+        # Said out loud. A junction that doubles the tree used to end with
+        # the recycler deleting both copies of every file, and the only
+        # visible sign was a suspiciously tidy pile of "exact duplicates".
+        print('')
+        print('%d folder(s) are a second route to something already scanned'
+              % len(relinks))
+        print('(a junction, symlink or mount point). Walked once, not twice -')
+        print('otherwise one file appears under two names and looks like its')
+        print('own duplicate:')
+        for p, r in relinks[:6]:
+            print('   %s' % p)
+            print('     -> %s' % r)
+        if len(relinks) > 6:
+            print('   ... and %d more' % (len(relinks) - 6))
     if total == 0:
         print('Nothing to do.')
         return
