@@ -1,5 +1,12 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions
+rem  NOT EnableDelayedExpansion. It was on here and nowhere else in the
+rem  fleet, and nothing in this file uses "!VAR!" - but with it on, the
+rem  `set "TARGET=%~1"` below runs the dragged path through delayed
+rem  expansion, so every "!" is eaten and "!NAME!" becomes the value of
+rem  the environment variable NAME. "D:\Wow! Photos" arrived as
+rem  "D:\Wow Photos", and folders named to sort first ("!New") are
+rem  exactly the ones people drag.
 cd /d "%~dp0"
 
 rem ----------------------------------------------------------------------
@@ -28,7 +35,11 @@ rem closing quote when passed on; "D:\." names the same folder and is safe
 if "%TARGET:~-1%"=="\" set "TARGET=%TARGET%."
 
 set "PROBE=from PIL import Image, ImageOps; Image.new('RGB',(2,2)).convert('L')"
-set "TPROBE=import torch, transformers"
+rem  Functional, not name-only: _pick-python.bat requires it. A gutted
+rem  install (folders survive, files deleted) still IMPORTS fine as an
+rem  empty namespace package, and that has fooled this toolkit before.
+rem  Same probe Embed-Images.bat and imgdedup.sh already use.
+set "TPROBE=import torch, transformers; assert torch.__file__ and transformers.__file__; torch.zeros(1)"
 
 for %%F in (collect-image-inventory.py analyze-inventory.py _pick-python.bat) do (
     if not exist "%~dp0%%F" (
