@@ -36,7 +36,7 @@ point, inspect everything in a text editor, and re-run stages independently.
 
 ---
 
-## Release contents
+## Repository contents
 
 | Path | Role |
 |------|------|
