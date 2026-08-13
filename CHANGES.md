@@ -3,7 +3,7 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## Unreleased
+## v4.3.8 — 2026-08-13 (current)
 
 **Opt-in GPU preprocessing, with the unsafe surface cut away.**
 `embed-images.py --gpu-preprocess` moves antialiased bicubic resize and CLIP
@@ -40,7 +40,7 @@ deterministic 2,623-image large-JPEG run limited to two decode threads reached
 run-ahead. The option therefore remains off by default and is documented for
 CPU-constrained preprocessing, not as a universal accelerator.
 
-## v4.3.7 — 2026-08-12 (current)
+## v4.3.7 — 2026-08-12
 
 **The whole pipeline is about 25% faster, and every byte of output is
 identical.** Measured end to end on the same 36,410-image library, same
