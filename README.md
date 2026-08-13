@@ -667,7 +667,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.7** (2026-08-12). Full history, including every bug and what it
+**v4.3.8** (2026-08-13). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change
