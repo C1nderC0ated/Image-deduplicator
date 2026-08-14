@@ -27,10 +27,11 @@ refuses.
 - **64 px crop near-misses are retried at 128 px.** The cheap pass keeps
   95% crops (99% vs 90% at 128) and misses some 80% crops (84% vs 97%).
   Only scores in [0.85, 0.90) are retried, closest to the gate first, cap
-  512. The retry only raises a score, so 95% crops that prefer 64 are
-  not demoted. On the 36k library: **5–10 s extra, 4 new pairs, 3
-  genuine.** The 0.80 band was tried first and cut to 0.85 as too
-  generous before this measurement.
+  1028. The retry only raises a score, so 95% crops that prefer 64 are
+  not demoted. On the 36k library at cap 512: **5–10 s extra, 4 new
+  pairs, 3 genuine.** Raising the cap to 1028 added about a second and
+  one more genuine pair. The 0.80 band was tried first and cut to 0.85 as
+  too generous before these measurements.
 - **List and report label it.** Slate tiles, a WEAKER EVIDENCE pill, and
   “weaker evidence” on every C line. The recycler never bulk-offers C
   (`sd` stays B-only). A C-only scan still writes the list so you can

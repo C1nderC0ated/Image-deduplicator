@@ -756,7 +756,7 @@ NCC_GATE = 0.90
 # score. Cap stops a 37k-pair crop list from becoming a second full pass.
 NCC_NEAR = 0.85
 NCC_CONFIRM_PX = 128
-NCC_CONFIRM_CAP = 512
+NCC_CONFIRM_CAP = 1028
 # CLIP-only Tier B shortcut: cosine 0.995 used to skip every pixel test.
 # Unrelated same-genre pairs already reach 0.982, so the shortcut now also
 # needs a low pixel distance (3x the default Tier A gate), and it is
