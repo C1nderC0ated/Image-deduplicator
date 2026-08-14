@@ -14,8 +14,10 @@ guard in the codebase exists downstream of that asymmetry, and it is why
 the verification bar below is higher than a normal refactor deserves.
 
 Tier A is pre-marked `X` for deletion. Tier B is review-only, pre-marked
-`.`. Anything that could move a pair from B to A, or widen A, needs the
-decision-level evidence described below — not just a plausible argument.
+`.`. Tier C is weaker-evidence review: also all `.`, no suggested keeper,
+no bulk-mark. C exists to unclutter B, not to promote anything. Anything
+that could move a pair from B to A, or widen A, needs the decision-level
+evidence described below — not just a plausible argument.
 
 ## How to verify a change
 

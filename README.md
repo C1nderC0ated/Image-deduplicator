@@ -60,7 +60,7 @@ Generated at run time, next to your images:
 |------|-----------|------------|
 | `image-inventory.jsonl` (+ `.partN` above ~200 MB) | Collect | One JSON line per image: path, size, SHA-256, dimensions, EXIF, JPEG quality fingerprint, AI-generation text chunks, 128 px thumbnail |
 | `image-embeddings.jsonl` | Embed | One CLIP vector per unique image, keyed by SHA-256 |
-| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper; the last surviving copy refuses. Dark-themed, so the thumbnails stay the brightest thing on screen |
+| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **weaker-evidence slate** (Tier C, no suggested keeper), **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper; the last surviving copy refuses. There is no “Mark all Tier C”. Dark-themed, so the thumbnails stay the brightest thing on screen |
 | `<name>-list.txt` | Analyze | The selection list you edit: first character `X` = delete, `.` = keep |
 | `Recycle-Duplicates.py` + `.bat` / `.sh` | Analyze | The only thing that deletes — after verification and your y/N. The `.py` holds every rule; the `.bat`/`.sh` only find a Python. Versioned (`Recycle-Duplicates-2.*`) when the inventory is, so each stays bound to its own list |
 
@@ -222,6 +222,8 @@ goes wrong, since it lets you re-run one stage without redoing the others.
    `Enter` for Tier A only (the default, and what happens with piped input
    or no terminal), `b` to include them, `q` to stop and review. Either way
    they go through the same survivor and hash checks as everything else.
+   Tier C is never bulk-offered: mark those files yourself if you want them
+   recycled.
 
 On Linux/macOS, steps 2–4 are `./imgdedup.sh collect <folder>`,
 `./imgdedup.sh embed <folder>`, `./imgdedup.sh analyze <folder>`.
@@ -349,7 +351,7 @@ the sweep already keeps 96,255 pairs out of 662 million at 8.0.
 Sweeps **every possible pair** on an 8×8 colour signature through BLAS with
 a provably lossless bound (`--self-test` asserts set equality against brute
 force), adds each image's nearest CLIP neighbours, re-scores survivors at
-full thumbnail resolution on a thread pool, and sorts findings into two
+full thumbnail resolution on a thread pool, and sorts findings into three
 tiers. Rotated/mirrored, grayscale/recoloured and cropped copies get their
 own detectors, each applied only to pairs every cheaper test rejected.
 Images whose SHA-256 is missing from the embeddings file are judged by
@@ -358,12 +360,14 @@ pixels alone, and byte-identical files are always clustered:
 | Tier | Meaning | Evidence required | Pre-set |
 |------|---------|-------------------|---------|
 | **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree | `X` |
-| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, inpaints, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995, or containment ≥ 0.92 with CLIP ≥ 0.94, or luma/orientation match at duplicate level | `.` always |
+| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, inpaints, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or luma/orientation match at duplicate level | `.` always |
+| **C — weaker evidence** | Related according to CLIP, but the pixel match is cheap chrome, near-black noise, or a high cosine with no crop confirm. Components larger than 16 are omitted (weak-edge chaining, not a reviewable set) | containment ≥ 0.95 **in** a dense CLIP pocket or on two near-black thumbs, or CLIP ≥ 0.97 after luma/orientation also missed | `.` always, **no suggested keeper**. You may still mark `X`; the last copy in a cluster cannot |
 
 Within a cluster the **keeper** is chosen by highest resolution, then
 largest file, then finest JPEG quantization (`qsum`), the
 least-recompressed copy, not just the biggest. It is only a *suggestion*:
-every member of every cluster is an editable line in the list.
+every member of every cluster is an editable line in the list. Tier C
+elects none: every file there starts unmarked so you pick, or leave them.
 
 Numbers you will see in the report:
 
@@ -374,7 +378,8 @@ Numbers you will see in the report:
   which is why Tier A demands 0.99 *and* pixel agreement, not either alone.
 - **ncc**: how well the smaller image matches somewhere *inside* the
   larger one (1.0 = perfect containment). This is the crop detector; it
-  needs OpenCV, and the run tells you if that is missing.
+  needs OpenCV, and the run tells you if that is missing. The cheap pass
+  is 64 px; scores in [0.85, 0.90) are retried at the 128 px thumbnail.
 
 Long runs print per-stage elapsed times, so you can see where the time
 goes. If the folder is clean, Analyze writes **only the report** (which
@@ -599,13 +604,15 @@ machine.
 Comparisons run on 128 px thumbnails, which is what makes a million-pair
 sweep fast. The thresholds were calibrated against real libraries with
 contact-sheet review: a JPEG re-save scores mad ≈ 1–3, genuinely different
-images 10 or more. Borderline pairs get surfaced in Tier B rather than
-decided.
+images 10 or more. Borderline pairs get surfaced in Tier B or C rather
+than decided.
 
 Tier B is a review queue, not a verdict. Same-prompt AI re-rolls, inpaint
 variants and crops are *structurally* alike, and only you know which of
 them you count as "the same picture". That is why every line there starts
-pre-set to `.`.
+pre-set to `.`. Tier C is the same unmarked queue on weaker evidence
+(screenshot chrome, near-black thumbs, CLIP-strong with no crop confirm).
+The recycler never bulk-offers it; mark what you want in the list.
 
 What it will miss: crops retaining under about a third of the original,
 and, without the Embed stage, brightness or colour edits, because nothing
@@ -667,7 +674,7 @@ and the freedesktop trash layout exercised against real files.
 
 ## Version
 
-**v4.3.8** (2026-08-13). Full history, including every bug and what it
+**v4.4** (2026-08-14). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change

@@ -3,7 +3,86 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.3.8 — 2026-08-13 (current)
+## v4.4 — 2026-08-14 (current)
+
+**Tier C: weaker-evidence review, so B is less cluttered.** Nothing here
+widens Tier A. Defaults stay permissive: every C line is `.`, there is no
+suggested keeper, and there is no “Mark all Tier C”. You can still mark
+`X` in the list or the report; the last remaining copy in a cluster still
+refuses.
+
+- **NCC ≥ 0.90 in a dense CLIP pocket (screenshot chrome) or on two
+  near-black thumbs** leaves B and lands in C. Dead-zone pixel-agree
+  (CLIP veto), the CLIP-only shortcut, luma/orientation matches, and
+  clean (not dense, not dark) crop matches stay in B. Pairs demoted from
+  the 512 px confirm stay in B.
+- **CLIP ≥ 0.97 after luma and orientation also missed** is the bounded
+  “can't tell” set (was 0.94; that band is same-subject different photos).
+  Dense/dark NCC now needs 0.95, not the 0.90 B crop gate (chrome). Cosine
+  at the 0.90 neighbour floor with an NCC miss is not dumped into C.
+- **The rotated-crop NCC pass is gone.** On a 36k library it searched
+  37,362 CLIP-strong misses, spent 35 s, and recovered 9 pairs that were
+  not clearly genuine. Unrotated crop matching and the 8-orientation
+  pixel check for rotated/mirrored *saves* are unchanged.
+- **64 px crop near-misses are retried at 128 px.** The cheap pass keeps
+  95% crops (99% vs 90% at 128) and misses some 80% crops (84% vs 97%).
+  Only scores in [0.85, 0.90) are retried, closest to the gate first, cap
+  512. The retry only raises a score, so 95% crops that prefer 64 are
+  not demoted. On the 36k library: **5–10 s extra, 4 new pairs, 3
+  genuine.** The 0.80 band was tried first and cut to 0.85 as too
+  generous before this measurement.
+- **List and report label it.** Slate tiles, a WEAKER EVIDENCE pill, and
+  “weaker evidence” on every C line. The recycler never bulk-offers C
+  (`sd` stays B-only). A C-only scan still writes the list so you can
+  mark files.
+- **C does not keep giant connected components.** Weak edges in a dense
+  genre chain into one cluster (measured: 1233 different photos of feet).
+  Components larger than 16 (one CLIP neighbourhood) are omitted, not
+  shown as a strip you cannot review. Small C groups are unchanged.
+
+Self-test covers the B/C lane, C invariants (no drops, A-drop stand-in),
+emission (one home per file), an all-dot list with no suggested keeper,
+a report that shows the weaker label, no KEEP tile, and the last-copy
+rule, and that oversized C components are dropped.
+
+## v4.3.9 — 2026-08-14
+
+**Tighter review admission, a bounded 512 px check on borderline Tier A
+pairs, and predicted crop scales.** None of these widen Tier A.
+
+- **CLIP-only 0.995 no longer skips every pixel test.** A pair still needs
+  MAD ≤ 12 (3× the default Tier A gate) to enter Tier B on cosine alone.
+  Same-genre screenshots and same-prompt re-rolls were landing there with
+  pixel distances in the tens. Pairs that fail the new gate go through
+  crop matching instead of being admitted or dropped.
+- **Dense CLIP pockets (the screenshot clusters that hit the K=16 cap) and
+  disagreeing PNG generation text refuse that shortcut too.** Collect has
+  stored `parameters` / `prompt` / `workflow` all along; Analyze never
+  read them. A shared key with different values is now a veto, one-sided
+  or missing text is not.
+- **Borderline Tier A keeper-drop pairs are re-scored at 512 px**, not
+  native resolution. SHA twins and MAD ≤ 2 skip it; the cap is 64 pairs so
+  a 9k-drop library cannot become a second Collect. A pair that fails is
+  demoted to review. Unreadable originals (including non-ASCII Windows
+  paths, which `cv2.imread` cannot open) are left in Tier A: the thumbnail
+  already passed two gates, and the recycler will refuse if the file is
+  gone. Paths are joined the same way the recycler does (`/` split, then
+  `os.path.join`), and `..` is refused.
+- **Crop matching tries the geometrically predicted scale first**
+  (`s_max = min(big/small)` in each dimension, then 0.97/0.95 of that),
+  then the existing grid, skipping duplicate integer template sizes, and
+  stops once the 0.90 gate is cleared. Off-grid sizes (a square inside
+  16:9 at 0.5625, a 93% crop between 0.92 and 0.95) were falling in gaps
+  the last absolute-grid fill never closed.
+- **Rotated crops that CLIP already saw get a second NCC pass.** 90/180/270
+  of the smaller image, only for pairs whose unrotated score missed 0.90
+  and whose cosine is still ≥ 0.94. `--no-orient` skips it. Identity is
+  not repeated. Process-pool scores match the threaded path.
+
+Self-test covers the admission helpers, predicted scale, Unicode path
+confirm, `..` refusal, and a synthetic demotion.
+
+## v4.3.8 — 2026-08-13
 
 **Opt-in GPU preprocessing, with the unsafe surface cut away.**
 `embed-images.py --gpu-preprocess` moves antialiased bicubic resize and CLIP

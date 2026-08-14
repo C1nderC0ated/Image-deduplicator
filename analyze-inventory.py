@@ -38,6 +38,12 @@ TIERS
   B  crop / variant - structurally the same, genuinely different pixels
                       (crops, rotations, recolours, re-rolls). Pre-set to
                       "." always - nothing here is deleted unreviewed.
+                      CLIP-only admission now also needs a low pixel
+                      distance; dense screenshot pockets and disagreeing
+                      generation text refuse it.
+  C  weaker evidence - NCC in a dense/dark pocket, or CLIP-strong with no
+                      crop confirm. All ".", no suggested keeper. You may
+                      still mark X; the last copy in a cluster cannot.
 
 THE INVARIANTS (enforced in code, not by memory)
   1. every file appears at most once as a deletion candidate
@@ -93,7 +99,7 @@ except ImportError:
     print('numpy is required:  ' + _hint('numpy'))
     sys.exit(2)
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     print('Pillow is required:  ' + _hint('pillow'))
     sys.exit(2)
@@ -701,8 +707,8 @@ def trim_bars(a, tol=1.0, keep=0.25, minfrac=0.08):
     return np.ascontiguousarray(a[t:b, l:r])
 
 
-def gray_small(TH, x):
-    """Grayscale copy of thumb x, downscaled to max side 64 (as float32).
+def gray_small(TH, x, cap=64):
+    """Grayscale copy of thumb x, downscaled to max side `cap` (as float32).
 
     Half the thumbnail's 128 px, which looks like a cheapness that ought to
     cost detection. Measured on 150 real images against their own crops, it
@@ -721,12 +727,16 @@ def gray_small(TH, x):
     a resized crop cannot align pixel-perfectly at 128 px and tolerates the
     mismatch at 64.
 
+    80% crops are the miss: they keep 84% at 64 and 97% at 128. Near-misses
+    from the 64 px pass are therefore retried at 128. The retry only RAISES
+    a score, so the 95% crops that prefer 64 are not hurt.
+
     Letterbox bars are trimmed first - see trim_bars. This affects only the
     crop tier; the pixel scores and the signature sweep see the untouched
     thumbnail."""
     g = np.asarray(Image.fromarray(trim_bars(TH[x])).convert('L'),
                    dtype=np.float32)
-    s = 64.0 / max(g.shape)
+    s = float(cap) / max(g.shape)
     if s < 1.0:
         g = np.asarray(Image.fromarray(g.astype('uint8')).resize(
             (max(8, int(g.shape[1] * s)), max(8, int(g.shape[0] * s))),
@@ -740,12 +750,103 @@ def gray_small(TH, x):
 # trivially-detectable crop missed purely by quantisation.
 NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.92,
               0.95, 0.97, 1.0)
+NCC_GATE = 0.90
+# 80% crops keep 84% at the 64 px pass and 97% at 128. Retry only the
+# band that almost cleared the gate, closest first, and never lower a
+# score. Cap stops a 37k-pair crop list from becoming a second full pass.
+NCC_NEAR = 0.85
+NCC_CONFIRM_PX = 128
+NCC_CONFIRM_CAP = 512
+# CLIP-only Tier B shortcut: cosine 0.995 used to skip every pixel test.
+# Unrelated same-genre pairs already reach 0.982, so the shortcut now also
+# needs a low pixel distance (3x the default Tier A gate), and it is
+# refused inside dense neighbour pockets and when PNG generation text
+# disagrees.
+CLIP_ONLY_COS = 0.995
+CLIP_ONLY_MAD = 12.0
+# Tier C CLIP-miss floor. 0.94-0.96 is same-subject different photos.
+# 0.97 sits under typical same-picture scores (~0.98) and above that band.
+CLIP_TIER_C = 0.97
+# Dense/dark NCC at 0.90 is screenshot chrome. A real crop in that pocket
+# still clears 0.95; chrome often does not.
+C_NCC_GATE = 0.95
+# Bounded 512 px re-score of borderline Tier A keeper-drop pairs. SHA twins
+# and obvious re-saves (MAD <= 2, the JPEG-thumb noise band) skip it. Cap
+# stops a 9k-drop library from becoming a second Collect.
+CONFIRM_PX = 512
+CONFIRM_MAD_LO = 2.0
+CONFIRM_CAP = 64
 # 0.88/0.92/0.97 added after measuring the grid rather than reasoning about
 # it. The old spacing left a hole either side of 0.9, and acceptance was
 # NOT monotonic in crop size - a 90% crop was accepted 79% of the time
 # while an 80% crop managed 84%. Non-monotonic behaviour is what a gap in
 # the grid looks like, not a threshold that is set wrong. Filling it took
 # 90% crops from 79% to 97% at the old gate. Costs ~20 s on a 164 s run.
+
+
+def ncc_scale_list(big_hw, small_hw):
+    """Template scales to try, predicted fit first, then the measured grid.
+
+    The grid is absolute (0.35 .. 1.0). Searching a square thumb inside a
+    128x72 original skips every scale above 0.5625 as too big, and the true
+    scale sits in the 0.50-0.60 gap. s_max = min(big/small) in each
+    dimension is that scale; trying it first finds off-grid crops without
+    denser absolute steps. Duplicate integer template sizes are dropped so
+    the extra guesses do not add matchTemplate calls.
+    """
+    bh, bw = int(big_hw[0]), int(big_hw[1])
+    sh, sw = int(small_hw[0]), int(small_hw[1])
+    if sh < 8 or sw < 8 or bh < 8 or bw < 8:
+        return list(NCC_SCALES)
+    s_fit = min(bh / float(sh), bw / float(sw))
+    ordered = (s_fit, 0.97 * s_fit, 0.95 * s_fit) + NCC_SCALES
+    seen = set()
+    out = []
+    for s in ordered:
+        if s <= 0:
+            continue
+        th, tw = int(sh * s), int(sw * s)
+        if th < 8 or tw < 8 or th > bh or tw > bw:
+            continue
+        key = (th, tw)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(s))
+    return out
+
+
+def needs_ncc_confirm(ncc, lo=NCC_NEAR, hi=NCC_GATE):
+    """64 px crop score almost cleared the gate - retry at 128 px."""
+    if ncc is None:
+        return False
+    v = float(ncc)
+    return lo <= v < hi
+
+
+def ncc_confirm_queue(nccs, cap=NCC_CONFIRM_CAP):
+    """Near-misses closest to the gate first. Returns (pairs, n_skipped)."""
+    near = [(p, v) for p, v in nccs.items() if needs_ncc_confirm(v)]
+    near.sort(key=lambda kv: (-kv[1], kv[0]))
+    return [p for p, _ in near[:cap]], max(0, len(near) - cap)
+
+
+def apply_ncc_confirms(nccs, TH, workers, cap=NCC_CONFIRM_CAP,
+                       max_side=NCC_CONFIRM_PX):
+    """Re-score 64 px near-misses at 128 px. Only raises a score."""
+    pairs, skipped = ncc_confirm_queue(nccs, cap)
+    if not pairs:
+        return nccs, 0, 0, skipped
+    hi = compute_nccs(TH, pairs, workers, max_side=max_side)
+    gained = 0
+    for p in pairs:
+        v1 = hi.get(p, 0.0)
+        v0 = nccs.get(p, 0.0)
+        if v1 > v0:
+            if v0 < NCC_GATE <= v1:
+                gained += 1
+            nccs[p] = v1
+    return nccs, len(pairs), gained, skipped
 
 
 # Below this many pairs the crop matcher stays on threads: the process
@@ -805,11 +906,11 @@ def _ncc_chunk(args):
     slice of the pairs. Reusing the whole function is the point - the child
     computes exactly what the parent would have, so the scores cannot
     disagree with the threaded path."""
-    chunk, tbmap = args
-    return compute_nccs(_TbView(tbmap), chunk, 1, procs=0)
+    chunk, tbmap, max_side = args
+    return compute_nccs(_TbView(tbmap), chunk, 1, procs=0, max_side=max_side)
 
 
-def _nccs_mp(TH, pairs, procs):
+def _nccs_mp(TH, pairs, procs, max_side=64):
     """The pair list sliced contiguously across worker processes.
 
     Why processes when every other stage here is happy on threads: the pair
@@ -843,7 +944,7 @@ def _nccs_mp(TH, pairs, procs):
     for k in range(0, len(pairs), step):
         chunk = pairs[k:k + step]
         idxs = sorted({x for p in chunk for x in p})
-        jobs.append((chunk, {i: recs[i]['tb'] for i in idxs}))
+        jobs.append((chunk, {i: recs[i]['tb'] for i in idxs}, max_side))
     res = {}
     with ProcessPoolExecutor(max_workers=procs) as ex:
         for d in ex.map(_ncc_chunk, jobs):
@@ -851,12 +952,17 @@ def _nccs_mp(TH, pairs, procs):
     return res
 
 
-def compute_nccs(TH, pairs, workers, procs=None):
+def compute_nccs(TH, pairs, workers, procs=None, max_side=64):
     """ncc containment for the given pairs, in parallel, with the per-image
     grayscale and per-(image, scale) template work computed once instead of
     once per pair. Large pair lists go to worker processes (see _nccs_mp);
     small ones, and any machine where spawning fails, use the threaded
-    path below - same scores either way, the worker IS this function."""
+    path below - same scores either way, the worker IS this function.
+
+    max_side is the grayscale cap (64 for the cheap pass, 128 for a
+    near-miss retry). The first pass stays at 64; 128 is only for the
+    band that almost cleared the gate.
+    """
     if not pairs:
         return {}
     try:
@@ -876,7 +982,7 @@ def compute_nccs(TH, pairs, workers, procs=None):
     if (procs and (forced or len(pairs) >= NCC_MP_MIN_PAIRS)
             and getattr(TH, '_recs', None) is not None):
         try:
-            return _nccs_mp(TH, pairs, procs)
+            return _nccs_mp(TH, pairs, procs, max_side=max_side)
         except Exception as e:
             # A machine that cannot spawn (frozen build, exotic runtime)
             # still finishes on threads; say so rather than silently being
@@ -914,18 +1020,21 @@ def compute_nccs(TH, pairs, workers, procs=None):
         dirs = ((a, b, j), (b, a, i))
         best = 0.0
         for big, small, sidx in dirs:
-            for s in NCC_SCALES:
+            for s in ncc_scale_list(big.shape, small.shape):
                 th, tw = int(small.shape[0] * s), int(small.shape[1] * s)
                 if th < 8 or tw < 8 or th > big.shape[0] or tw > big.shape[1]:
                     continue
                 t = template(sidx, s, small)
                 best = max(best, float(cv2.matchTemplate(
                     big, t, cv2.TM_CCOEFF_NORMED).max()))
+                if best >= NCC_GATE:
+                    return p, best
         return p, best
 
     res = {}
     with ThreadPoolExecutor(workers) as pool:
-        for x, g in zip(idxs, pool.map(lambda x: gray_small(TH, x), idxs)):
+        for x, g in zip(idxs, pool.map(
+                lambda x, cap=max_side: gray_small(TH, x, cap), idxs)):
             grays[x] = g
         for p, v in pool.map(one, pairs):
             res[p] = v
@@ -1129,13 +1238,304 @@ def shown_dims(r):
     return (h, w) if r.get('ori') in (5, 6, 7, 8) else (w, h)
 
 
+def generation_params_conflict(ra, rb):
+    """True when both records carry PNG generation text and a shared key differs.
+
+    Collect stores parameters/prompt/workflow when the file has them. Two
+    re-rolls of one prompt are the case CLIP-B/32 cannot tell apart; a
+    string compare is free and only fires when BOTH sides recorded the
+    field. One-sided or empty text is silence, not a veto.
+    """
+    ta, tb = ra.get('txt'), rb.get('txt')
+    if not isinstance(ta, dict) or not isinstance(tb, dict) or not ta or not tb:
+        return False
+    keys_a = {str(k).lower(): ('' if v is None else str(v).strip())
+              for k, v in ta.items()}
+    keys_b = {str(k).lower(): ('' if v is None else str(v).strip())
+              for k, v in tb.items()}
+    shared = set(keys_a) & set(keys_b)
+    if not shared:
+        return False
+    return any(keys_a[k] != keys_b[k] for k in shared)
+
+
+def clip_only_admit(mad, cos, dense_i=False, dense_j=False, rec_i=None, rec_j=None,
+                    mad_cut=CLIP_ONLY_MAD, cos_cut=CLIP_ONLY_COS):
+    """May this pair enter Tier B on CLIP cosine alone, with no NCC?
+
+    Used to be `cos >= 0.995` with no pixel test. That is the same-genre
+    leak. The shortcut now also needs a low MAD, and it is refused for
+    dense neighbour pockets (screenshots) and disagreeing generation text.
+    """
+    if cos is None or cos < cos_cut:
+        return False
+    if mad > mad_cut:
+        return False
+    if dense_i or dense_j:
+        return False
+    if rec_i is not None and rec_j is not None and generation_params_conflict(rec_i, rec_j):
+        return False
+    return True
+
+
+DARK_LUMA = 12.0
+# Weak C edges in a dense genre form one giant connected component
+# (measured: 1233 different photos of feet in a single cluster). C is
+# pairwise evidence; transitivity at that level is a lie. Components
+# larger than one CLIP neighbourhood are omitted, not sliced into
+# equally-unreviewable chunks.
+C_CLUSTER_MAX = 16
+
+
+def weaker_review(dense_i, dense_j, luma_i, luma_j, dark_cut=DARK_LUMA):
+    """NCC passed, but the match is cheap chrome or near-black noise."""
+    if dense_i or dense_j:
+        return True
+    return luma_i < dark_cut and luma_j < dark_cut
+
+
+def review_lane(ncc, cos, dense_i=False, dense_j=False,
+                luma_i=255.0, luma_j=255.0, clip_only=False, dead_zone=False):
+    """Which review tier a non-A pair belongs in, or None to drop.
+
+    Dead-zone and CLIP-only shortcuts stay in B (stronger). An NCC pass
+    outside a dense/dark pocket stays in B. Dense/dark NCC needs C_NCC_GATE
+    (0.95), not the B crop gate: 0.90 there is chrome. A CLIP-strong miss
+    needs CLIP_TIER_C (0.97); 0.94-0.96 is same-subject different photos.
+    """
+    if dead_zone or clip_only:
+        return 'B'
+    ncc_v = 0.0 if ncc is None else float(ncc)
+    if ncc_v >= NCC_GATE:
+        if not weaker_review(dense_i, dense_j, luma_i, luma_j):
+            return 'B'
+        return 'C' if ncc_v >= C_NCC_GATE else None
+    if cos is not None and float(cos) >= CLIP_TIER_C:
+        return 'C'
+    return None
+
+
+def scan_has_output(tier_a, tier_b, info_b=None, tier_c=None):
+    """Write a list+recycler when anything can be marked, including C.
+
+    info_b groups are review-only with no suggested drops; they do not
+    by themselves force a recycler (same as before C existed).
+    """
+    if any(d for _k, d, _m in tier_a):
+        return True
+    if any(d for _k, d, _m in tier_b):
+        return True
+    if tier_c:
+        return True
+    return False
+
+
+def build_tier_c(groups, recs, tier_a, tier_b=None):
+    """Weaker-evidence groups: shown, all unmarked, no suggested keeper.
+
+    Same A-drop standing-in as Tier B, so a relation to a doomed copy is
+    not lost. No keeper is elected here; emission picks a silent one
+    only so last-copy membership has an owner.
+    """
+    a_drops = set(i for _, d, _ in tier_a for i in d)
+    keeper_of = {}
+    for k, drops, _m in tier_a:
+        for d in drops:
+            keeper_of[d] = k
+    out = []
+    for members in groups:
+        surv = [i for i in members if i not in a_drops]
+        if len(surv) < 2:
+            stand = list(surv)
+            for i in members:
+                if i in a_drops:
+                    kk = keeper_of.get(i)
+                    if kk is not None and kk not in stand:
+                        stand.append(kk)
+            if len(stand) > 1:
+                out.append(sorted(stand))
+            continue
+        out.append(sorted(surv))
+    return out
+
+
+def cap_c_groups(groups, max_size=C_CLUSTER_MAX):
+    """Keep reviewable C components; drop genre hairballs.
+
+    Returns (kept_groups, n_dropped_files, n_dropped_groups).
+    """
+    kept, n_files, n_groups = [], 0, 0
+    for g in groups:
+        if len(g) > max_size:
+            n_files += len(g)
+            n_groups += 1
+            continue
+        kept.append(g)
+    return kept, n_files, n_groups
+
+
+def needs_hires_confirm(mad, same_sha, queued, cap=CONFIRM_CAP,
+                        lo=CONFIRM_MAD_LO, hi=4.0):
+    """Whether a Tier A keeper-drop pair should be re-scored at 512 px."""
+    if same_sha or mad is None:
+        return False
+    if queued >= cap:
+        return False
+    return lo < float(mad) <= float(hi)
+
+
+def inventory_abspath(root, rel):
+    """Join the inventory root to a stored relative path.
+
+    Records use '/' even on Windows so inventories move between OSes.
+    Split on '/' then os.path.join, the same rule the recycler uses. A
+    naive join of the raw string would keep forward slashes as one
+    component on Windows. '..' is refused so a stored path cannot walk
+    out of the scan root.
+    """
+    rel = (rel or '').replace('\\', '/')
+    parts = [p for p in rel.split('/') if p and p != '.']
+    if not parts or any(p == '..' for p in parts):
+        return None
+    if root:
+        return os.path.join(root, *parts)
+    return os.path.join(*parts)
+
+
+def load_rgb_capped(path, max_side=CONFIRM_PX):
+    """Decode an original to RGB, longest side at most max_side.
+
+    Pillow only: cv2.imread returns None on non-ASCII Windows paths, which
+    is exactly the library this tool is used on. Failures return None so
+    the caller can skip the confirm rather than crash the run. Alpha is
+    composited onto white and 16-bit is rescaled, matching Collect, so a
+    pair that already passed the thumbnail gate is not re-judged on a
+    different flattening.
+    """
+    try:
+        im = Image.open(path)
+    except Exception:
+        return None
+    try:
+        if getattr(im, 'format', None) == 'JPEG':
+            try:
+                im.draft('RGB', (max_side * 2, max_side * 2))
+            except Exception:
+                pass
+        ImageOps.exif_transpose(im, in_place=True)
+        im2 = im
+        if im2.mode in ('I;16', 'I;16L', 'I;16B', 'I;16N'):
+            if im2.mode != 'I;16':
+                im2 = im2.convert('I')
+            im2 = im2.point(lambda v: v * (1 / 257)).convert('L')
+        elif im2.mode in ('I', 'F'):
+            lo, hi = im2.getextrema()
+            if not (abs(lo) < 3.0e38 and abs(hi) < 3.0e38):
+                return None
+            span = (hi - lo) or 1
+            im2 = im2.point(lambda v: (v - lo) * (255.0 / span)).convert('L')
+        if (im2.mode in ('RGBA', 'LA', 'PA', 'La')
+                or 'transparency' in im2.info):
+            if im2.mode == 'La':
+                im2 = im2.convert('LA')
+            rgba = im2 if im2.mode == 'RGBA' else im2.convert('RGBA')
+            bg = Image.new('RGB', rgba.size, (255, 255, 255))
+            bg.paste(rgba, (0, 0), rgba)
+            im2 = bg
+        if im2.mode != 'RGB':
+            im2 = im2.convert('RGB')
+        w, h = im2.size
+        if max(w, h) > max_side:
+            if w >= h:
+                nw, nh = max_side, max(1, int(round(h * max_side / float(w))))
+            else:
+                nh, nw = max_side, max(1, int(round(w * max_side / float(h))))
+            im2 = im2.resize((nw, nh), Image.LANCZOS, reducing_gap=2.0)
+        return np.asarray(im2, dtype=np.uint8)
+    except Exception:
+        return None
+    finally:
+        try:
+            im.close()
+        except Exception:
+            pass
+
+
+def confirm_hires_mad(root, ra, rb, max_side=CONFIRM_PX):
+    """512 px MAD of two original files, or None if either cannot be read."""
+    pa = inventory_abspath(root, ra.get('p'))
+    pb = inventory_abspath(root, rb.get('p'))
+    if not pa or not pb:
+        return None
+    A = load_rgb_capped(pa, max_side)
+    B = load_rgb_capped(pb, max_side)
+    if A is None or B is None:
+        return None
+    if A.shape != B.shape:
+        B = np.asarray(Image.fromarray(B).resize(
+            (A.shape[1], A.shape[0]), Image.LANCZOS), dtype=np.uint8)
+    return absdiff_mean(A, B)
+
+
+def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
+                         cap=CONFIRM_CAP):
+    """Re-score borderline keeper-drop pairs at 512 px.
+
+    Only pairs that matched the keeper (so they would be pre-marked X),
+    are not byte-identical, and sit in (2, gate] at thumbnail size.
+    Failures are demoted to review. Unreadable originals are left in
+    Tier A: the thumbnail already passed two gates, and the recycler
+    will refuse if the file is gone or has changed.
+
+    Returns (new_tier_a, demoted_pairs, n_checked, n_capped).
+    """
+    demoted = []
+    checked = 0
+    capped = 0
+    new_a = []
+    if not root or not tier_a:
+        return tier_a, demoted, checked, capped
+    for k, drops, members in tier_a:
+        keep_drops = []
+        gone = set()
+        for d in drops:
+            if recs[k].get('sha') == recs[d].get('sha'):
+                keep_drops.append(d)
+                continue
+            if (k, d) not in a_edges and (d, k) not in a_edges:
+                keep_drops.append(d)
+                continue
+            mad = mad_of(k, d)
+            if not needs_hires_confirm(mad, False, checked, cap=cap, hi=gate):
+                if (mad is not None and checked >= cap
+                        and CONFIRM_MAD_LO < float(mad) <= float(gate)):
+                    capped += 1
+                keep_drops.append(d)
+                continue
+            checked += 1
+            hi = confirm_hires_mad(root, recs[k], recs[d])
+            if hi is None or hi <= gate:
+                keep_drops.append(d)
+            else:
+                gone.add(d)
+                demoted.append((k, d) if k < d else (d, k))
+        if not keep_drops:
+            continue
+        new_members = [m for m in members if m not in gone]
+        new_a.append((k, keep_drops, new_members))
+    return new_a, demoted, checked, capped
+
+
 # ------------------------------------------------------------- invariants --
 class InvariantError(Exception):
     pass
 
 
-def check_invariants(tier_a, tier_b):
-    """tier_a / tier_b: list of (keeper, [drops], [members])."""
+def check_invariants(tier_a, tier_b, tier_c=None):
+    """tier_a / tier_b: list of (keeper, [drops], [members]).
+    tier_c: list of member-lists. No keepers, no drops - weaker evidence,
+    all unmarked. Members must not be Tier A drops (those are stood in
+    for at build time). Overlap with B members is allowed."""
     seen = {}
     keepers = set()
     for tier, name in ((tier_a, 'A'), (tier_b, 'B')):
@@ -1161,6 +1561,12 @@ def check_invariants(tier_a, tier_b):
                 raise InvariantError('tier %s: keeper %r is a candidate elsewhere' % (name, k))
             if not drops:
                 raise InvariantError('tier %s: cluster with no candidates' % name)
+    for members in (tier_c or []):
+        if len(members) < 2:
+            raise InvariantError('tier C: cluster with %d member(s)' % len(members))
+        for i in members:
+            if i in seen and seen[i] == 'A':
+                raise InvariantError('tier C: member %r is a Tier A drop' % i)
     return True
 
 
@@ -1210,7 +1616,7 @@ def build_tier_b(groups, recs, tier_a):
     return tier_b, info_b
 
 
-def build_emission_plan(tier_a, tier_b, recs, info_b=None):
+def build_emission_plan(tier_a, tier_b, recs, info_b=None, tier_c=None):
     """Decide, for every cluster, which members get an EDITABLE line and which
     are only referenced.
 
@@ -1219,6 +1625,9 @@ def build_emission_plan(tier_a, tier_b, recs, info_b=None):
     group's own elected keeper as a free file). Members already editable
     elsewhere become references; a free member still gets its editable
     line here - so the group is shown and reviewable either way.
+
+    tier_c: weaker-evidence member-lists. No suggested keeper is shown;
+    a silent keeper is elected only so last-copy membership has an owner.
 
     A file can legitimately belong to a Tier A cluster (exact duplicates) and
     also to a Tier B cluster (it is the uncropped original of something).
@@ -1237,7 +1646,8 @@ def build_emission_plan(tier_a, tier_b, recs, info_b=None):
     home = {}
     cl_id = 0
     for tier, key in ((tier_a, 'A'), (tier_b, 'B'),
-                      ([(None, [], m) for m in (info_b or [])], 'B')):
+                      ([(None, [], m) for m in (info_b or [])], 'B'),
+                      ([(None, [], m) for m in (tier_c or [])], 'C')):
         for k, drops, members in tier:
             editable = [i for i in members if i not in home]
             refs = [i for i in members if i in home]
@@ -1556,6 +1966,54 @@ def self_test():
     print('  [%s] a group of drops from one Tier A cluster stays collapsed'
           % ('PASS' if ib5 == [] else 'FAIL'))
     ok = ok and ib5 == []
+
+    # Tier C: no suggested keeper, no drops, still a cluster of >= 2.
+    recs_c = [{'w': 10, 'h': 10, 'b': 10, 'qsum': 1} for _ in range(4)]
+    try:
+        check_invariants([], [], [[0, 1]])
+        c_inv = True
+    except (InvariantError, TypeError):
+        c_inv = False
+    try:
+        check_invariants([], [], [[0]])
+        c_one = False
+    except InvariantError:
+        c_one = True
+    except TypeError:
+        c_one = False
+    try:
+        tc_stand = build_tier_c([[1, 3]], recs4, ta4, [])
+        stand_c = tc_stand == [[0, 3]]
+        plan_c, hm_c = build_emission_plan([], [], recs_c, tier_c=[[0, 1]])
+        c_keys = [k for _, k, _, _, _ in plan_c]
+        c_ed = [e for _, k, _, e, _ in plan_c if k == 'C']
+        c_plan = (c_keys == ['C'] and c_ed and sorted(c_ed[0]) == [0, 1]
+                  and plan_c[0][2] in (0, 1))
+        check_emission(plan_c, hm_c)
+        c_em = True
+    except (InvariantError, TypeError, NameError):
+        stand_c = False
+        c_plan = False
+        c_em = False
+    print('  [%s] Tier C has no drops, stands in for A-drops, one editable home'
+          % ('PASS' if c_inv and c_one and stand_c and c_plan and c_em else 'FAIL'))
+    ok = ok and c_inv and c_one and stand_c and c_plan and c_em
+    try:
+        # A chain of 20 weak C edges is one connected component. That is how
+        # 1233 different photos of the same subject became one cluster.
+        kept, n_f, n_g = cap_c_groups(
+            [list(range(20)), [20, 21], list(range(22, 25))])
+        cap_ok = (sorted(map(tuple, kept)) == sorted([(20, 21), (22, 23, 24)])
+                  and n_f == 20 and n_g == 1)
+        at_cap = cap_c_groups([list(range(C_CLUSTER_MAX))]) == (
+            [list(range(C_CLUSTER_MAX))], 0, 0)
+        over = cap_c_groups([list(range(C_CLUSTER_MAX + 1))]) == ([], C_CLUSTER_MAX + 1, 1)
+        print('  [%s] oversized Tier C components are omitted, small ones kept'
+              % ('PASS' if cap_ok and at_cap and over else 'FAIL'))
+        ok = ok and cap_ok and at_cap and over
+    except Exception as exc:
+        print('  [FAIL] Tier C size cap: %s: %s' % (type(exc).__name__, exc))
+        ok = False
 
     print('  [%s] chained pairs collapse into one cluster of %d'
           % ('PASS' if grp == [[1, 2, 3]] else 'FAIL', len(grp[0]) if grp else 0))
@@ -1942,6 +2400,265 @@ def self_test():
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # Admission helpers: CLIP-only shortcut, generation-text veto, predicted
+    # NCC scale, bounded 512 px confirm. These are the decision rules, so
+    # they get cases of their own rather than only being hit by a later
+    # library run.
+    try:
+        # generation text: silence or a one-sided dict is not a conflict;
+        # a shared key with different values is.
+        t_none = not generation_params_conflict({}, {'txt': {'prompt': 'a'}})
+        t_empty = not generation_params_conflict({'txt': {}}, {'txt': {'prompt': 'a'}})
+        t_same = not generation_params_conflict(
+            {'txt': {'prompt': 'cat', 'parameters': 'seed=1'}},
+            {'txt': {'Prompt': 'cat', 'parameters': 'seed=1'}})
+        t_diff = generation_params_conflict(
+            {'txt': {'prompt': 'cat', 'parameters': 'seed=1'}},
+            {'txt': {'prompt': 'cat', 'parameters': 'seed=2'}})
+        print('  [%s] generation text conflicts only when a shared key differs'
+              % ('PASS' if t_none and t_empty and t_same and t_diff else 'FAIL'))
+        ok = ok and t_none and t_empty and t_same and t_diff
+    except Exception as exc:
+        print('  [FAIL] generation text: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        rec = {'txt': {'prompt': 'same'}}
+        # MAD 8 + cosine 0.996 is the leftover near-dup shortcut.
+        a_ok = clip_only_admit(8.0, 0.996)
+        # high MAD is the same-genre leak
+        a_mad = not clip_only_admit(60.0, 0.996)
+        # under the cosine floor
+        a_cos = not clip_only_admit(8.0, 0.99)
+        # screenshot pocket
+        a_den = not clip_only_admit(8.0, 0.996, dense_i=True)
+        # different seeds, same prompt
+        a_txt = not clip_only_admit(8.0, 0.996, rec_i=rec,
+                                    rec_j={'txt': {'prompt': 'other'}})
+        a_txt_ok = clip_only_admit(8.0, 0.996, rec_i=rec, rec_j=rec)
+        print('  [%s] CLIP-only admission needs low MAD, no dense pocket, agreeing text'
+              % ('PASS' if a_ok and a_mad and a_cos and a_den and a_txt and a_txt_ok
+                 else 'FAIL'))
+        ok = ok and a_ok and a_mad and a_cos and a_den and a_txt and a_txt_ok
+    except Exception as exc:
+        print('  [FAIL] CLIP-only admit: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # Dense screenshot chrome or two near-black thumbs: NCC at the B
+        # crop gate (0.90) is matching UI chrome / noise. C now needs a
+        # tighter containment (0.95). A clean NCC pass, a dead-zone, and a
+        # CLIP-only shortcut stay in B. A CLIP-strong miss needs 0.97:
+        # 0.94-0.96 is same-subject different photos. Cosine at the 0.90
+        # neighbour floor with a miss is dropped.
+        w_den = weaker_review(True, False, 80.0, 80.0)
+        w_dark = weaker_review(False, False, 5.0, 8.0)
+        w_one = not weaker_review(False, False, 5.0, 80.0)
+        w_ok = not weaker_review(False, False, 80.0, 80.0)
+        lane_b = review_lane(0.93, 0.92) == 'B'
+        lane_c_ncc = review_lane(0.96, 0.92, dense_i=True) == 'C'
+        lane_c_ncc_lo = review_lane(0.93, 0.92, dense_i=True) is None
+        lane_c_miss = review_lane(0.5, 0.975) == 'C'
+        lane_c_miss_lo = review_lane(0.5, 0.95) is None
+        lane_drop = review_lane(0.5, 0.91) is None
+        lane_dead = review_lane(0.5, 0.5, dead_zone=True) == 'B'
+        lane_clip = review_lane(0.5, 0.996, clip_only=True) == 'B'
+        empty = not scan_has_output([], [])
+        c_only = scan_has_output([], [], tier_c=[[0, 1]])
+        a_only = scan_has_output([(0, [1], [0, 1])], [])
+        print('  [%s] weaker-evidence lane: dense/dark/CLIP-miss to C, rest B or drop'
+              % ('PASS' if (w_den and w_dark and w_one and w_ok and lane_b
+                            and lane_c_ncc and lane_c_ncc_lo and lane_c_miss
+                            and lane_c_miss_lo and lane_drop and lane_dead
+                            and lane_clip and empty and c_only and a_only)
+                 else 'FAIL'))
+        ok = ok and w_den and w_dark and w_one and w_ok and lane_b and lane_c_ncc \
+            and lane_c_ncc_lo and lane_c_miss and lane_c_miss_lo and lane_drop \
+            and lane_dead and lane_clip and empty and c_only and a_only
+    except Exception as exc:
+        print('  [FAIL] weaker-evidence lane: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # 128x128 inside 128x72: s=1.0 does not fit; the geometric fit is 0.5625
+        scales = ncc_scale_list((72, 128), (128, 128))
+        th0, tw0 = int(128 * scales[0]), int(128 * scales[0])
+        fits = th0 <= 72 and tw0 <= 128
+        first_is_fit = abs(scales[0] - 72.0 / 128.0) < 1e-9
+        no_oversize = all(int(128 * s) <= 72 for s in scales)
+        print('  [%s] predicted NCC scale is s_max, not an oversize grid step'
+              % ('PASS' if scales and fits and first_is_fit and no_oversize else 'FAIL'))
+        ok = ok and scales and fits and first_is_fit and no_oversize
+    except Exception as exc:
+        print('  [FAIL] predicted scale: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        n_lo = needs_ncc_confirm(0.85)
+        n_hi = not needs_ncc_confirm(0.90)
+        n_far = not needs_ncc_confirm(0.84)
+        n_none = not needs_ncc_confirm(None)
+        q, sk = ncc_confirm_queue({
+            (0, 1): 0.89, (0, 2): 0.81, (0, 3): 0.50, (0, 4): 0.91,
+            (0, 5): 0.88, (0, 6): 0.86,
+        }, cap=2)
+        # closest to the gate first: 0.89 then 0.88; 0.86 is the skip,
+        # 0.81 is below the band
+        q_ok = q == [(0, 1), (0, 5)] and sk == 1
+        print('  [%s] 128 px crop confirm is only for 64 px near-misses, closest first'
+              % ('PASS' if n_lo and n_hi and n_far and n_none and q_ok else 'FAIL'))
+        ok = ok and n_lo and n_hi and n_far and n_none and q_ok
+    except Exception as exc:
+        print('  [FAIL] ncc confirm gate: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        rng = np.random.default_rng(31)
+        canvas = rng.integers(20, 220, (128, 128, 3), dtype=np.uint8)
+        m = 13
+        crop = np.ascontiguousarray(canvas[m:128 - m, m:128 - m])
+        recs_n = []
+        for name, arr in (('canvas', canvas), ('crop', crop)):
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, 'PNG')
+            recs_n.append({'p': name + '.png', 'b': 100, 'sha': name[0] * 64,
+                           'w': arr.shape[1], 'h': arr.shape[0],
+                           'tw': arr.shape[1], 'th': arr.shape[0],
+                           'tb': base64.b64encode(buf.getvalue()).decode('ascii')})
+        TH_n = ThumbStore(recs_n, workers=2)
+        g64 = gray_small(TH_n, 0, 64)
+        g128 = gray_small(TH_n, 0, 128)
+        sizes = max(g64.shape) <= 64 and max(g128.shape) >= max(g64.shape)
+        lo = compute_nccs(TH_n, [(0, 1)], 2, procs=0, max_side=64).get((0, 1), 0.0)
+        hi = compute_nccs(TH_n, [(0, 1)], 2, procs=0, max_side=128).get((0, 1), 0.0)
+        nccs_n = {(0, 1): lo}
+        apply_ncc_confirms(nccs_n, TH_n, 2)
+        # retry only raises; a score already at 128 is left alone
+        raised = nccs_n[(0, 1)] >= lo - 1e-9
+        print('  [%s] 128 px crop retry never lowers the 64 px score'
+              % ('PASS' if sizes and raised else 'FAIL'))
+        ok = ok and sizes and raised
+    except Exception as exc:
+        print('  [FAIL] 128 px crop retry: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # SHA twins and obvious re-saves (MAD <= 2) skip the extra decode.
+        # The cap bites before a 9k-drop library becomes a second Collect.
+        n1 = needs_hires_confirm(3.2, same_sha=False, queued=0)
+        n_sha = not needs_hires_confirm(3.2, same_sha=True, queued=0)
+        n_lo = not needs_hires_confirm(1.0, same_sha=False, queued=0)
+        n_hi = not needs_hires_confirm(4.1, same_sha=False, queued=0)
+        n_cap = not needs_hires_confirm(3.2, same_sha=False, queued=CONFIRM_CAP)
+        print('  [%s] 512 px confirm is bounded to borderline non-exact pairs'
+              % ('PASS' if n1 and n_sha and n_lo and n_hi and n_cap else 'FAIL'))
+        ok = ok and n1 and n_sha and n_lo and n_hi and n_cap
+    except Exception as exc:
+        print('  [FAIL] hires confirm gate: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        import shutil as _shc
+        import tempfile as _tfc
+        td = _tfc.mkdtemp()
+        # Non-ASCII component: cv2.imread returns None on these on Windows.
+        # Pillow must still open them, or the confirm would silently skip
+        # every CJK/Cyrillic folder.
+        sub = os.path.join(td, 'фото')
+        os.mkdir(sub)
+        pa = os.path.join(sub, 'a.png')
+        pb = os.path.join(sub, 'b.png')
+        pc = os.path.join(sub, 'c.png')
+        Image.fromarray(np.zeros((80, 80, 3), np.uint8)).save(pa)
+        Image.fromarray(np.full((80, 80, 3), 3, np.uint8)).save(pb)
+        Image.fromarray(np.full((80, 80, 3), 40, np.uint8)).save(pc)
+        Aa = load_rgb_capped(pa, 512)
+        Bb = load_rgb_capped(pb, 512)
+        opened = (Aa is not None and Bb is not None
+                  and Aa.shape[0] <= 512 and Aa.shape[1] <= 512)
+        rel_a = 'фото/a.png'
+        rel_b = 'фото/b.png'
+        rel_c = 'фото/c.png'
+        built = (inventory_abspath(td, rel_a) == pa
+                 and inventory_abspath(td, rel_b) == pb)
+        no_walk = inventory_abspath(td, '../x.png') is None
+        rec_a = {'p': rel_a, 'sha': 'a' * 64}
+        rec_b = {'p': rel_b, 'sha': 'b' * 64}
+        rec_c = {'p': rel_c, 'sha': 'c' * 64}
+        m = confirm_hires_mad(td, rec_a, rec_b)
+        # two flats 3 levels apart: MAD is 3.0 at any resolution
+        mad_ok = m is not None and abs(m - 3.0) < 0.05
+        recs_h = [rec_a, rec_c]
+        # thumbnail claimed 3.2 (inside the A gate); the files are 40 apart
+        ta_h, dem_h, nchk, _nc = apply_hires_confirms(
+            [(0, [1], [0, 1])], recs_h, td,
+            lambda i, j: 3.2, {(0, 1), (1, 0)}, 4.0)
+        demoted_ok = nchk == 1 and dem_h == [(0, 1)] and ta_h == []
+        print('  [%s] 512 px confirm opens Unicode paths and demotes a mismatch'
+              % ('PASS' if opened and built and no_walk and mad_ok and demoted_ok
+                 else 'FAIL'))
+        ok = ok and opened and built and no_walk and mad_ok and demoted_ok
+        _shc.rmtree(td, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] 512 px confirm IO: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        import shutil as _shw
+        import tempfile as _tfw
+        tdw = _tfw.mkdtemp()
+        buf = io.BytesIO()
+        Image.new('RGB', (8, 8), (30, 30, 40)).save(buf, 'JPEG', quality=70)
+        tbw = base64.b64encode(buf.getvalue()).decode('ascii')
+        recs_w = [
+            {'p': 'weak-a.png', 'b': 100, 'sha': 'a' * 64, 'w': 40, 'h': 40,
+             'tb': tbw},
+            {'p': 'weak-b.png', 'b': 90, 'sha': 'b' * 64, 'w': 40, 'h': 40,
+             'tb': tbw},
+        ]
+        _nw, Lw, atw, sgw, allw = write_list_and_script(
+            os.path.join(tdw, 'l.txt'), os.path.join(tdw, 'R.py'),
+            os.path.join(tdw, 'R.bat'), os.path.join(tdw, 'R.sh'),
+            recs_w, [], [], tdw, tier_c=[[0, 1]])
+        marks_w = {}
+        keeper_w = False
+        weak_w = False
+        for ln in Lw:
+            if 'weaker evidence' in ln.lower():
+                weak_w = True
+            if len(ln) > 3 and ln[0] in 'X.' and ln[1:3] == '  ':
+                marks_w[ln[3:].split('   ')[0]] = ln[0]
+                if 'suggested keeper' in ln:
+                    keeper_w = True
+        all_dot = marks_w == {'weak-a.png': '.', 'weak-b.png': '.'}
+        no_sugg = not sgw and not allw
+        plw, hmw = build_emission_plan([], [], recs_w, tier_c=[[0, 1]])
+        stats_w = {'n': 2, 'exact': 0, 'headline': 'tier c', 'method': 'test'}
+        html_w = os.path.join(tdw, 'r.html')
+        write_report(html_w, recs_w, [], [], tdw, stats_w, plw, hmw,
+                     list_lines=Lw, editable_at=atw, suggested_b=sgw,
+                     tier_b_all=allw, list_name='l.txt', tier_c=[[0, 1]])
+        page = open(html_w, encoding='utf-8').read()
+        page_ok = (
+            'WEAKER EVIDENCE' in page
+            and 'Mark all Tier C' not in page
+            and '<div class="lb">KEEP</div>' not in page
+            and 'No duplicates found' not in page
+            and 'weak-a.png' in page and 'weak-b.png' in page
+            and 'last copy' in page
+        )
+        print('  [%s] Tier C list is all dots, no suggested keeper, weaker label'
+              % ('PASS' if all_dot and not keeper_w and weak_w and no_sugg
+                 else 'FAIL'))
+        ok = ok and all_dot and not keeper_w and weak_w and no_sugg
+        print('  [%s] Tier C report shows weaker evidence, no KEEP, last-copy rule'
+              % ('PASS' if page_ok else 'FAIL'))
+        ok = ok and page_ok
+        _shw.rmtree(tdw, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] Tier C list/report: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
     # fallback suite away the moment anything above it failed
@@ -1978,7 +2695,7 @@ def small_b64(rec, maxw=150):
 def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                  list_lines=None, editable_at=None, suggested_b=None,
                  tier_b_all=None, list_name=None, b_edges=None,
-                 a_edges=None):
+                 a_edges=None, tier_c=None, c_edges=None):
     def mb(x):
         return '%.2f MB' % (x / 1048576.0)
 
@@ -2008,7 +2725,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
       ':root{color-scheme:dark;'
       '--bg:#0f1116;--panel:#171a21;--panel2:#1c202a;'
       '--ink:#e7e9ef;--dim:#99a1b3;--line:#2a2f3a;'
-      '--keep:#3ddc97;--drop:#ff7a7a;--rev:#f0b64b;--ref:#6f7787}'
+      '--keep:#3ddc97;--drop:#ff7a7a;--rev:#f0b64b;--weak:#8aa4c8;--ref:#6f7787}'
       '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);'
       'font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;'
       '-webkit-font-smoothing:antialiased}'
@@ -2030,7 +2747,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
       '.it img{width:150px;border-radius:6px;border:3px solid transparent;display:block;'
       'background:#20242d}'
       '.it.k img{border-color:var(--keep)}.it.d img{border-color:var(--drop)}'
-      '.it.n img{border-color:var(--rev)}.it.r img{border-color:var(--ref);opacity:.55}'
+      '.it.n img{border-color:var(--rev)}.it.w img{border-color:var(--weak)}'
+      '.it.r img{border-color:var(--ref);opacity:.55}'
       '.it.r .lb{color:var(--dim)}'
       '.it.x img{border-color:#7d6a9e;border-style:dashed}'
       '.it.x .lb{color:#b3a0d4}'
@@ -2041,7 +2759,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
       '.cnt{color:var(--dim);font-weight:400}'
       '.cl:target{box-shadow:0 0 0 3px #5b7cfa55;border-color:#5b7cfa}'
       '.lb{font:700 9.5px/1.6 ui-sans-serif;letter-spacing:.05em;margin-top:5px}'
-      '.it.k .lb{color:var(--keep)}.it.d .lb{color:var(--drop)}.it.n .lb{color:var(--rev)}'
+      '.it.k .lb{color:var(--keep)}.it.d .lb{color:var(--drop)}'
+      '.it.n .lb{color:var(--rev)}.it.w .lb{color:var(--weak)}'
       '.fn{font:10.5px/1.35 ui-monospace,Menlo,Consolas,monospace;color:var(--dim);'
       'word-break:break-all;margin-top:3px}'
       'footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);'
@@ -2087,8 +2806,9 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
           'Nothing is deleted here: download the list, save it beside the images, '
           'and run the recycler. Any copy can be marked, including the suggested '
           'keeper &mdash; the last remaining copy in a cluster cannot, so a group '
-          'is never emptied.</p>')
-    if not tier_a and not tier_b:
+          'is never emptied. Tier C is weaker evidence: all unmarked, no suggested '
+          'keeper, still markable one file at a time.</p>')
+    if not tier_a and not tier_b and not (tier_c or []):
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
           'No duplicates found &mdash; every image in this folder is distinct. '
           'No selection list or deletion script was generated.</p>')
@@ -2097,10 +2817,10 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     A('<p class="sub">Cluster numbers match the selection list exactly &mdash; '
       'search the .txt for <code>cluster 91</code> to find the same group. '
       'Click a number to link straight to it.</p>')
-    plan_by_key = {'A': [], 'B': []}
+    plan_by_key = {'A': [], 'B': [], 'C': []}
     if plan:
         for cl_id, key, keeper, editable, refs in plan:
-            plan_by_key[key].append((cl_id, keeper, editable, refs))
+            plan_by_key.setdefault(key, []).append((cl_id, keeper, editable, refs))
 
     def shown_drops(key, tier):
         """How many files this tier actually offers HERE.
@@ -2109,7 +2829,14 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
         is already editable in a Tier A cluster is shown as a reference and
         cannot be marked here, so counting relations promised more to review
         than the page contains. It also has to agree with the review bar,
-        which can only touch what it renders."""
+        which can only touch what it renders.
+
+        Tier C has no suggested keeper, so every editable member counts.
+        """
+        if key == 'C':
+            if not plan:
+                return sum(len(m) for m in (tier or []))
+            return sum(len(ed) for _c, _kp, ed, _r in plan_by_key[key])
         if not plan:
             return sum(len(d) for _, d, _ in tier)
         return sum(len([m for m in ed if m != kp])
@@ -2121,7 +2848,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                  ('%d' % len(tier_a), 'duplicate clusters'),
                  ('%d' % dn, 'droppable files'),
                  (mb(db), 'reclaimable'),
-                 ('%d' % shown_drops('B', tier_b), 'crop / variant to review')):
+                 ('%d' % shown_drops('B', tier_b), 'crop / variant to review'),
+                 ('%d' % shown_drops('C', tier_c), 'weaker-evidence to review')):
         A('<div class="stat"><b>%s</b><span>%s</span></div>' % (b, s))
     A('</div>')
 
@@ -2141,15 +2869,26 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
              '<b style="color:var(--rev)">REVIEW</b> matched the keeper directly; '
              '<b style="color:#b3a0d4">LINKED</b> (dashed) matched another member '
              'instead, so it is in this group by a chain and may have little to do '
-             'with the keeper.')):
-        groups = plan_by_key[key] if plan else [
-            (None, k, [k] + drops, []) for k, drops, members in tier]
+             'with the keeper.'),
+            (tier_c or [], 'C', '#8aa4c8', '#1a2230', 'WEAKER EVIDENCE',
+             'CLIP still thinks these are related, but the pixel evidence is weaker: '
+             'NCC in a dense screenshot pocket or on near-black thumbs, or a high '
+             'cosine with no crop confirm. Nothing is pre-marked and there is '
+             '<b>no suggested keeper</b>. You may still mark <code>X</code> to recycle; '
+             'the last remaining copy in a cluster cannot.')):
+        if plan:
+            groups = plan_by_key.get(key, [])
+        elif key == 'C':
+            groups = [(None, None, list(m), []) for m in (tier or [])]
+        else:
+            groups = [(None, k, [k] + drops, []) for k, drops, members in tier]
         if not groups:
             continue
         A('<h2><span class="pill" style="color:%s;background:%s">TIER %s &middot; %s</span> '
           '<span style="color:var(--dim);font-weight:400;font-size:15px">%d clusters &middot; '
-          '%d candidates</span></h2>' % (colour, bg, key, title, len(groups),
-                                         shown_drops(key, tier)))
+          '%d %s</span></h2>' % (colour, bg, key, title, len(groups),
+                                 shown_drops(key, tier),
+                                 'files' if key == 'C' else 'candidates'))
         A('<p class="lead">%s</p>' % lead)
         for cl_id, keeper, editable, refs in groups:
             members = editable + refs
@@ -2167,8 +2906,9 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             # the recycler enforces too. Pinning the keeper instead meant
             # that preferring the other copy could not be expressed here at
             # all, and the whole point of the list is that the choice is
-            # yours.
-            if keeper is not None:
+            # yours. Tier C has no suggested keeper at all: every tile is
+            # the same weaker-evidence review mark.
+            if key != 'C' and keeper is not None:
                 krel = recs[keeper]['p']
                 ktog = ''
                 if live and krel in (editable_at or {}):
@@ -2181,23 +2921,30 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                   % ((' data-p="%s"' % esc(krel)) if ktog else '',
                      (' data-cl="%s"' % cl_id) if ktog else '',
                      small_b64(recs[keeper]), meta(keeper), esc(krel[:44]), ktog))
-            for d in [m for m in editable if m != keeper]:
-                cls = 'd' if key == 'A' else 'n'
-                lab = 'DROP' if key == 'A' else 'REVIEW'
-                on = ' on' if key == 'A' else ''
+            shown_ed = list(editable) if key == 'C' else [
+                m for m in editable if m != keeper]
+            for d in shown_ed:
+                if key == 'C':
+                    cls, lab, on = 'w', 'WEAKER', ''
+                else:
+                    cls = 'd' if key == 'A' else 'n'
+                    lab = 'DROP' if key == 'A' else 'REVIEW'
+                    on = ' on' if key == 'A' else ''
                 # A review cluster is a connected component, so a member can
                 # be here because it matches the keeper, or because it
                 # matches something that matches the keeper. Those are very
                 # different claims and the report used to make them look
                 # identical - which is how an eighteen-file cluster of
                 # unrelated screenshots reads as a bug rather than as a
-                # chain. Say which is which.
-                _edges = b_edges if key == 'B' else a_edges
-                if (_edges is not None and keeper is not None
-                        and (keeper, d) not in _edges):
-                    cls, lab = 'x', 'LINKED'
-                    if key == 'A':
-                        on = ''          # chained: not pre-marked any more
+                # chain. Say which is which. Tier C does not elect a keeper,
+                # so it does not split WEAKER vs LINKED on that axis.
+                if key != 'C':
+                    _edges = b_edges if key == 'B' else a_edges
+                    if (_edges is not None and keeper is not None
+                            and (keeper, d) not in _edges):
+                        cls, lab = 'x', 'LINKED'
+                        if key == 'A':
+                            on = ''          # chained: not pre-marked any more
                 rel = recs[d]['p']
                 tog = ''
                 if live and rel in (editable_at or {}):
@@ -2335,7 +3082,7 @@ paint();
 
 def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                           tier_a, tier_b, root, info_b=None, b_edges=None,
-                          a_edges=None):
+                          a_edges=None, tier_c=None, c_edges=None):
     """Writes the list and the three recyclers.
 
     Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
@@ -2347,12 +3094,14 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
       suggested_b   Tier B paths this scan would have marked, had Tier B
                     been the sort of match that may be acted on unreviewed
     """
-    def info(i, keeper, linked=False):
+    def info(i, keeper, linked=False, weaker=False):
         r = recs[i]
         t = '%dx%d, %.2f MB' % (shown_dims(r) + (r['b'] / 1048576.0,))
         if 'qsum' in r:
             t += ', q%d' % r['qsum']
-        if keeper:
+        if weaker:
+            t += ' - weaker evidence'
+        elif keeper:
             t += ' - suggested keeper'
         elif linked:
             # It is in this cluster through another member, not through the
@@ -2361,7 +3110,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             t += ' - linked via another file, not the keeper'
         return t
 
-    plan, home = build_emission_plan(tier_a, tier_b, recs, info_b)
+    plan, home = build_emission_plan(tier_a, tier_b, recs, info_b, tier_c)
     check_emission(plan, home)
     # Real Tier B clusters carry suggested drops; info_b groups carry none,
     # and the plan cannot tell them apart because both use key 'B'. So take
@@ -2392,13 +3141,20 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
          '#',
          '#  TIER A: suggested keeper pre-set to ".", the rest to X.',
          '#  TIER B: everything pre-set to "." - review in the HTML report first.',
+         '#  TIER C: weaker evidence. Everything pre-set to "." - no suggested',
+         '#          keeper. You may still mark X. The last remaining copy in',
+         '#          a cluster cannot be deleted.',
          '# ' + '=' * 74]
     rows = []
     last_key = None
     for cl_id, key, keeper, editable, refs in plan:
         if key != last_key:
-            head = ('TIER A  -  DUPLICATE' if key == 'A'
-                    else 'TIER B  -  CROP / VARIANT  (review first)')
+            if key == 'A':
+                head = 'TIER A  -  DUPLICATE'
+            elif key == 'C':
+                head = 'TIER C  -  WEAKER EVIDENCE  (no suggested keeper)'
+            else:
+                head = 'TIER B  -  CROP / VARIANT  (review first)'
             L += ['', '# ' + '=' * 74, '#  ' + head, '# ' + '=' * 74]
             last_key = key
         members = editable + refs
@@ -2411,7 +3167,8 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                      ' editable in another cluster)')
         for i in refs:
             L.append('#  also in cluster %d (edit it there): %s   [%s]'
-                     % (home[i], list_safe(recs[i]['p']), info(i, False)))
+                     % (home[i], list_safe(recs[i]['p']),
+                        info(i, False, weaker=(key == 'C'))))
             if editable:
                 # reference rows exist so the recycler can count them as
                 # witnesses; a reference-only cluster has nothing to delete,
@@ -2420,9 +3177,10 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                              'sha': recs[i]['sha'], 'cl': cl_id, 'home': home[i],
                              't': key})
         for i in ([keeper] + [m for m in editable if m != keeper] if editable else []):
-            is_keeper = (i == keeper)
-            edges = b_edges if key == 'B' else a_edges
-            linked = (not is_keeper and edges is not None
+            weaker = (key == 'C')
+            is_keeper = (i == keeper) and not weaker
+            edges = (c_edges if key == 'C' else b_edges if key == 'B' else a_edges)
+            linked = (not weaker and not is_keeper and edges is not None
                       and keeper is not None and (keeper, i) not in edges)
             if list_safe(recs[i]['p']) != recs[i]['p']:
                 # A control character in a filename (a newline above all)
@@ -2436,7 +3194,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                 L.append('#  [not editable - name contains control characters;'
                          ' always kept]')
                 L.append('#    %s   [%s]' % (list_safe(recs[i]['p']),
-                                             info(i, is_keeper, linked)))
+                                             info(i, is_keeper, linked, weaker)))
                 mark = None
             else:
                 # A Tier A member that never matched the KEEPER is not
@@ -2452,10 +3210,12 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                 # that recommendation about a file the keeper never matched
                 # is the exact failure this tool exists to avoid, so those
                 # members stay in the cluster, stay visible, and stay on "."
-                # until a human says otherwise.
-                mark = '.' if (is_keeper or key == 'B' or linked) else 'X'
+                # until a human says otherwise. Tier C is weaker evidence:
+                # all ".", no suggested keeper.
+                mark = '.' if (is_keeper or key in ('B', 'C') or linked) else 'X'
                 L.append('%s  %s   [%s]'
-                         % (mark, recs[i]['p'], info(i, is_keeper, linked)))
+                         % (mark, recs[i]['p'],
+                            info(i, is_keeper, linked, weaker)))
                 editable_at[recs[i]['p']] = len(L) - 1
             # A file with control characters in its name gets NO editable
             # line, and the list says of it "always kept". Flagging it as a
@@ -3152,6 +3912,7 @@ def main():
                       'for rotated / mirrored saves' % len(orient_cand))
     used_clip = False
     has_vec = None
+    dense = np.zeros(n, dtype=bool)
     if vec is not None:
         dim0 = next(iter(vec.values())).shape[0]
         zero = np.zeros(dim0, dtype=np.float32)
@@ -3189,6 +3950,7 @@ def main():
             Sb[np.arange(b - a), rows] = -1.0        # never its own neighbour
             idx1 = np.argpartition(Sb, -kk1, axis=1)[:, -kk1:]
             vals1 = np.take_along_axis(Sb, idx1, axis=1)
+            dense[a:b] = (vals1 >= 0.90).sum(axis=1) >= kk
             if kk1 > kk:
                 drop = np.argmin(vals1, axis=1)      # the (K+1)-th nearest
                 capped += int((vals1[np.arange(b - a), drop] >= 0.90).sum())
@@ -3257,11 +4019,19 @@ def main():
         c = cos_of(i, j)
         if (m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos):
             continue
-        if m > args.tier_b_mad and not (c is not None and c >= 0.995) \
+        shortcut = clip_only_admit(m, c, dense[i], dense[j], recs[i], recs[j])
+        if m > args.tier_b_mad and not shortcut \
                 and (c is None or c >= args.tier_b_cos):
             need_ncc.append((i, j))
     phase('Crop matching on %d pair(s) ...' % len(need_ncc))
     nccs = compute_nccs(TH, need_ncc, workers)
+    if nccs and _HAVE_CV2:
+        nccs, n_retry, n_gain, n_skip = apply_ncc_confirms(nccs, TH, workers)
+        if n_retry or n_skip or n_gain:
+            print('  128 px crop confirm: %d pair(s) retried, %d crossed the gate%s'
+                  % (n_retry, n_gain,
+                     ', %d skipped (cap %d)' % (n_skip, NCC_CONFIRM_CAP)
+                     if n_skip else ''))
 
     # The colour and orientation questions are expensive per pair (a resample
     # each, eight for orientation), so they are asked ONLY of pairs that
@@ -3271,8 +4041,11 @@ def main():
     uf_a = UF()
     a_edges = set()          # which Tier A members actually matched EACH OTHER
     tierb_pairs = []
+    tierc_pairs = []
     fallback = []
     dead_zone = oriented = 0
+    rec601 = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    sig_luma = (C.reshape(len(C), 64, 3) @ rec601).mean(1)
     for t, (i, j) in enumerate(cand):
         m = mads[t]
         c = cos_of(i, j)
@@ -3297,18 +4070,28 @@ def main():
             # high baseline (random pairs here average ~0.76), so structural
             # containment alone admits same-prompt re-rolls that are simply
             # different pictures. Require decent semantic agreement too.
-            if c is not None and c >= 0.995:
+            if clip_only_admit(m, c, dense[i], dense[j], recs[i], recs[j]):
                 tierb_pairs.append((i, j))
             # 0.90, not the old 0.92. Measured with the grid above on 150
             # real images: an 80% crop goes from 84% accepted to 91%, an 85%
             # crop 96% -> 98%, a 90% crop 97% -> 100%. Unrelated pairs top
             # out at 0.816 over 296 samples, so the margin is still 0.084 -
-            # and this gate feeds Tier B, which is never deleted without
-            # review, so its failure mode is an extra line to look at.
+            # and this gate feeds review, which is never deleted without a
+            # look, so its failure mode is an extra line to look at.
             # 0.85 was tried and rejected: it adds 399 review candidates on
             # a 36k library to catch crops the grid fix already gets.
+            # Dense/dark NCC at 0.90 is chrome; review_lane only sends those
+            # to C at C_NCC_GATE (0.95).
             elif (c is None or c >= args.tier_b_cos) and nccs.get((i, j), 0.0) >= 0.90:
-                tierb_pairs.append((i, j))
+                lane = review_lane(nccs.get((i, j), 0.0), c,
+                                   bool(dense[i]), bool(dense[j]),
+                                   float(sig_luma[i]), float(sig_luma[j]))
+                if lane == 'B':
+                    tierb_pairs.append((i, j))
+                elif lane == 'C':
+                    tierc_pairs.append((i, j))
+                else:
+                    fallback.append((i, j))
             else:
                 fallback.append((i, j))
 
@@ -3363,16 +4146,27 @@ def main():
     phase('Orientation check on %d of %d pair(s) (coarse prefilter) ...'
           % (len(orient_list), len(still)))
     omads = {} if args.no_orient else compute_oriented_mads(TH, orient_list, workers)
+    leftover = []
     for p in still:
         if omads.get(p, (255.0, ''))[0] <= args.tier_a_mad:
             tierb_pairs.append(p)                   # rotated / mirrored save
             oriented += 1
+        else:
+            leftover.append(p)
+    # CLIP still says same picture, crop matching did not, luma/orient did
+    # not. Bounded by CLIP_TIER_C (0.97), not the 0.90 neighbour floor.
+    for i, j in leftover:
+        if review_lane(nccs.get((i, j), 0.0), cos_of(i, j)) == 'C':
+            tierc_pairs.append((i, j))
 
     if dead_zone:
         print('Pixel-identical but CLIP-vetoed: %d pair(s) sent to review '
               '(they used to be dropped)' % dead_zone)
     if oriented:
         print('Rotated / mirrored copies found: %d pair(s)' % oriented)
+    if tierc_pairs:
+        print('Weaker-evidence pairs (Tier C): %d  (dense/dark NCC or CLIP-strong miss)'
+              % len(tierc_pairs))
 
     # Byte-identical files are duplicates by definition - cluster them even
     # if the sweep or the embeddings could not vouch for them.
@@ -3391,6 +4185,24 @@ def main():
     for members in uf_a.groups():
         k = max(members, key=lambda i: quality_key(recs, i))
         tier_a.append((k, [i for i in members if i != k], members))
+
+    mad_map = {}
+    for t, (i, j) in enumerate(cand):
+        mad_map[(i, j)] = mads[t]
+
+    def mad_of(i, j):
+        return mad_map.get((i, j) if i < j else (j, i))
+
+    phase('Confirming borderline Tier A pairs at %d px ...' % CONFIRM_PX)
+    tier_a, demoted, n_hires, n_cap = apply_hires_confirms(
+        tier_a, recs, root, mad_of, a_edges, args.tier_a_mad)
+    if n_hires or n_cap or demoted:
+        print('  512 px confirm: %d pair(s) checked, %d demoted to review%s'
+              % (n_hires, len(demoted),
+                 ', %d skipped (cap %d)' % (n_cap, CONFIRM_CAP) if n_cap else ''))
+    for p in demoted:
+        tierb_pairs.append(p)
+
     a_drops = set(i for _, d, _ in tier_a for i in d)
     a_keeps = set(k for k, _, _ in tier_a)
 
@@ -3410,10 +4222,25 @@ def main():
     for i, j in tierb_pairs:
         b_edges.add((i, j))
         b_edges.add((j, i))
+    b_seen = set(tierb_pairs)
+    b_seen.update((j, i) for i, j in tierb_pairs)
+    uf_c = UF()
+    c_edges = set()
+    for i, j in tierc_pairs:
+        if (i, j) in b_seen:
+            continue
+        uf_c.union(i, j)
+        c_edges.add((i, j))
+        c_edges.add((j, i))
+    capped_c, c_omit_files, c_omit_groups = cap_c_groups(uf_c.groups())
+    if c_omit_groups:
+        kept_ids = set(i for g in capped_c for i in g)
+        c_edges = set(e for e in c_edges if e[0] in kept_ids and e[1] in kept_ids)
+    tier_c = build_tier_c(capped_c, recs, tier_a, tier_b)
 
     phase('')
     try:
-        check_invariants(tier_a, tier_b)
+        check_invariants(tier_a, tier_b, tier_c)
     except InvariantError as e:
         print('')
         print('  [ABORT] internal consistency check failed: %s' % e)
@@ -3431,6 +4258,12 @@ def main():
           % (len(tier_b), sum(len(d) for _, d, _ in tier_b),
              '  (+%d with no suggested deletions, shown for review)' % len(info_b)
              if info_b else ''))
+    print('Tier C weaker     : %d clusters, %d files (all unmarked, no suggested keeper)'
+          % (len(tier_c), sum(len(m) for m in tier_c)))
+    if c_omit_groups:
+        print('                    omitted %d files in %d oversized cluster(s) '
+              '(weak-edge chaining, cap %d)'
+              % (c_omit_files, c_omit_groups, C_CLUSTER_MAX))
 
     outdir = os.path.dirname(os.path.abspath(inv))
     stem = os.path.basename(inv)[:-len('.jsonl')].replace('image-inventory', 'duplicates')
@@ -3446,7 +4279,7 @@ def main():
     rpy = os.path.join(outdir, rec_name + '.py')
     bat = os.path.join(outdir, rec_name + '.bat')
     sh = os.path.join(outdir, rec_name + '.sh')
-    nothing = (dn == 0 and sum(len(d) for _, d, _ in tier_b) == 0)
+    nothing = not scan_has_output(tier_a, tier_b, info_b, tier_c)
     stats = {'n': n, 'exact': sum(len(v) - 1 for v in exact),
              'headline': ('%d exact duplicates, %d visual clusters.'
                           % (sum(len(v) - 1 for v in exact), len(tier_a))),
@@ -3454,16 +4287,19 @@ def main():
                         'signature%s; survivors re-scored at full thumbnail resolution by '
                         'mean absolute pixel difference. Tier A requires pixel difference '
                         '<= %.1f%s. Tier B is structural similarity with genuinely different '
-                        'pixels, detected by multi-scale template matching.'
+                        'pixels, detected by multi-scale template matching. Tier C is the '
+                        'weaker-evidence remainder: dense/dark NCC matches and CLIP-strong '
+                        'pairs that crop matching did not confirm.'
                         % (n * (n - 1) // 2,
                            ' and independently on CLIP embeddings' if used_clip else '',
                            args.tier_a_mad,
                            ' and CLIP cosine >= %.3f' % args.tier_a_cos if used_clip else ''))}
-    plan, home = build_emission_plan(tier_a, tier_b, recs, info_b)
+    plan, home = build_emission_plan(tier_a, tier_b, recs, info_b, tier_c)
     check_emission(plan, home)
 
     if nothing:
-        write_report(rep, recs, tier_a, tier_b, root, stats, plan, home)
+        write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
+                     tier_c=tier_c, c_edges=c_edges)
         # Writing a selection list and a Recycle-Bin script with an empty
         # manifest is worse than writing nothing: it looks like a loaded tool
         # that silently does nothing, and a stale one from an earlier run is
@@ -3497,12 +4333,12 @@ def main():
     # this project has been bitten by exactly that before.
     nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
         lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges,
-        a_edges)
+        a_edges, tier_c, c_edges)
     write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
                  list_lines=llines, editable_at=editable_at,
                  suggested_b=suggested_b, tier_b_all=tier_b_all,
                  list_name=os.path.basename(lst), b_edges=b_edges,
-                 a_edges=a_edges)
+                 a_edges=a_edges, tier_c=tier_c, c_edges=c_edges)
     print('')
     print('Wrote:')
     for q in (rep, lst, rpy, bat, sh):
