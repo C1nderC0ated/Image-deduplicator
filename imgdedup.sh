@@ -1,6 +1,6 @@
 #!/bin/sh
 # ----------------------------------------------------------------------
-#  imgdedup.sh  -  one launcher for all four stages, on Linux and macOS.
+#  imgdedup.sh  -  one launcher for the five subcommands, on Linux and macOS.
 #
 #  The Windows side has a .bat per stage because they are double-clicked
 #  and dragged onto. A POSIX shell is a different habit: one entry point

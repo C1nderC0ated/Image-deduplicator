@@ -3,7 +3,39 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.4 — 2026-08-14 (current)
+## v4.4.1 — 2026-09-20 (current)
+
+**Setup could pick a PyTorch index with no wheels in it.** Nothing here
+changes a duplicate decision.
+
+- **Index discovery checks for a wheel, not a directory name.**
+  download.pytorch.org now lists `cu134`, which holds only torch 2.0
+  aarch64 wheels, and the newest-name rule chose it on every NVIDIA
+  machine, so the install could not resolve. The newest few candidates
+  are now checked for a torch wheel matching this Python and platform.
+  The offline fallback is `cu132`, not the superseded `cu128`.
+- **Intel and Apple GPUs get the GPU batch size.** `--batch` defaulted to
+  64 only on `cuda`; XPU and MPS ran with 8. `--device` accepts `xpu` and
+  `mps`, so those backends can be forced as well as detected.
+- **`--clip-neighbors` help said default 48.** It is 16, as the README
+  and the docstring already said.
+- **AVIF is not reported as missing a codec when Pillow decodes it
+  natively.** The pre-scan notice and the unreadable-extension hint
+  counted `.avif` with HEIC whenever pillow-heif was absent.
+- **`_why-no-python.bat` reports the `.venv` candidate** that
+  `_pick-python.bat` has probed since the venv step was added.
+- **Docs.** README: thumbnails are JPEG at quality 80 (lossless is the
+  opt-in, since v4.3.3); animations are compared by 25 frames, not five,
+  and the fingerprint is about 6 KB, not 440 characters; the 512 px
+  Tier A confirm and the 1028 crop-retry cap are described; Apple Metal
+  is in the hardware table; the worker floor of 2, the `.venv` probe
+  step, the `_setup.py` flags and the Tier B report buttons are listed;
+  the test section no longer claims a recycler harness that is not in
+  the repository. CONTRIBUTING points at `.benchmarks/agent-control/`.
+- **Dead code.** Two unused sets in `main()`, an unused 128 px NCC call
+  in the self-test, an unused import, a redundant device comparison.
+
+## v4.4 — 2026-08-14
 
 **Tier C: weaker-evidence review, so B is less cluttered.** Nothing here
 widens Tier A. Defaults stay permissive: every C line is `.`, there is no

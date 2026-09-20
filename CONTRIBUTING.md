@@ -82,6 +82,11 @@ worker processes, holds both signature sweeps against brute-force
 oracles, and exercises the OpenCV-absent fallbacks. Nothing ships
 without it passing.
 
+**Agent benchmark**: `.benchmarks/agent-control/` scores an AI agent
+driving the toolkit end to end (`benchmark.py prepare | launch | validate
+| score-exact | verify`). Its README carries the protocol; the baseline
+runs it quotes live outside the repository.
+
 ## Settled defaults — do not re-tune casually
 
 All measured on a real 36,410-image library.

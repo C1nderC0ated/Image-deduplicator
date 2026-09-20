@@ -114,6 +114,18 @@ try:
 except Exception:
     pass
 
+# .avif decodes natively on Pillow 11.2+ wheels; pillow-heif covers the rest.
+try:
+    from PIL import features as _pil_features
+    AVIF_OK = HEIF_OK or bool(_pil_features.check('avif'))
+except Exception:
+    AVIF_OK = HEIF_OK
+
+# Extensions this interpreter has no decoder for; the run says so up front.
+NO_CODEC_EXTS = tuple(e for e, ok in (('.heic', HEIF_OK), ('.heif', HEIF_OK),
+                                      ('.hif', HEIF_OK), ('.avif', AVIF_OK))
+                      if not ok)
+
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
 # Pillow writes this straight to stderr, unbuffered, so it landed ABOVE our
@@ -146,8 +158,9 @@ EXTS = {
     '.jpg', '.jpeg', '.jfif', '.jpe', '.png', '.webp', '.tif', '.tiff',
     '.bmp',
     # phone cameras (.hif is Canon's name for the same container).
-    # These need pillow-heif; without it they are the one group that lands
-    # as unreadable.
+    # HEIC/HEIF need pillow-heif; without it they are the one group that
+    # lands as unreadable. AVIF decodes natively on Pillow 11.2+ wheels and
+    # only needs pillow-heif on builds without that codec.
     '.heic', '.heif', '.hif', '.avif',
     # animated
     '.gif', '.apng',
@@ -376,8 +389,9 @@ def frame_signature(im):
     been reported as automatic duplicates. In RGB the same pairs score 64,
     62 and 85.
 
-    8x8x3 per frame: 192 bytes, so five frames add ~1.3 KB of base64
-    against a 128px thumbnail's few KB. Stills return '' and pay nothing.
+    8x8x3 per frame: 192 bytes, so FRAME_SAMPLES (25) frames add ~6.4 KB
+    of base64 against a 128px thumbnail's few KB. Stills return '' and pay
+    nothing.
 
     The walk is strictly ASCENDING and then rewinds to 0. That is not
     incidental: Pillow 12.3 raises on a backwards seek to a middle frame of
@@ -494,8 +508,9 @@ def truncated(data):
 
 
 def make_thumb(im, thumb_px, fast=True):
-    """Returns (fmt_flag, tw, th, b64). JPEG by default; lossless WebP when
-    that is actually smaller (flat/UI content compresses better losslessly)."""
+    """Returns (fmt_flag, tw, th, b64). JPEG at THUMB_QUALITY by default;
+    with fast=False (--lossless-thumbs) a lossless WebP is also tried and
+    kept when it is smaller (flat/UI content compresses better losslessly)."""
     # exif_transpose ends in `return image.copy()` even when the image has
     # NO orientation tag - a full-resolution duplicate of the whole thing,
     # for nothing. That copy is the single largest avoidable allocation in
@@ -1088,9 +1103,9 @@ def main():
     if total == 0:
         print('Nothing to do.')
         return
-    if not HEIF_OK:
+    if NO_CODEC_EXTS:
         n_heif = sum(1 for f in files
-                     if os.path.splitext(f)[1].lower() in ('.heic', '.heif', '.avif'))
+                     if os.path.splitext(f)[1].lower() in NO_CODEC_EXTS)
         if n_heif:
             print('NOTE: ' + str(n_heif) + ' HEIC/HEIF/AVIF files present but the codec')
             print('      is not installed; they will be listed as unreadable.')
@@ -1216,7 +1231,7 @@ def main():
           + str(reused) + ' reused), ' + str(err) + ' unreadable.')
     if unreadable_ext:
         print('Unreadable by extension: ' + json.dumps(unreadable_ext))
-        if not HEIF_OK and any(e in unreadable_ext for e in ('.heic', '.heif', '.avif')):
+        if any(e in unreadable_ext for e in NO_CODEC_EXTS):
             print('  -> install pillow-heif and re-run with --resume to fill these in.')
     if unreadable_why:
         print('')

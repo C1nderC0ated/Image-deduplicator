@@ -32,7 +32,8 @@ numpy>=1.24.0
 # Crop-containment detection in Analyze (the "ncc" tier). Recommended:
 opencv-python-headless>=4.8.0
 
-# Optional - HEIC/HEIF phone photos in Collect (AVIF works natively on Pillow 12+):
+# Optional - HEIC/HEIF phone photos in Collect (AVIF works natively on
+# Pillow 11.2+). The setup helper does not install this one; add it by hand:
 # pillow-heif>=1.0.0
 
 # Semantic stage (Embed) - transformers from PyPI, torch installed SEPARATELY

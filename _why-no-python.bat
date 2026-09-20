@@ -27,6 +27,14 @@ if %ERRORLEVEL% equ 0 (
     echo --- py launcher not installed ---
     echo.
 )
+if exist "%~dp0.venv\Scripts\python.exe" (
+    echo --- .venv beside the toolkit ---
+    "%~dp0.venv\Scripts\python.exe" -c "%PROBE%" 2>&1
+    echo.
+) else (
+    echo --- no .venv beside the toolkit ---
+    echo.
+)
 where python >nul 2>&1
 if %ERRORLEVEL% equ 0 (
     echo --- python on PATH ---

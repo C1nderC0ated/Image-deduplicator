@@ -2169,7 +2169,6 @@ def self_test():
     # later line silently overwrote the earlier - putting an X on a file
     # whose own line read "." and "suggested keeper".
     try:
-        import re as _re2
         import tempfile as _tf2
         import shutil as _sh3
         td = _tf2.mkdtemp()
@@ -2530,7 +2529,6 @@ def self_test():
         g128 = gray_small(TH_n, 0, 128)
         sizes = max(g64.shape) <= 64 and max(g128.shape) >= max(g64.shape)
         lo = compute_nccs(TH_n, [(0, 1)], 2, procs=0, max_side=64).get((0, 1), 0.0)
-        hi = compute_nccs(TH_n, [(0, 1)], 2, procs=0, max_side=128).get((0, 1), 0.0)
         nccs_n = {(0, 1): lo}
         apply_ncc_confirms(nccs_n, TH_n, 2)
         # retry only raises; a score already at 128 is left alone
@@ -3806,7 +3804,7 @@ def main():
     # 2.7 million pairs.
     ap.add_argument('--clip-neighbors', type=int, default=16,
                     help='how many nearest neighbours each image contributes '
-                         'from the embeddings (default 48). Bounds the '
+                         'from the embeddings (default 16). Bounds the '
                          'candidate set on large libraries, where a flat '
                          'cosine floor admits a fifth of all pairs. Cannot '
                          'cost a Tier A candidate; may trim review '
@@ -4202,9 +4200,6 @@ def main():
                  ', %d skipped (cap %d)' % (n_cap, CONFIRM_CAP) if n_cap else ''))
     for p in demoted:
         tierb_pairs.append(p)
-
-    a_drops = set(i for _, d, _ in tier_a for i in d)
-    a_keeps = set(k for k, _, _ in tier_a)
 
     # Connected components, not cliques. Cliques were tried and reverted:
     # forcing every member to match every other splits a chain into groups

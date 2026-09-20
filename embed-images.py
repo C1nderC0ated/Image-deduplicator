@@ -20,13 +20,17 @@ Usage:
 Options:
     --model NAME    HF model id (default: openai/clip-vit-base-patch32;
                     first run downloads ~600 MB into the HF cache)
-    --device D      auto (default) / cuda / cpu. auto prefers the GPU and
-                    explains exactly why when it cannot use one
+    --device D      auto (default) / cuda / xpu / mps / cpu. auto prefers
+                    the GPU and explains exactly why when it cannot use one
+                    (ROCm builds are 'cuda' - HIP reuses the namespace)
     --root DIR      override the image root recorded in the inventory
-    --batch N       batch size (default: 64 on GPU, 8 on CPU)
+    --batch N       batch size (default: 64 on a GPU, 8 on CPU)
     --workers N     image decode/preprocess threads (default: auto).
                     Decoding runs ahead of the model on a thread pool, so
                     the GPU never waits for the disk.
+    --fp16          run the model in float16 on a GPU (~2.9x faster).
+                    Changes the vectors slightly; recorded in the header,
+                    so a resumed file cannot mix the two precisions.
     --gpu-preprocess
                     resize opaque 2x-or-larger downscales and normalize on
                     the GPU with antialiased bicubic interpolation. Smaller,
@@ -326,7 +330,7 @@ def resolve_device(requested):
         print('Device: cpu (forced by --device cpu)')
         return 'cpu'
     if requested != 'auto':
-        if requested == dev or (requested == 'cuda' and dev == 'cuda'):
+        if requested == dev:
             print('Device: %s (%s, %s)' % (dev, _dev_name(dev), desc))
             return dev
         print('--device %s was requested, but this torch cannot use it here:'
@@ -641,7 +645,8 @@ def main():
     ap = argparse.ArgumentParser(description='Compute CLIP embeddings for an image inventory.')
     ap.add_argument('inventory', help='inventory .jsonl, or a folder containing one')
     ap.add_argument('--model', default='openai/clip-vit-base-patch32')
-    ap.add_argument('--device', default='auto', choices=('auto', 'cuda', 'cpu'))
+    ap.add_argument('--device', default='auto',
+                    choices=('auto', 'cuda', 'xpu', 'mps', 'cpu'))
     ap.add_argument('--root', help='override image root folder')
     ap.add_argument('--batch', type=int, default=0)
     ap.add_argument('--workers', type=int, default=0,
@@ -838,7 +843,7 @@ def main():
                                     'https://download.pytorch.org/whl/cu132'))
         print('')
 
-    batch = args.batch or (64 if device == 'cuda' else 8)
+    batch = args.batch or (8 if device == 'cpu' else 64)
     workers = args.workers if args.workers > 0 else default_workers()
     print('Batch size: ' + str(batch) + '   decode threads: ' + str(workers))
     print('Loading model ' + args.model + ' (first run downloads it) ...')

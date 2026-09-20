@@ -16,11 +16,13 @@ is numpy, so "CPU" there is correct, not a compromise.
     python _setup.py              interactive: report, then offer to fix
     python _setup.py --check      report only, exit 1 if something is missing
     python _setup.py --yes        assume yes (for scripted use)
+    python _setup.py --offline    skip index discovery, use the pinned suffixes
 """
 import argparse
 import glob
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -41,7 +43,7 @@ PCI_VENDORS = {0x1002: 'AMD', 0x10DE: 'NVIDIA', 0x8086: 'Intel'}
 # Fallbacks only. The real versions are discovered from the PyTorch index at
 # run time (see newest_index) because they move: the stable ROCm index went
 # 6.4 -> 7.0 -> 7.1 -> 7.2 within a few releases.
-FALLBACK_CUDA = 'cu128'
+FALLBACK_CUDA = 'cu132'
 FALLBACK_ROCM = 'rocm7.2'
 
 # AMD's ROCm-on-Windows wheels. Pinned URLs, not an index, and cp312 ONLY -
@@ -133,9 +135,40 @@ def _ver_key(s):
     return tuple(int(x) for x in re.findall(r'\d+', s))
 
 
+def _wheel_tags():
+    """(python tag, platform substring) a torch wheel needs to install here."""
+    py = 'cp%d%d' % sys.version_info[:2]
+    if IS_WIN:
+        plat = 'win_amd64'
+    elif IS_MAC:
+        plat = 'macosx'
+    else:
+        plat = 'aarch64' if 'aarch64' in platform.machine() else 'x86_64'
+    return py, plat
+
+
+def _index_has_wheel(idx, timeout=15):
+    """True when .../whl/<idx>/torch/ lists a torch wheel this interpreter
+    can install. A directory existing proves nothing: cu134 was published
+    with only torch 2.0 aarch64 wheels in it, so the newest directory name
+    is not the newest usable build."""
+    py, plat = _wheel_tags()
+    try:
+        from urllib.request import urlopen
+        url = 'https://download.pytorch.org/whl/%s/torch/' % idx
+        with urlopen(url, timeout=timeout) as r:
+            html = r.read().decode('utf-8', 'replace')
+    except Exception:
+        return False
+    pat = r'torch-\d[^"<]*-%s-%s-[^"<]*%s[^"<]*\.whl' % (py, py, plat)
+    return re.search(pat, html) is not None
+
+
 def newest_index(prefix, timeout=15):
-    """Newest .../whl/<prefix>N index actually published, or None offline.
-    The listing is a plain PEP-503 anchor page."""
+    """Newest .../whl/<prefix>N index that actually carries a torch wheel
+    for this Python and platform, or None offline. The listing is a plain
+    PEP-503 anchor page; candidates are checked newest-first, and only a
+    few, because each check downloads that index's wheel list."""
     try:
         from urllib.request import urlopen
         with urlopen('https://download.pytorch.org/whl/', timeout=timeout) as r:
@@ -144,7 +177,10 @@ def newest_index(prefix, timeout=15):
         return None
     found = set(re.findall(r'>\s*(%s[\d.]+)\s*/?\s*<' % prefix, html))
     found |= set(re.findall(r'href="[^"]*?(%s[\d.]+)/' % prefix, html))
-    return max(found, key=_ver_key) if found else None
+    for idx in sorted(found, key=_ver_key, reverse=True)[:4]:
+        if _index_has_wheel(idx, timeout):
+            return idx
+    return None
 
 
 # --------------------------------------------------------------- backends --

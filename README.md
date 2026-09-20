@@ -1,6 +1,6 @@
 # Image Inventorization
 
-A three-stage pipeline that finds duplicate, re-encoded, resized, rotated,
+A three-stage pipeline, plus a recycler, that finds duplicate, re-encoded, resized, rotated,
 mirrored and cropped images in large libraries. Tested from 1,500 to 36,000
 images. Everything runs on your own machine: nothing is uploaded, and there
 is no account to make. Runs on Windows, Linux and macOS.
@@ -46,13 +46,16 @@ point, inspect everything in a text editor, and re-run stages independently.
 | `Analyze-Inventory.bat` + `analyze-inventory.py` | Stage 3 — find duplicates, write report / list / recycler |
 | `Check-Image-Tools.bat` + `check-image-tools.py` | Doctor — every Python on the machine and what each can actually do |
 | `imgdedup.sh` | POSIX launcher: `setup` / `collect` / `embed` / `analyze` / `doctor` |
-| `_setup.py` | GPU detection + guided install, shared by every launcher |
+| `_setup.py` | GPU detection + guided install, shared by every launcher. `--check` reports only, `--yes` skips the prompts, `--offline` skips index discovery |
 | `_offer-setup.bat` | Shared "something is missing" handler for the .bat launchers |
 | `_trash.py` | The only code that can make a file disappear — one trash backend per OS |
 | `_pick-python.bat` | Shared interpreter chooser used by every `.bat` launcher |
 | `_why-no-python.bat` | Shared failure report — prints what each Python candidate *actually said* |
 | `requirements.txt` | Package list (see [Requirements](#requirements)) |
 | `CHANGES.md` | Version history, including the bugs and what they taught the tool |
+| `CONTRIBUTING.md` | The standard a change is held to, the settled defaults, the measured dead ends |
+| `.benchmarks/agent-control/` | Scored benchmark for driving the toolkit through an AI agent; its own README explains the protocol |
+| `LICENSE` | MIT |
 
 Generated at run time, next to your images:
 
@@ -60,7 +63,7 @@ Generated at run time, next to your images:
 |------|-----------|------------|
 | `image-inventory.jsonl` (+ `.partN` above ~200 MB) | Collect | One JSON line per image: path, size, SHA-256, dimensions, EXIF, JPEG quality fingerprint, AI-generation text chunks, 128 px thumbnail |
 | `image-embeddings.jsonl` | Embed | One CLIP vector per unique image, keyed by SHA-256 |
-| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **weaker-evidence slate** (Tier C, no suggested keeper), **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper; the last surviving copy refuses. There is no “Mark all Tier C”. Dark-themed, so the thumbnails stay the brightest thing on screen |
+| `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **weaker-evidence slate** (Tier C, no suggested keeper), **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper; the last surviving copy refuses. “Mark all Tier B suggestions” and “Clear Tier B marks” buttons act on the review tier; there is no “Mark all Tier C”. Dark-themed, so the thumbnails stay the brightest thing on screen |
 | `<name>-list.txt` | Analyze | The selection list you edit: first character `X` = delete, `.` = keep |
 | `Recycle-Duplicates.py` + `.bat` / `.sh` | Analyze | The only thing that deletes — after verification and your y/N. The `.py` holds every rule; the `.bat`/`.sh` only find a Python. Versioned (`Recycle-Duplicates-2.*`) when the inventory is, so each stays bound to its own list |
 
@@ -70,7 +73,7 @@ Generated at run time, next to your images:
 
 - **Windows 10/11, Linux, or macOS.** Windows gets a `.bat` per stage to
   drag folders onto; elsewhere use `./imgdedup.sh`. GPU acceleration (Embed
-  only) works with **NVIDIA, AMD and Intel**; see [AMD GPUs](#amd-gpus)
+  only) works with **NVIDIA, AMD, Intel and Apple silicon**; see [AMD GPUs](#amd-gpus)
   for the one platform that needs care. Deleted files go to the
   Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively, never a
   permanent delete on any of them.
@@ -80,7 +83,7 @@ Generated at run time, next to your images:
 | Stage | Needs |
 |-------|-------|
 | Collect | Pillow |
-| Collect (HEIC/HEIF phone photos) | pillow-heif *(optional)* |
+| Collect (HEIC/HEIF phone photos) | pillow-heif *(optional; setup does not install it, `pip install pillow-heif` does)* |
 | Analyze | Pillow + numpy |
 | Analyze (crop detection) | OpenCV *(recommended)* |
 | Embed | torch + transformers |
@@ -110,7 +113,7 @@ Generated at run time, next to your images:
   `python3 -m venv` imports and *then* fails until that package is added.
 
 **Easiest: let the toolkit install it.** Setup detects your GPU
-(NVIDIA / AMD / Intel), asks which PyTorch build you want, shows the exact
+(NVIDIA / AMD / Intel / Apple), asks which PyTorch build you want, shows the exact
 pip command and waits for a yes. It never installs anything silently:
 
 ```
@@ -130,13 +133,16 @@ your hardware; pick one, then `pip install transformers` either way:
 | NVIDIA (CUDA) | `pip install torch --index-url https://download.pytorch.org/whl/cu132` |
 | AMD on **Linux** (ROCm) | `pip install torch --index-url https://download.pytorch.org/whl/rocm7.2` |
 | Intel (XPU) | `pip install torch --index-url https://download.pytorch.org/whl/xpu` |
+| Apple silicon (Metal) | `pip install torch` — the stock wheel includes MPS |
 | AMD on **Windows** | not from PyPI — see [AMD GPUs](#amd-gpus) |
 
 > Those suffixes **move**: `cu128` became `cu132`, `rocm6.4` became
 > `rocm7.2`. Setup reads the current list from download.pytorch.org rather
 > than trusting a number printed in a README, so prefer it to copying these.
 > (It also sorts them numerically — `rocm7.14` is *newer* than `rocm7.2`,
-> which string and float comparison both get backwards.)
+> which string and float comparison both get backwards — and it checks that
+> the index it picks actually carries a wheel for your Python and platform.
+> A directory can exist with nothing usable in it: `cu134` did.)
 
 > **Python 3.14 note:** the old `cu121` index has no 3.14 wheels at all.
 
@@ -239,7 +245,8 @@ Restore it.
 
 Walks the folder tree, 17 extensions, the ones that actually turn up in an
 image gallery: `.jpg .jpeg .jfif .jpe .png .apng .webp .gif .tif .tiff .bmp
-.tga .qoi`, plus `.heic .heif .hif .avif` when pillow-heif is present. Icons,
+.tga .qoi`, plus `.heic .heif .hif` when pillow-heif is present and `.avif`
+(native on Pillow 11.2+; pillow-heif covers older builds). Icons,
 cursors, Photoshop files, game textures and the legacy encodings are
 deliberately excluded (an asset folder reuses the same texture on purpose,
 so every "duplicate" found there is intended); `collect-image-inventory.py`
@@ -249,13 +256,14 @@ image: relative path, byte size, mtime, **SHA-256**, format, dimensions,
 key EXIF fields (timestamp, camera, software, orientation), a **JPEG
 quantization fingerprint** (`qsum`, lower means less recompressed), any
 **AI-generation text chunks** found in PNGs (Stable Diffusion / ComfyUI
-`parameters`), and a 128 px thumbnail, rotation-corrected, stored losslessly
-when that is smaller than JPEG.
+`parameters`), and a 128 px thumbnail, rotation-corrected, as JPEG at
+quality 80 (`--lossless-thumbs` also tries lossless WebP and keeps it when
+smaller).
 
 - **Read-only.** It never touches an image. Its own output files are the
   only thing it writes.
 - **Parallel.** Hashing, decoding and thumbnailing run on a thread pool
-  (`--workers`, default min(CPU cores, 8)); each file is read from disk
+  (`--workers`, default CPU cores, clamped to 2–8); each file is read from disk
   once. Records stream out in scan order, so the output is deterministic.
 - **Resume.** Re-running offers to reuse the previous inventory: files with
   unchanged size+mtime are carried over without re-reading, so a re-scan
@@ -359,7 +367,7 @@ pixels alone, and byte-identical files are always clustered:
 
 | Tier | Meaning | Evidence required | Pre-set |
 |------|---------|-------------------|---------|
-| **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree | `X` |
+| **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree. Borderline pairs (thumbnail difference above 2, not byte-identical) are re-scored at 512 px from the original files, at most 64 per run, and demoted to review when that disagrees | `X` |
 | **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, inpaints, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or luma/orientation match at duplicate level | `.` always |
 | **C — weaker evidence** | Related according to CLIP, but the pixel match is cheap chrome, near-black noise, or a high cosine with no crop confirm. Components larger than 16 are omitted (weak-edge chaining, not a reviewable set) | containment ≥ 0.95 **in** a dense CLIP pocket or on two near-black thumbs, or CLIP ≥ 0.97 after luma/orientation also missed | `.` always, **no suggested keeper**. You may still mark `X`; the last copy in a cluster cannot be deleted |
 
@@ -379,7 +387,9 @@ Numbers you will see in the report:
 - **ncc**: how well the smaller image matches somewhere *inside* the
   larger one (1.0 = perfect containment). This is the crop detector; it
   needs OpenCV, and the run tells you if that is missing. The cheap pass
-  is 64 px; scores in [0.85, 0.90) are retried at the 128 px thumbnail.
+  is 64 px; scores in [0.85, 0.90) are retried at the 128 px thumbnail,
+  closest to the gate first, at most 1028 pairs per run. The retry can only
+  raise a score.
 
 Long runs print per-stage elapsed times, so you can see where the time
 goes. If the folder is clean, Analyze writes **only the report** (which
@@ -462,7 +472,7 @@ more:
 | Option | Default | Meaning |
 |---|---|---|
 | `--thumb N` | 128 | thumbnail max side, px |
-| `--workers N` | auto (≤ 8) | parallel hash/decode/thumbnail threads |
+| `--workers N` | auto (2–8) | parallel hash/decode/thumbnail threads |
 | `--lossless-thumbs` | off | also try a lossless WebP thumbnail and keep it when smaller. ~2.2× slower. Across 36,410 images it changed no duplicate decision, which is why it is no longer the default — but a collection that is mostly screenshots, UI captures or pixel art has a far larger share of qualifying thumbnails, and this keeps their pixels exact |
 | `--split-mb N` | 200 | roll output to a new `.partN` past this size |
 | `--resume` / `--no-resume` | ask | reuse previous inventory for unchanged files |
@@ -477,11 +487,11 @@ more:
 | `--model NAME` | `openai/clip-vit-base-patch32` | HF model id (~600 MB first download) |
 | `--root DIR` | from inventory header | override the image folder |
 | `--batch N` | 64 GPU / 8 CPU | batch size |
-| `--workers N` | auto (≤ 8) | decode/preprocess threads feeding the model |
+| `--workers N` | auto (2–8) | decode/preprocess threads feeding the model |
 | `--no-draft` | off | decode JPEGs at full resolution (slower). Recorded in preprocessing provenance; changing it requires a fresh embeddings file |
 | `--fp16` | off | float16 on the GPU (~2.9× faster). Vectors shift by up to 0.0006 pairwise cosine — enough to move a pair sitting exactly on the Tier A floor into review. Recorded in the header; a resumed file of the other precision is refused |
 | `--gpu-preprocess` | off | move opaque 2x+ downscale and normalization to the GPU. Transparent, animated, smaller, and decoded-over-4-MP images stay on Pillow. Useful on CPU-constrained runs; not pixel-identical, so it has separate resume provenance and requires a fresh embeddings file |
-| `--device D` | auto | `auto` / `cuda` / `cpu` — auto prefers GPU and explains any fallback |
+| `--device D` | auto | `auto` / `cuda` / `xpu` / `mps` / `cpu` — auto prefers the GPU and explains any fallback. ROCm builds are `cuda` |
 | `--share` / `--mirror-dir` | off | as in Collect |
 
 **analyze-inventory.py** `<inventory.jsonl | folder>`
@@ -498,10 +508,14 @@ more:
 | `--no-embeddings` | off | ignore embeddings even if present |
 | `--self-test` | — | run the invariant + sweep-equality tests and exit |
 
-**Interpreter choice.** The `.bat` launchers call `_pick-python.bat`;
-`imgdedup.sh` probes `python3.14` … `python3.9`, then `python3`/`python`.
-Both try `IMGDEDUP_PYTHON` first (always wins) and probe *functionally*, the candidate must actually import and call into the packages the stage
-needs. To pin an interpreter for everything:
+**Interpreter choice.** The `.bat` launchers call `_pick-python.bat`,
+which tries `py -V:3.14` … `3.9`, then `py -3`, then a `.venv` beside the
+toolkit, then `python`; `imgdedup.sh` probes `.venv`, `python3.14` …
+`python3.9`, then `python3`/`python`. Both try `IMGDEDUP_PYTHON` first (it
+wins whenever it passes the probe; a failing override is reported and the
+search continues) and probe *functionally*: the candidate must actually
+import and call into the packages the stage needs. To pin an interpreter
+for everything:
 
 ```
 set IMGDEDUP_PYTHON=C:\path\to\python.exe        (Windows)
@@ -602,7 +616,9 @@ machine.
 ## Notes & caveats
 
 Comparisons run on 128 px thumbnails, which is what makes a million-pair
-sweep fast. The thresholds were calibrated against real libraries with
+sweep fast. The one exception is the 512 px confirm: borderline Tier A
+pairs are re-read from the original files before they are allowed to
+drop. The thresholds were calibrated against real libraries with
 contact-sheet review: a JPEG re-save scores mad ≈ 1–3, genuinely different
 images 10 or more. Borderline pairs get surfaced in Tier B or C rather
 than decided.
@@ -620,7 +636,7 @@ nominates those pairs for scoring in the first place. Against a 20-case
 truth set of known same-picture transformations the pipeline finds
 **20/20 with embeddings and 15/20 without**, so run the semantic stage.
 
-Animated GIF, WebP and APNG are compared by five frames sampled across the
+Animated GIF, WebP and APNG are compared by 25 frames sampled across the
 whole animation rather than by the first one alone. Frame 0 is not enough:
 two completely different animations that happen to start the same way
 score a perfect pixel match, and so does a still lifted out of a GIF. Both
@@ -628,8 +644,8 @@ used to be reported as automatic duplicates. An animation and a still are
 now never auto-deleted against each other, and neither are two animations
 whose frames diverge; those go to the review tier instead. Only animations
 pay for the scan, and not much: a 30-frame GIF costs about what one
-900×900 photo does, and the frame fingerprint adds roughly 440 characters
-beside a thumbnail of several KB.
+900×900 photo does, and the frame fingerprint adds roughly 6 KB beside a
+thumbnail of several KB.
 
 Paths in Cyrillic, Japanese, emoji, typographic quotes and non-printable
 characters all work. Each of those became a test case after breaking
@@ -664,17 +680,19 @@ against brute force (including pairs placed deliberately at the band
 edge). Every guard was validated by *mutation testing*, deliberately
 re-breaking the code and confirming the check fires.
 
-The stages are tested end-to-end on synthetic image sets (exact copies,
-re-encodes, resizes, crops, rotations, mirrors, grayscale copies, EXIF
-rotations, corrupt files, Unicode filenames) and the recycler against a
-13-scenario safety harness, including a verified Recycle-Bin round-trip
-and the freedesktop trash layout exercised against real files.
+During development the stages were also run end-to-end on synthetic
+image sets (exact copies, re-encodes, resizes, crops, rotations, mirrors,
+grayscale copies, EXIF rotations, corrupt files, Unicode filenames) and
+the recycler through a Recycle-Bin round-trip and the freedesktop trash
+layout on real files. Those harnesses are not in the repository. What is
+tracked is `.benchmarks/agent-control/`, a scored benchmark for driving
+the toolkit through an AI agent, with its own README.
 
 ---
 
 ## Version
 
-**v4.4** (2026-08-14). Full history, including every bug and what it
+**v4.4.1** (2026-09-20). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change
