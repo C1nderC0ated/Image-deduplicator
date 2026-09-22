@@ -43,6 +43,9 @@ opencv-python-headless>=4.8.0
 #     pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   NVIDIA GPU (CUDA):
 #     pip install torch --index-url https://download.pytorch.org/whl/cu132
+#   NVIDIA before Turing (GTX 9xx/10xx, Titan X/Xp/V, Quadro M/P) - CUDA
+#   12.8 and newer builds carry no kernels for these cards:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu126
 #   AMD GPU on LINUX (ROCm):
 #     pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
 #   Intel GPU (XPU):

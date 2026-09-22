@@ -58,6 +58,7 @@ import collections
 import glob
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -105,7 +106,7 @@ def _hint(pkg, exe=None):
         from _setup import pip_hint
         return pip_hint(pkg, exe)
     except Exception:
-        return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
+        return '"%s" -m pip install %s' % (exe or sys.executable, pkg)
 
 
 try:
@@ -195,12 +196,23 @@ except ImportError as exc:
         print('  ' + type(exc).__name__ + ': ' + str(exc)[:200])
         print('')
         print('If that mentions a DLL or an entry point, a compiled package no')
-        print('longer matches the installed torch. Reinstall the pair together:')
-        print('  ' + _hint('--force-reinstall torch torchvision --index-url '
-                           'https://download.pytorch.org/whl/cu132'))
+        print('longer matches the installed torch - usually torchvision, which')
+        print('nothing in this toolkit needs:')
+        print('  "' + sys.executable + '" -m pip uninstall torchvision')
     sys.exit(2)
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# Pillow refuses a PNG whose compressed text chunk (or colour profile)
+# inflates past 1 MB, so a picture every viewer opens - a ComfyUI workflow
+# is easily that big - was recorded as unreadable and never compared. The
+# guard is aimed at untrusted uploads, like the pixel limit; the user owns
+# every file here. 16 MB still bounds a hostile chunk.
+try:
+    from PIL import PngImagePlugin as _png
+    _png.MAX_TEXT_CHUNK = max(_png.MAX_TEXT_CHUNK, 16 * 1024 * 1024)
+except Exception:
+    pass
 
 # See collect-image-inventory.py: Pillow's raw stderr warning reads as a
 # crash and as an accusation about the user's own file. Suppressed at
@@ -275,13 +287,19 @@ def torch_build():
         return 'rocm', 'ROCm/HIP ' + str(torch.version.hip)
     if getattr(torch.version, 'cuda', None):
         return 'cuda', 'CUDA ' + str(torch.version.cuda)
+    # The BUILD, not the device: an XPU wheel with its driver missing was
+    # called "CPU-only", and the advice was to install the XPU wheel - the
+    # one already there. Where the build is right, the auto path now says
+    # the driver is the problem instead.
+    if getattr(torch.version, 'xpu', None):
+        return 'xpu', 'Intel XPU'
     try:
         if torch.xpu.is_available():
             return 'xpu', 'Intel XPU'
     except Exception:
         pass
     try:
-        if torch.backends.mps.is_available():
+        if torch.backends.mps.is_built() or torch.backends.mps.is_available():
             return 'mps', 'Apple Metal'
     except Exception:
         pass
@@ -289,20 +307,41 @@ def torch_build():
 
 
 def _install_hint(vendors):
-    """The right reinstall line for the hardware actually present."""
-    if 'NVIDIA' in vendors:
-        return '    ' + _hint('torch --index-url '
-                              'https://download.pytorch.org/whl/cu132')
-    if 'AMD' in vendors:
-        if os.name == 'nt':
-            return ('    AMD ships ROCm wheels for Windows on Python 3.12 only;'
-                    ' run:  python _setup.py')
-        return '    ' + _hint('torch --index-url '
-                              'https://download.pytorch.org/whl/rocm7.2')
-    if 'Intel' in vendors:
-        return '    ' + _hint('torch --index-url '
-                              'https://download.pytorch.org/whl/xpu')
-    return '    python _setup.py   (picks the right build for this machine)'
+    """How to get a torch build that can use this machine's GPU: setup, run
+    by this interpreter with an absolute path. It reads the current index
+    list, checks the card's compute capability and replaces a wrong build.
+    Fixed index URLs here went stale, named CUDA 13 for cards it cannot
+    drive, and a relative "_setup.py" failed from any other folder."""
+    setup = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_setup.py')
+    return ('    "%s" "%s"\n    (picks the build for this GPU, and asks first)'
+            % (sys.executable, setup))
+
+
+def cuda_kernels_fit():
+    """(True, '') when this CUDA build carries kernels for GPU 0, else
+    (False, 'compute X.Y'). PyTorch's CUDA 12.8 and newer builds start at
+    Turing (7.5): on a GTX 10xx torch.cuda.is_available() is True and the
+    first kernel fails with "no kernel image is available". CUDA's rule: a
+    binary for the same major and a lower-or-equal minor runs, and PTX
+    ('compute_') runs on anything newer."""
+    try:
+        cap = tuple(torch.cuda.get_device_capability(0))
+        arch = torch.cuda.get_arch_list()
+    except Exception:
+        return True, ''
+    if not arch:
+        return True, ''
+    for a in arch:
+        kind, _, num = a.partition('_')
+        num = ''.join(ch for ch in num if ch.isdigit())
+        if len(num) < 2:
+            continue
+        mj, mn = int(num[:-1]), int(num[-1])
+        if kind == 'sm' and mj == cap[0] and mn <= cap[1]:
+            return True, ''
+        if kind == 'compute' and (mj, mn) <= cap:
+            return True, ''
+    return False, 'compute %d.%d' % cap
 
 
 def gpu_device():
@@ -325,6 +364,20 @@ def resolve_device(requested):
     build, desc = torch_build()
     dev = gpu_device()
     vendors, names = _gpu_hint()
+    if dev == 'cuda' and build == 'cuda' and requested in ('auto', 'cuda'):
+        fits, cc = cuda_kernels_fit()
+        if not fits:
+            print('Device: cpu' if requested == 'auto'
+                  else '--device cuda was requested, but this torch cannot run on it:')
+            print('  Why not the GPU: this %s build has no kernels for %s (%s).'
+                  % (desc, _dev_name('cuda'), cc))
+            print("  PyTorch's CUDA 12.8 and newer builds start at compute 7.5.")
+            print('  The CUDA 12.6 build still supports this card:')
+            print('  ' + _hint('--force-reinstall torch --index-url '
+                               'https://download.pytorch.org/whl/cu126'))
+            if requested == 'cuda':
+                sys.exit(2)
+            return 'cpu'
 
     if requested == 'cpu':
         print('Device: cpu (forced by --device cpu)')
@@ -338,7 +391,16 @@ def resolve_device(requested):
         print('  installed build: %s' % desc)
         if names:
             print('  hardware present: %s' % ', '.join(names[:2]))
-        print(_install_hint(vendors))
+        # Advice for the device ASKED for: when the build already serves it,
+        # reinstalling it again was the old answer, and the driver is the fix.
+        serves = {'cuda': ('cuda', 'rocm'), 'xpu': ('xpu',), 'mps': ('mps',)}
+        if build in serves.get(requested, ()):
+            print('  The build is right but no device is visible - check the')
+            print('  driver is installed and current.')
+        else:
+            print('  That needs a different build. Setup installs the one for')
+            print('  this GPU:')
+            print(_install_hint(vendors))
         sys.exit(2)
 
     if dev:
@@ -370,39 +432,155 @@ def _dev_name(dev):
     return dev
 
 
+def json_line(obj):
+    """One JSONL line, readable UTF-8 where it can be. A path holding a lone
+    surrogate (a name that is not valid UTF-8 on Linux) cannot be encoded,
+    so that line alone is written with JSON escapes instead."""
+    line = json.dumps(obj, ensure_ascii=False)
+    try:
+        line.encode('utf-8')
+    except UnicodeEncodeError:
+        line = json.dumps(obj)
+    return line + '\n'
+
+
+def mirror_output(out, root, args):
+    """The --share / --mirror-dir copy of the embeddings file."""
+    mdir = args.mirror_dir or (MIRROR_DIR if args.share else '')
+    if not mdir or not os.path.exists(out):
+        return
+    try:
+        os.makedirs(mdir, exist_ok=True)
+        tag = os.path.basename((root or '').rstrip('\\/')) or 'root'
+        # mirror under the real output name, so image-embeddings-2.jsonl
+        # does not overwrite the mirror of image-embeddings.jsonl
+        shutil.copy2(out, os.path.join(mdir, tag + ' - ' + os.path.basename(out)))
+        print('Copied to the shared folder for your AI assistant: ' + mdir)
+    except Exception as e:
+        print('(shared copy skipped: ' + str(e)[:120] + ')')
+
+
 def find_inventory(arg):
     if os.path.isfile(arg):
         return arg
     if os.path.isdir(arg):
         cands = [p for p in glob.glob(os.path.join(glob.escape(arg),
                                                    'image-inventory*.jsonl'))]
+        cands = [p for p in cands if '.part' not in os.path.basename(p)] or cands
         if cands:
-            return max(cands, key=os.path.getmtime)
+            return pick_inventory(cands)
     return None
 
 
-def load_inventory(path):
-    """Returns (root, records). Follows .partN siblings of the given file."""
+def inventory_parts(path):
+    """The files of one inventory: the named file and its .partN siblings,
+    base file first. A file whose name does not end in .jsonl is read on its
+    own - chopping six characters off it blindly found nothing at all."""
     d, b = os.path.split(path)
+    if not b.lower().endswith('.jsonl'):
+        return [path]
     b = b[:-len('.jsonl')]
     if '.part' in b:                     # basename only: a folder named
         b = b.split('.part')[0]          # 'archive.part' must not truncate
     stem = os.path.join(glob.escape(d), glob.escape(b)) if d else glob.escape(b)
-    paths = sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
+    return sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
+
+
+def same_run(paths, lines_of):
+    """Keep the parts written by ONE run: the one the first file belongs to.
+
+    Every part repeats the header, with the run's start time. A copy that
+    is overwritten by name - the --share / --mirror-dir copy - kept the
+    .partN files of an earlier, longer run, and they were read as part of
+    this one: deleted files came back, and a file could be its own
+    duplicate. lines_of(p) yields the parsed lines of p.
+    Returns [(path, [dict, ...])] for the parts kept, and the paths dropped."""
+    kept, dropped, ref = [], [], None
+    for p in paths:
+        rows = list(lines_of(p))
+        stamp = next((r.get('started') for r in rows
+                      if r.get('kind') == 'header' or r.get('schema')), None)
+        if ref is None:
+            ref = stamp
+        elif stamp is not None and stamp != ref:
+            dropped.append(p)
+            continue
+        kept.append((p, rows))
+    if dropped:
+        print('[WARN] %d part file%s from a different scan run ignored:'
+              % (len(dropped), '' if len(dropped) == 1 else 's'))
+        for p in dropped[:4]:
+            print('         ' + os.path.basename(p))
+    return kept, dropped
+
+
+def _json_rows(p):
+    # Bytes, decoded by json.loads inside the try: a line torn mid-character
+    # (power loss, full disk) used to raise UnicodeDecodeError in the loop
+    # itself and stop the run, every run, until the file was hand-edited.
+    with open(p, 'rb') as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(r, dict):
+                yield r
+
+
+def inventory_status(path):
+    """'done' when the scan that wrote this inventory finished, 'aborted'
+    when it recorded an interruption, None when no footer says either way (a
+    killed run, or an inventory older than footers)."""
+    status = None
+    for p in inventory_parts(path):
+        try:
+            with open(p, 'rb') as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 65536))
+                tail = fh.read().splitlines()[-3:]
+        except OSError:
+            continue
+        for line in tail:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(r, dict) and r.get('kind') == 'footer':
+                status = 'done' if r.get('done') else 'aborted'
+    return status
+
+
+def pick_inventory(cands):
+    """Of several inventories in one folder, the newest COMPLETE one. An
+    interrupted rescan leaves a newer, partial image-inventory-2.jsonl
+    beside the finished one, and newest-by-date alone analyzed the partial
+    one - "still usable", but missing every file it never reached."""
+    newest = sorted(cands, key=os.path.getmtime, reverse=True)
+    status = dict((p, inventory_status(p)) for p in newest)
+    for want in ('done', None):
+        for p in newest:
+            if status[p] == want:
+                if p != newest[0]:
+                    print('Note: %s is from a scan that did not finish; using %s.'
+                          % (os.path.basename(newest[0]), os.path.basename(p)))
+                    print('      Name the file to use the other one.')
+                return p
+    return newest[0]
+
+
+def load_inventory(path):
+    """Returns (root, records). Follows .partN siblings of the given file."""
     root = None
     recs = []
-    for p in paths:
-        with open(p, encoding='utf-8') as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(r, dict):
-                    if 'root' in r and root is None:
-                        root = r['root']
-                    if r.get('kind') is None and 'p' in r and 'sha' in r:
-                        recs.append(r)
+    kept, _dropped = same_run(inventory_parts(path), _json_rows)
+    paths = [p for p, _rows in kept]
+    for _p, rows in kept:
+        for r in rows:
+            if 'root' in r and root is None:
+                root = r['root']
+            if r.get('kind') is None and 'p' in r and 'sha' in r:
+                recs.append(r)
     first = {}
     uniq = []
     for r in recs:
@@ -421,12 +599,15 @@ def load_inventory(path):
 def model_input_edge(proc):
     """Shortest-edge target of the image processor, for draft decoding."""
     sz = getattr(proc, 'size', None)
-    if isinstance(sz, dict):
-        for k in ('shortest_edge', 'height', 'width'):
-            if isinstance(sz.get(k), int):
-                return sz[k]
     if isinstance(sz, int):
         return sz
+    # transformers 5 returns a SizeDict, which is not a dict: only a plain
+    # dict was read, so every model fell back to 224 - a 336-pixel model's
+    # draft target and GPU-path threshold were computed for the wrong size
+    if sz is not None:
+        v = _cfg(sz, 'shortest_edge', 'height', 'width')
+        if v:
+            return v
     return 224
 
 
@@ -671,6 +852,16 @@ def main():
     ap.add_argument('--mirror-dir', default='',
                     help="copy the output to this folder instead ('' = off)")
     args = ap.parse_args()
+    try:
+        # a folder dropped on a launcher, as it really was (see _setup)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _setup import dropped_path
+        _was = args.inventory
+        args.inventory = dropped_path(args.inventory, os.path.dirname(os.path.abspath(__file__)))
+        if args.inventory != _was:
+            print('Using the dropped path as Windows passed it in full: ' + args.inventory)
+    except Exception:
+        pass
 
     inv = find_inventory(args.inventory)
     if not inv:
@@ -707,8 +898,19 @@ def main():
     # stop, and it was invisible because the opposite direction (an fp16
     # file resumed without the flag) was caught correctly.
     device = resolve_device(args.device)
-    use_half = args.fp16 and device in ('cuda', 'xpu')
+    # Apple Metal runs float16 under autocast from torch 2.5; before that
+    # autocast refuses the 'mps' device. It used to be refused outright,
+    # while the message beside it named mps as the GPU in use.
+    half_ok = device in ('cuda', 'xpu') or (
+        device == 'mps' and tuple(int(x) for x in
+                                  re.findall(r'\d+', torch.__version__)[:2]) >= (2, 5))
+    use_half = args.fp16 and half_ok
     use_gpu_preprocess = args.gpu_preprocess and device != 'cpu'
+    if args.gpu_preprocess and not use_gpu_preprocess:
+        # said, not dropped: the STOP below may name a preprocessing change
+        # that happened only because of this
+        print('Note: --gpu-preprocess applies only on a GPU; this run is on the')
+        print('      CPU, so the Pillow path is used.')
     if use_gpu_preprocess:
         pre_tag = (GPU_FULL_JPEG_PRE_TAG if args.no_draft else GPU_PRE_TAG)
     else:
@@ -717,14 +919,16 @@ def main():
     done = set()
     prev_err = {}                     # sha -> last recorded error message
     prev_model = prev_dim = prev_pre = prev_prec = None
+    has_header = False
     if os.path.exists(out):
-        with open(out, encoding='utf-8') as f:
+        with open(out, 'rb') as f:           # bytes: see load_inventory
             for line in f:
                 try:
                     r = json.loads(line)
                 except Exception:
                     continue
                 if r.get('schema') == 'img-emb/1':
+                    has_header = True
                     prev_model = r.get('model')
                     prev_dim = r.get('dim')
                     prev_pre = r.get('pre')
@@ -739,6 +943,22 @@ def main():
                     done.discard(r['sha'])
                     prev_err[r['sha']] = r.get('err')
         print('Resuming: ' + str(len(done)) + ' already embedded in ' + out)
+        # Every guard below compares against the header, and each one used to
+        # pass when its field was simply missing. A file with vectors and no
+        # header at all - its header line torn, say - accepted any model and
+        # any precision. Unknown is not compatible.
+        if done and (not has_header or not prev_model):
+            print('')
+            print('  [STOP] That file holds vectors but no header saying which')
+            print('  model and precision built them, so nothing here can check')
+            print('  that new vectors would match. Move it aside (or delete it)')
+            print('  and embed again.')
+            sys.exit(2)
+        # Files from before v4.2f carry no "prec": they are all float32, which
+        # is when --fp16 and the field arrived together. Read as unknown, an
+        # --fp16 run appended float16 vectors to one without a word.
+        if has_header and not prev_prec:
+            prev_prec = 'fp32'
         if prev_model and prev_model != args.model:
             print('')
             print('  [STOP] That file was built with a different model:')
@@ -762,11 +982,17 @@ def main():
                 # The subtle case: they DID pass --fp16, so "re-run with
                 # --fp16" would be maddening advice. The flag is being
                 # ignored because this run is not on a GPU.
-                print('  --fp16 was given but only applies on a GPU, and this')
-                print('  run is on %s. Either run it where the GPU is visible'
-                      % device)
-                print('  (see the device note above), or move the file aside')
-                print('  and re-embed from scratch on this machine.')
+                if device == 'mps':
+                    print('  --fp16 was given, but on Apple Metal it needs torch 2.5')
+                    print('  or newer (this is %s). Update torch, or move the file'
+                          % torch.__version__)
+                    print('  aside and re-embed from scratch on this machine.')
+                else:
+                    print('  --fp16 was given but only applies on a GPU, and this')
+                    print('  run is on %s. Either run it where the GPU is visible'
+                          % device)
+                    print('  (see the device note above), or move the file aside')
+                    print('  and re-embed from scratch on this machine.')
             else:
                 print('  Re-run %s --fp16, or move the file aside to start '
                       'fresh.' % ('with' if prev_prec == 'fp16' else 'without'))
@@ -781,6 +1007,9 @@ def main():
             print('  reach the model. Mixing preprocessing populations would')
             print('  make cosine comparisons inconsistent. Move the embeddings')
             print('  file aside and re-embed the whole inventory.')
+            if args.gpu_preprocess and not use_gpu_preprocess:
+                print('  (--gpu-preprocess was given but ignored: this run is on')
+                print('  the CPU. On the GPU it would match that file.)')
             sys.exit(2)
         if done and prev_pre != pre_tag:
             # Cumulative: name every change the existing file predates, so a
@@ -825,6 +1054,8 @@ def main():
     todo = [r for r in recs if r['sha'] not in done]
     if not todo:
         print('Nothing new to embed. Done.')
+        # the copy was skipped along with the work, so --share did nothing
+        mirror_output(out, root, args)
         return
 
     if _TV_BROKEN is not None:
@@ -837,10 +1068,8 @@ def main():
         print('         Embedding continues on the Pillow image path (same results,')
         print('         marginally slower preprocessing). To clean it up, either:')
         print('           "' + sys.executable + '" -m pip uninstall torchvision')
-        print('         (this tool never needs it), or reinstall the matched pair:')
-        print('           ' + _hint('--force-reinstall torch torchvision '
-                                    '--index-url '
-                                    'https://download.pytorch.org/whl/cu132'))
+        print('         This tool never needs it. (Reinstalling the pair from the')
+        print('         CUDA index, the old advice, swapped a ROCm or Intel torch.)')
         print('')
 
     batch = args.batch or (8 if device == 'cpu' else 64)
@@ -1035,6 +1264,15 @@ def main():
     consec_fail = 0
     header_written = bool(done)
     pool = ThreadPoolExecutor(max_workers=workers)
+    # A file cut off mid-line (power loss, full disk) got the next record
+    # appended straight onto the fragment, fusing the two into one line
+    # that nothing can parse - a vector lost, or the header. End the
+    # fragment first, so it is one bad line on its own and skipped.
+    if os.path.exists(out) and os.path.getsize(out):
+        with open(out, 'rb+') as fx:
+            fx.seek(-1, os.SEEK_END)
+            if fx.read(1) != b'\n':
+                fx.write(b'\n')
     with open(out, 'a', encoding='utf-8') as f:
 
         # use_half was decided up with the device, before the resume guard
@@ -1115,9 +1353,8 @@ def main():
                         msg = str(e)[:200]
                         r0, used0 = metas[0]
                         if prev_err.get(r0['sha']) != msg:
-                            f.write(json.dumps({'sha': r0['sha'],
-                                                'p': used0, 'err': msg},
-                                               ensure_ascii=False) + '\n')
+                            f.write(json_line({'sha': r0['sha'],
+                                               'p': used0, 'err': msg}))
                             prev_err[r0['sha']] = msg
                         err += 1
                         consec_fail += 1
@@ -1158,8 +1395,7 @@ def main():
                     sys.exit(2)
                 for (r, used), vec in zip(metas, v16):
                     b64 = base64.b64encode(vec.tobytes()).decode('ascii')
-                    f.write(json.dumps({'sha': r['sha'], 'p': used, 'v': b64},
-                                       ensure_ascii=False) + '\n')
+                    f.write(json_line({'sha': r['sha'], 'p': used, 'v': b64}))
                     ok += 1
             flushed_batches += 1
             if flushed_batches % 10 == 0 or final:
@@ -1183,8 +1419,8 @@ def main():
                     if prev_err.get(r['sha']) != e:
                         # only record a failure once per distinct message -
                         # a permanent failure must not grow the file each run
-                        f.write(json.dumps({'sha': r['sha'], 'p': used,
-                                            'err': e}, ensure_ascii=False) + '\n')
+                        f.write(json_line({'sha': r['sha'], 'p': used,
+                                           'err': e}))
                         prev_err[r['sha']] = e
                     err += 1
                     continue
@@ -1207,17 +1443,7 @@ def main():
     print('Done: %d embedded, %d unreadable, %.1f min.' % (ok, err, (time.time() - t0) / 60))
     print('Output: ' + out)
 
-    mdir = args.mirror_dir or (MIRROR_DIR if args.share else '')
-    if mdir:
-        try:
-            os.makedirs(mdir, exist_ok=True)
-            tag = os.path.basename(root.rstrip('\\/')) or 'root'
-            # mirror under the real output name, so image-embeddings-2.jsonl
-            # does not overwrite the mirror of image-embeddings.jsonl
-            shutil.copy2(out, os.path.join(mdir, tag + ' - ' + os.path.basename(out)))
-            print('Copied to the shared folder for your AI assistant: ' + mdir)
-        except Exception as e:
-            print('(shared copy skipped: ' + str(e)[:120] + ')')
+    mirror_output(out, root, args)
     print('')
     print('Next: run Analyze-Inventory.bat - it picks these embeddings up')
     print('automatically. Local by default; --share is the opt-in handoff to')

@@ -34,12 +34,25 @@
 #  and that has fooled this toolkit before.
 # ----------------------------------------------------------------------
 set -u
-HERE=$(cd "$(dirname "$0")" && pwd)
+# Where this script really lives. A symlink to it - ~/bin/imgdedup, say -
+# is followed to the toolkit: dirname "$0" took the link's own folder and
+# reported the toolkit missing. CDPATH is cleared for the cd: exported, it
+# sent cd somewhere else, or made cd print the path and doubled HERE.
+SELF=$0
+while [ -h "$SELF" ]; do
+    LINK=$(readlink -- "$SELF") || break
+    case $LINK in
+        /*) SELF=$LINK ;;
+        *)  SELF=$(dirname -- "$SELF")/$LINK ;;
+    esac
+done
+HERE=$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd) || exit 1
 
 usage() {
     # print the header comment up to (not including) its closing dashed
-    # rule, so the range cannot drift when the header grows
-    sed -n '3,/^# ----/p' "$0" | sed '$d' | sed 's/^# \{0,2\}//'
+    # rule, so the range cannot drift when the header grows. $SELF, not $0:
+    # inside a function zsh sets $0 to the function's own name.
+    sed -n '3,/^# ----/p' "$SELF" | sed '$d' | sed 's/^# \{0,2\}//'
     exit "${1:-1}"
 }
 
@@ -76,14 +89,6 @@ try_py() {
     return 0
 }
 
-if [ -n "${IMGDEDUP_PYTHON:-}" ]; then
-    if "$IMGDEDUP_PYTHON" -c "$PROBE" >/dev/null 2>&1; then
-        PYCMD=$IMGDEDUP_PYTHON
-    else
-        printf '[WARN] IMGDEDUP_PYTHON=%s cannot run this stage; trying others.\n' \
-               "$IMGDEDUP_PYTHON" >&2
-    fi
-fi
 # A .venv beside this script is how setup gets out of a PEP 668 distro,
 # where pip will not touch the system Python. Prefer it over anything on
 # PATH: it is the environment we populated on purpose.
@@ -94,31 +99,60 @@ fi
 # later run inside the very environment that needs repairing.
 VPROBE=$PROBE
 [ "$CMD" = setup ] && VPROBE='import sys, pip'
-if [ -z "$PYCMD" ]; then
-    for v in "$HERE/.venv/bin/python" "$HERE/.venv/Scripts/python.exe"; do
-        [ -x "$v" ] || continue
-        if "$v" -c "$VPROBE" >/dev/null 2>&1; then
-            PYCMD=$v
-            break
+
+# The whole search, as a function: it runs again after setup, so an
+# accepted setup goes on to run the stage instead of stopping at
+# "Setup finished - re-run" with exit 0, which let `collect X && analyze X`
+# carry on even when setup had installed nothing.
+pick() {
+    PYCMD=""
+    if [ -n "${IMGDEDUP_PYTHON:-}" ]; then
+        if "$IMGDEDUP_PYTHON" -c "$PROBE" >/dev/null 2>&1; then
+            PYCMD=$IMGDEDUP_PYTHON
+        else
+            printf '[WARN] IMGDEDUP_PYTHON=%s cannot run this stage; trying others.\n' \
+                   "$IMGDEDUP_PYTHON" >&2
         fi
-    done
-fi
-if [ -z "$PYCMD" ]; then
-    # Newest-first, each probed functionally, then the unversioned names.
-    # The explicit list has an expiry date - 3.15 is not in it - but unlike
-    # the Windows side that is harmless here: python3 almost always points
-    # at the newest installed interpreter, so a future version is still
-    # reached by the last two entries. It just loses its place in the
-    # ordering, not its chance.
-    for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 \
-             python3 python; do
-        try_py "$c" && break
-    done
-fi
+    fi
+    if [ -z "$PYCMD" ]; then
+        for v in "$HERE/.venv/bin/python" "$HERE/.venv/Scripts/python.exe"; do
+            [ -x "$v" ] || continue
+            if "$v" -c "$VPROBE" >/dev/null 2>&1; then
+                PYCMD=$v
+                break
+            fi
+        done
+    fi
+    if [ -z "$PYCMD" ]; then
+        # Newest-first, each probed functionally, then the unversioned names.
+        # The explicit list has an expiry date - 3.15 is not in it - but
+        # unlike the Windows side that is harmless here: python3 almost
+        # always points at the newest installed interpreter, so a future
+        # version is still reached by the last two entries. It just loses
+        # its place in the ordering, not its chance.
+        for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 \
+                 python3 python; do
+            try_py "$c" && break
+        done
+    fi
+}
+pick
 
 if [ -z "$PYCMD" ]; then
     printf '\n[FAIL] no Python here can run "%s".\n\n' "$CMD" >&2
     printf 'Each candidate was asked to actually run:\n    %s\n\n' "$PROBE" >&2
+    # Every candidate the search tried, in its order - the override and the
+    # .venv were missing here, so a broken .venv (left dangling by a distro
+    # Python upgrade, say) was invisible in the one report meant to show it.
+    if [ -n "${IMGDEDUP_PYTHON:-}" ]; then
+        printf '  IMGDEDUP_PYTHON (%s) said:\n' "$IMGDEDUP_PYTHON" >&2
+        "$IMGDEDUP_PYTHON" -c "$PROBE" 2>&1 | sed 's/^/      /' >&2
+    fi
+    for v in "$HERE/.venv/bin/python" "$HERE/.venv/Scripts/python.exe"; do
+        [ -e "$v" ] || [ -h "$v" ] || continue
+        printf '  .venv (%s) said:\n' "$v" >&2
+        "$v" -c "$VPROBE" 2>&1 | sed 's/^/      /' >&2
+    done
     BASEPY=""
     for c in python3 python; do
         if command -v "$c" >/dev/null 2>&1; then
@@ -137,18 +171,28 @@ if [ -z "$PYCMD" ]; then
         printf 'A Python is present; it is the packages that are missing.\n' >&2
         printf 'Run setup now? It will show each command and ask first.\n' >&2
         printf '  [y/N]: ' >&2
-        read -r ans </dev/tty 2>/dev/null || ans=""
+        # stderr first: redirections apply left to right, and with
+        # </dev/tty first a machine with no terminal printed
+        # "cannot open /dev/tty" despite the 2>/dev/null
+        read -r ans 2>/dev/null </dev/tty || ans=""
         case "$ans" in
             [Yy]*) "$BASEPY" "$HERE/_setup.py" || exit 1
-                   printf '\nSetup finished - re-run: ./imgdedup.sh %s\n\n' "$CMD" >&2
-                   exit 0 ;;
+                   pick
+                   if [ -z "$PYCMD" ]; then
+                       printf '\nSetup finished, but still no Python here can run "%s".\n' \
+                              "$CMD" >&2
+                       printf 'Run ./imgdedup.sh doctor for the full picture.\n\n' >&2
+                       exit 1
+                   fi
+                   printf '\nSetup finished - continuing.\n\n' >&2 ;;
+            *) printf '\nSkipped. Run it yourself any time:  ./imgdedup.sh setup\n\n' >&2
+               exit 1 ;;
         esac
-        printf '\nSkipped. Run it yourself any time:  ./imgdedup.sh setup\n\n' >&2
     else
         printf '\nInstall Python 3 from your package manager, then run:\n' >&2
         printf '  ./imgdedup.sh setup\n\n' >&2
+        exit 1
     fi
-    exit 1
 fi
 
 # ${1+"$@"} rather than "$@": under `set -u`, bash 3.2 - which is what

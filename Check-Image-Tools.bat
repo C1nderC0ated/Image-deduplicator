@@ -1,5 +1,7 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions DisableDelayedExpansion
+rem  helpers are called through %%TOOLDIR%%: see Find-Duplicates.bat
+set "TOOLDIR=%~dp0"
 cd /d "%~dp0"
 
 rem ----------------------------------------------------------------------
@@ -27,12 +29,12 @@ if not exist "%~dp0_pick-python.bat" (
     exit /b 1
 )
 
-call "%~dp0_pick-python.bat" "%PROBE%"
+call "%%TOOLDIR%%_pick-python.bat" "%PROBE%"
 if not defined PYTHON_CMD goto :no_python
 goto :run
 
 :no_python
-call "%~dp0_why-no-python.bat" "%PROBE%"
+call "%%TOOLDIR%%_why-no-python.bat" "%PROBE%"
 pause
 exit /b 1
 

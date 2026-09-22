@@ -92,7 +92,7 @@ def _hint(pkg):
         from _setup import pip_hint
         return pip_hint(pkg)
     except Exception:
-        return '"%s" -m pip install --user %s' % (sys.executable, pkg)
+        return '"%s" -m pip install %s' % (sys.executable, pkg)
 
 
 try:
@@ -103,23 +103,28 @@ except ImportError:
     sys.exit(2)
 
 HEIF_OK = False
+AVIF_VIA_HEIF = False
 try:
     import pillow_heif                      # optional; enables .heic/.heif
     pillow_heif.register_heif_opener()
     HEIF_OK = True
     try:
-        pillow_heif.register_avif_opener()  # separate call; .avif needs it on
-    except Exception:                       # Pillow builds without native AVIF
+        pillow_heif.register_avif_opener()  # pillow-heif before 1.0 only:
+        AVIF_VIA_HEIF = True                # 1.0 dropped AVIF for Pillow's own
+    except Exception:
         pass
 except Exception:
     pass
 
-# .avif decodes natively on Pillow 11.2+ wheels; pillow-heif covers the rest.
+# .avif decodes natively on Pillow 11.2+. pillow-heif is no help from its
+# 1.0 on, so having it installed says nothing about AVIF - that assumption
+# silenced the notice while every .avif failed. check_module, not check:
+# check() prints "Unknown feature" on a Pillow that predates AVIF.
 try:
     from PIL import features as _pil_features
-    AVIF_OK = HEIF_OK or bool(_pil_features.check('avif'))
+    AVIF_OK = AVIF_VIA_HEIF or bool(_pil_features.check_module('avif'))
 except Exception:
-    AVIF_OK = HEIF_OK
+    AVIF_OK = AVIF_VIA_HEIF
 
 # Extensions this interpreter has no decoder for; the run says so up front.
 NO_CODEC_EXTS = tuple(e for e, ok in (('.heic', HEIF_OK), ('.heif', HEIF_OK),
@@ -127,6 +132,17 @@ NO_CODEC_EXTS = tuple(e for e, ok in (('.heic', HEIF_OK), ('.heif', HEIF_OK),
                       if not ok)
 
 Image.MAX_IMAGE_PIXELS = 300_000_000
+
+# Pillow refuses a PNG whose compressed text chunk (or colour profile)
+# inflates past 1 MB, so a picture every viewer opens - a ComfyUI workflow
+# is easily that big - was recorded as unreadable and never compared. The
+# guard is aimed at untrusted uploads, like the pixel limit; the user owns
+# every file here. 16 MB still bounds a hostile chunk.
+try:
+    from PIL import PngImagePlugin as _png
+    _png.MAX_TEXT_CHUNK = max(_png.MAX_TEXT_CHUNK, 16 * 1024 * 1024)
+except Exception:
+    pass
 
 # Pillow writes this straight to stderr, unbuffered, so it landed ABOVE our
 # own banner:
@@ -680,6 +696,10 @@ def process_one(full, rel, thumb_px, fast=True):
     src = io.BytesIO(data) if data is not None else full
     with Image.open(src) as im:
         rec['fmt'] = im.format or ''
+        # The analyzer's keeper rule needs it: a greyscale ('L') or palette
+        # ('P') copy has lost colour the others still have, whatever its
+        # format or size. Header-only, like the size below.
+        rec['mode'] = im.mode or ''
         rec['w'], rec['h'] = im.size
         # Read from the header - Image.open is lazy, so this costs nothing
         # and is known BEFORE the decode that might run out of memory.
@@ -712,14 +732,26 @@ def process_one(full, rel, thumb_px, fast=True):
         try:
             txt = getattr(im, 'text', None)
             if txt:
-                keep = {}
-                for k, v in txt.items():
-                    if k.lower() in PNG_TEXT_KEYS and isinstance(v, str) and v.strip():
-                        keep[k[:24]] = v.strip()[:300]
-                    if len(keep) >= 4:
-                        break
+                # 300 characters is for the eye. The analyzer compares the
+                # WHOLE value, as a digest ('txth'): an A1111 prompt plus
+                # its negative prompt runs past 300 characters, and the seed
+                # comes after them, so two re-rolls stored identical text
+                # and the veto that exists to tell them apart never fired.
+                # Generation keys go first, so four other chunks cannot
+                # crowd them out of the four kept.
+                keep, digest = {}, {}
+                items = sorted(
+                    ((k, v) for k, v in txt.items()
+                     if k.lower() in PNG_TEXT_KEYS and isinstance(v, str)
+                     and v.strip()),
+                    key=lambda kv: PNG_TEXT_KEYS.index(kv[0].lower()))
+                for k, v in items[:4]:
+                    keep[k[:24]] = v.strip()[:300]
+                    digest[k[:24]] = hashlib.sha1(v.strip().encode(
+                        'utf-8', 'surrogatepass')).hexdigest()[:16]
                 if keep:
                     rec['txt'] = keep
+                    rec['txth'] = digest
         except Exception:
             pass
 
@@ -798,7 +830,30 @@ def work_one(full, rel, thumb_px, fast=True):
         return 'err', rec, os.path.splitext(rel)[1].lower()
 
 
-def walk_images(root, skip_names, on_relink=None):
+def codec_fixes(exts):
+    """What installs the missing decoder: pillow-heif for HEIC/HEIF, a
+    newer Pillow for AVIF (pillow-heif 1.0 and later do not decode AVIF, so
+    pointing an AVIF owner at it could not help)."""
+    out = []
+    if any(e in ('.heic', '.heif', '.hif') for e in exts):
+        out.append(_hint('pillow-heif') + '   (HEIC/HEIF)')
+    if '.avif' in exts:
+        out.append(_hint('--upgrade "pillow>=11.2"') + '   (AVIF)')
+    return out
+
+
+def _header_root(path):
+    """The root recorded in an inventory file's header, or None."""
+    try:
+        with open(path, 'rb') as f:
+            r = json.loads(f.readline())
+        return r.get('root') if isinstance(r, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
+                on_unlistable=None):
     """Every image under root, each PHYSICAL file once.
 
     os.walk(followlinks=False) does not stop a Windows junction. Junctions
@@ -825,8 +880,27 @@ def walk_images(root, skip_names, on_relink=None):
     A junction pointing somewhere genuinely outside the tree still gets
     scanned - it is new content, and skipping it would lose files. Only a
     second route to something already walked is dropped.
+
+    The same holds one level down, for FILES. A file symlink beside its
+    target, or a second hard link, is one file under two names, and it
+    failed exactly as the junction did: two records, one SHA, a Tier A
+    pair - and when the link sorted first it became the suggested keeper,
+    the real file got the X, and the recycler's hash check read straight
+    through the link and passed it as the survivor. So a link whose target
+    the walk reaches anyway is skipped, and any file already seen under
+    another name (same device and inode) is skipped. A link to a file
+    OUTSIDE the tree is kept: it is the only route to that picture.
+
+    A symlinked FOLDER is different again: os.walk does not enter one, so
+    it is not a route at all and must not claim its target. It did - the
+    target's resolved path was marked as walked - so with albums/best ->
+    ../photos/2020 met first, photos/2020 was then skipped as a "second
+    route" and scanned zero times. Now the walk takes the real folder. A
+    symlinked folder pointing OUTSIDE the tree is still not followed, as
+    before, but it is reported rather than silently missing.
     """
     seen_dirs = set()
+    seen_files = {}
 
     def resolved(p):
         try:
@@ -834,13 +908,46 @@ def walk_images(root, skip_names, on_relink=None):
         except OSError:
             return os.path.normcase(os.path.abspath(p))
 
-    seen_dirs.add(resolved(root))
-    for dirpath, dirnames, filenames in os.walk(root):
+    def skipped_dir(d):
+        return (d.lower() in SKIP_DIRS
+                or d.lower().startswith(SKIP_DIR_PREFIXES)
+                or d.startswith('.'))
+
+    root_r = resolved(root)
+
+    def walked_anyway(target):
+        """True when the walk reaches this resolved file under its own name:
+        inside the tree, through folders it enters, with an image extension."""
+        if not os.path.isfile(target):
+            return False
+        if target != root_r and not target.startswith(
+                root_r.rstrip(os.sep) + os.sep):
+            return False
+        parts = os.path.relpath(target, root_r).split(os.sep)
+        if any(skipped_dir(d) for d in parts[:-1]):
+            return False
+        if os.path.splitext(parts[-1])[1].lower() not in EXTS:
+            return False
+        return target not in skip_names
+
+    seen_dirs.add(root_r)
+    # A folder that cannot be listed (permission, I/O error) used to drop
+    # out with its whole subtree and no word; the caller is told instead.
+    def unlistable(err):
+        if on_unlistable is not None:
+            on_unlistable(getattr(err, 'filename', None) or str(err), err)
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=unlistable):
         keep = []
         for d in dirnames:
-            if (d.lower() in SKIP_DIRS
-                    or d.lower().startswith(SKIP_DIR_PREFIXES)
-                    or d.startswith('.')):
+            if skipped_dir(d):
+                continue
+            if os.path.islink(os.path.join(dirpath, d)):
+                t = resolved(os.path.join(dirpath, d))
+                if (on_outside_link is not None and t != root_r
+                        and not t.startswith(root_r.rstrip(os.sep) + os.sep)):
+                    on_outside_link(os.path.join(dirpath, d),
+                                    os.path.realpath(os.path.join(dirpath, d)))
                 continue
             r = resolved(os.path.join(dirpath, d))
             if r in seen_dirs:
@@ -848,7 +955,8 @@ def walk_images(root, skip_names, on_relink=None):
                 # rather than skipped quietly: from the outside this looks
                 # like files going missing from the scan.
                 if on_relink is not None:
-                    on_relink(os.path.join(dirpath, d), r)
+                    on_relink(os.path.join(dirpath, d),
+                              os.path.realpath(os.path.join(dirpath, d)))
                 continue
             seen_dirs.add(r)
             keep.append(d)
@@ -859,6 +967,24 @@ def walk_images(root, skip_names, on_relink=None):
             full = os.path.join(dirpath, name)
             if os.path.normcase(os.path.abspath(full)) in skip_names:
                 continue
+            if os.path.islink(full):
+                r = resolved(full)
+                if walked_anyway(r):
+                    if on_relink is not None:
+                        on_relink(full, os.path.realpath(full))
+                    continue
+            try:
+                st = os.stat(full)
+                key = (st.st_dev, st.st_ino) if st.st_ino else None
+            except OSError:
+                key = None          # unreadable: the worker records why
+            if key is not None:
+                first = seen_files.get(key)
+                if first is not None:
+                    if on_relink is not None:
+                        on_relink(full, first)
+                    continue
+                seen_files[key] = full
             yield full
 
 
@@ -899,7 +1025,9 @@ def load_previous(root, thumb):
     files = sorted(glob.glob(os.path.join(glob.escape(root), 'image-inventory*.jsonl')))
     for fp in sorted(files, key=lambda p: (os.path.getmtime(p), p)):
         try:
-            with open(fp, encoding='utf-8') as f:
+            # bytes: json.loads decodes inside the try, so a line torn
+            # mid-character is skipped instead of aborting the resume
+            with open(fp, 'rb') as f:
                 file_thumb = None
                 file_fmt = None
                 recs = {}
@@ -974,7 +1102,18 @@ class PartWriter:
         if self.roll:
             self._open_next()
             self.roll = False
-        self.f.write(json.dumps(obj, ensure_ascii=False).encode('utf-8') + self.nl)
+        # A name that is not valid UTF-8 (Linux, surrogateescape) or holds an
+        # unpaired UTF-16 unit (NTFS) arrives with a lone surrogate, which
+        # UTF-8 cannot encode: one such file aborted the whole scan, and a
+        # resume died at the same file again. Such a record is written with
+        # JSON escapes instead; json.loads gives the same string back, and
+        # every other record stays readable, byte for byte as before.
+        line = json.dumps(obj, ensure_ascii=False)
+        try:
+            data = line.encode('utf-8')
+        except UnicodeEncodeError:
+            data = json.dumps(obj).encode('ascii')
+        self.f.write(data + self.nl)
         if self.f.tell() > self.limit:
             self.roll = True
 
@@ -1012,6 +1151,16 @@ def main():
     ap.add_argument('--mirror-dir', default='',
                     help="copy the output to this folder instead ('' = off)")
     args = ap.parse_args()
+    try:
+        # a folder dropped on a launcher, as it really was (see _setup)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _setup import dropped_path
+        _was = args.folder
+        args.folder = dropped_path(args.folder, os.path.dirname(os.path.abspath(__file__)))
+        if args.folder != _was:
+            print('Using the dropped path as Windows passed it in full: ' + args.folder)
+    except Exception:
+        pass
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(args.folder) if args.folder else script_dir
@@ -1043,7 +1192,14 @@ def main():
         elif sys.stdin.isatty():
             print('Found a previous inventory here ('
                   + str(len(prev)) + ' records in ' + str(len(prev_files)) + ' file(s)).')
-            ans = input('Reuse it for unchanged files? [Y/n]: ').strip().lower()
+            try:
+                ans = input('Reuse it for unchanged files? [Y/n]: ').strip().lower()
+            except EOFError:
+                # Windows reports NUL as a terminal, so a run with its input
+                # from NUL reached this prompt and died on end of input
+                print('')
+                print('No answer - rescanning fresh. Pass --resume to reuse it.')
+                ans = 'n'
             use_resume = ans in ('', 'y', 'yes')
         else:
             print('Previous inventory found; pass --resume to reuse it. Rescanning fresh.')
@@ -1081,35 +1237,72 @@ def main():
 
     print('Scanning: ' + root)
     relinks = []
+    outside = []
+    unlisted = []
     files = list(walk_images(root, skip_names,
-                             lambda p, r: relinks.append((p, r))))
+                             lambda p, r: relinks.append((p, r)),
+                             lambda p, r: outside.append((p, r)),
+                             lambda p, e: unlisted.append((p, e))))
     total = len(files)
     print('Found ' + str(total) + ' image files.')
     if relinks:
         # Said out loud. A junction that doubles the tree used to end with
         # the recycler deleting both copies of every file, and the only
         # visible sign was a suspiciously tidy pile of "exact duplicates".
+        nd = sum(1 for p, _r in relinks if os.path.isdir(p))
+        nf = len(relinks) - nd
+        what = []
+        if nd:
+            what.append('%d folder%s' % (nd, '' if nd == 1 else 's'))
+        if nf:
+            what.append('%d file%s' % (nf, '' if nf == 1 else 's'))
         print('')
-        print('%d folder(s) are a second route to something already scanned'
-              % len(relinks))
-        print('(a junction, symlink or mount point). Walked once, not twice -')
-        print('otherwise one file appears under two names and looks like its')
-        print('own duplicate:')
+        print('%s %s a second route to something already scanned'
+              % (' and '.join(what), 'is' if len(relinks) == 1 else 'are'))
+        print('(a junction, symlink, hard link or mount point). Scanned once,')
+        print('not twice - otherwise one file appears under two names and looks')
+        print('like its own duplicate:')
         for p, r in relinks[:6]:
             print('   %s' % p)
             print('     -> %s' % r)
         if len(relinks) > 6:
             print('   ... and %d more' % (len(relinks) - 6))
+    if outside:
+        print('')
+        print('%d symlinked folder%s point%s outside this folder and %s not scanned'
+              % (len(outside), '' if len(outside) == 1 else 's',
+                 's' if len(outside) == 1 else '',
+                 'was' if len(outside) == 1 else 'were'))
+        print('(symlinks are not followed). Scan the target directly to include it:')
+        for p, r in outside[:6]:
+            print('   %s' % p)
+            print('     -> %s' % r)
+        if len(outside) > 6:
+            print('   ... and %d more' % (len(outside) - 6))
+    if unlisted:
+        print('')
+        print('%d folder%s could not be read and %s skipped, with everything'
+              % (len(unlisted), '' if len(unlisted) == 1 else 's',
+                 'was' if len(unlisted) == 1 else 'were'))
+        print('under %s:' % ('it' if len(unlisted) == 1 else 'them'))
+        for p, e in unlisted[:6]:
+            print('   %s  (%s)' % (p, type(e).__name__))
+        if len(unlisted) > 6:
+            print('   ... and %d more' % (len(unlisted) - 6))
     if total == 0:
         print('Nothing to do.')
-        return
+        # Its own exit code, so a caller can tell "no images here" from a
+        # scan: Find-Duplicates.bat went on to embed and analyze an empty
+        # folder and then reported "Stage failed" for the stage after it.
+        sys.exit(3)
     if NO_CODEC_EXTS:
         n_heif = sum(1 for f in files
                      if os.path.splitext(f)[1].lower() in NO_CODEC_EXTS)
         if n_heif:
             print('NOTE: ' + str(n_heif) + ' HEIC/HEIF/AVIF files present but the codec')
             print('      is not installed; they will be listed as unreadable.')
-            print('      Fix:  ' + _hint('pillow-heif'))
+            for line in codec_fixes(NO_CODEC_EXTS):
+                print('      Fix:  ' + line)
     workers = args.workers if args.workers > 0 else default_workers()
     print('Reading files (hash + thumbnail, %d worker%s). Progress below;'
           % (workers, '' if workers == 1 else 's'))
@@ -1231,8 +1424,11 @@ def main():
           + str(reused) + ' reused), ' + str(err) + ' unreadable.')
     if unreadable_ext:
         print('Unreadable by extension: ' + json.dumps(unreadable_ext))
-        if any(e in unreadable_ext for e in NO_CODEC_EXTS):
-            print('  -> install pillow-heif and re-run with --resume to fill these in.')
+        missing = [e for e in NO_CODEC_EXTS if e in unreadable_ext]
+        if missing:
+            for line in codec_fixes(missing):
+                print('  -> ' + line)
+            print('     then re-run with --resume to fill these in.')
     if unreadable_why:
         print('')
         print('Why they failed:')
@@ -1299,9 +1495,30 @@ def main():
     elif mdir:
         try:
             os.makedirs(mdir, exist_ok=True)
-            tag = os.path.basename(root) or 'root'
-            for p in w.paths:
-                shutil.copy2(p, os.path.join(mdir, tag + ' - ' + os.path.basename(p)))
+            # The copy is named after the folder alone, so two libraries
+            # both called "Photos" landed on one name and the second copy
+            # mixed with the first's parts. A copy of another root takes a
+            # numbered name instead.
+            base_tag = os.path.basename(root) or 'root'
+            tag, n_tag = base_tag, 1
+            while True:
+                other = _header_root(os.path.join(
+                    mdir, tag + ' - ' + os.path.basename(w.paths[0])))
+                if other is None or (os.path.normcase(os.path.abspath(other))
+                                     == os.path.normcase(os.path.abspath(root))):
+                    break
+                n_tag += 1
+                tag = '%s (%d)' % (base_tag, n_tag)
+            names = [tag + ' - ' + os.path.basename(p) for p in w.paths]
+            for p, nm in zip(w.paths, names):
+                shutil.copy2(p, os.path.join(mdir, nm))
+            # An earlier, longer run left .partN files under this name, and
+            # they were read as part of this copy. Only this tool's own
+            # copies match the name.
+            stale_stem, stale_ext = strip_jsonl(os.path.join(mdir, names[0]))
+            for q in glob.glob(glob.escape(stale_stem) + '.part*' + stale_ext):
+                if os.path.basename(q) not in names:
+                    os.remove(q)
             print('Copied to the shared folder for your AI assistant: ' + mdir)
         except Exception as e:
             print('(shared copy skipped: ' + str(e)[:120] + ')')

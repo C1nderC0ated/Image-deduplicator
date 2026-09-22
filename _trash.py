@@ -60,6 +60,11 @@ def _win_send(path):
     FOF_NOCONFIRMATION = 0x0010
     FOF_ALLOWUNDO = 0x0040          # this is what means "Recycle Bin"
     FOF_NOERRORUI = 0x0400
+    # FOF_NOCONFIRMATION alone lets the shell DESTROY a file it cannot
+    # recycle - a bin turned off for the drive, a file bigger than the bin -
+    # and still report success. This flag overrides that one case only: the
+    # shell asks before a permanent delete, and a "no" comes back as aborted.
+    FOF_WANTNUKEWARNING = 0x4000
 
     full = os.path.abspath(path)
     ok, why = _win_precheck(full)
@@ -74,7 +79,8 @@ def _win_send(path):
     # character (an emoji in a filename) must not be measured with len().
     op.pFrom = full + '\0'
     op.pTo = None
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+                 | FOF_WANTNUKEWARNING)
     op.fAnyOperationsAborted = 0
     op.hNameMappings = None
     op.lpszProgressTitle = None
@@ -152,10 +158,16 @@ def _win_precheck(path):
                        'PERMANENT, so it is refused. Delete it on the machine '
                        'that owns the share')
     lim = _win_long_path_limit()
-    if len(full) > lim:
-        return False, ('path is %d characters; Windows cannot recycle past %d - '
-                       'it would delete the file PERMANENTLY and report success'
-                       % (len(full), lim))
+    # Measured the way the shell measures it, in UTF-16 units: an emoji or
+    # any other character past U+FFFF is TWO. len() counted it as one, and a
+    # 259-character path that is 260 units passed this check - Windows then
+    # destroyed the file and the recycler reported it in the Recycle Bin.
+    units = len(full.encode('utf-16-le')) // 2
+    if units > lim:
+        return False, ('path is %d characters as Windows counts them (an emoji '
+                       'counts as two); Windows cannot recycle past %d - it '
+                       'would delete the file PERMANENTLY and report success'
+                       % (units, lim))
     drive = os.path.splitdrive(full)[0]
     if drive and not _win_volume_has_bin(drive):
         return False, ('volume %s has no usable Recycle Bin (removable and '

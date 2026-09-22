@@ -43,14 +43,27 @@ rem  No setlocal: this runs in the caller's variable scope on purpose, so
 rem  PYTHON_CMD survives the return without endlocal tricks.
 rem ----------------------------------------------------------------------
 set "_PP_PROBE=%~1"
+rem  Every probe failure test has a second line for a NEGATIVE exit code:
+rem  "if errorlevel 1" means ">= 1", and a probe that crashed the
+rem  interpreter (0xC0000005 = -1073741819) was taken as a working one.
 set "PYTHON_CMD="
 set "PICK_ERR=1"
 
 if not defined IMGDEDUP_PYTHON goto :pp_launcher
-"%IMGDEDUP_PYTHON%" -c "%_PP_PROBE%" >nul 2>&1
-if errorlevel 1 goto :pp_launcher
-set "PYTHON_CMD="%IMGDEDUP_PYTHON%""
+"%IMGDEDUP_PYTHON:"=%" -c "%_PP_PROBE%" >nul 2>&1
+if errorlevel 1 goto :pp_override_bad
+if not errorlevel 0 goto :pp_override_bad
+rem  No outer quotes: set "X="path"" put the path OUTSIDE the quoting, so
+rem  an "&" in it ended the command and the variable came out empty.
+set PYTHON_CMD="%IMGDEDUP_PYTHON:"=%"
 goto :pp_done
+
+:pp_override_bad
+rem  Said, not skipped quietly: the override is a deliberate choice, and
+rem  passing it over in silence looked like it had been ignored.
+echo [WARN] IMGDEDUP_PYTHON cannot run this check - trying the others:
+echo        "%IMGDEDUP_PYTHON:"=%"
+goto :pp_launcher
 
 :pp_launcher
 where py >nul 2>&1
@@ -72,6 +85,7 @@ rem  so if the newest interpreter cannot import what a stage needs, an older
 rem  one still wins. `py -3` alone would take the newest and stop.
 py -3 -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 goto :pp_venv
+if not errorlevel 0 goto :pp_venv
 set "PYTHON_CMD=py -3"
 goto :pp_done
 
@@ -82,12 +96,14 @@ rem beside the scripts, not beside whatever was dragged onto them.
 if not exist "%~dp0.venv\Scripts\python.exe" goto :pp_path
 "%~dp0.venv\Scripts\python.exe" -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 goto :pp_path
-set "PYTHON_CMD="%~dp0.venv\Scripts\python.exe""
+if not errorlevel 0 goto :pp_path
+set PYTHON_CMD="%~dp0.venv\Scripts\python.exe"
 goto :pp_done
 
 :pp_path
 python -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 goto :pp_fail
+if not errorlevel 0 goto :pp_fail
 set "PYTHON_CMD=python"
 goto :pp_done
 
@@ -95,6 +111,7 @@ goto :pp_done
 if defined PYTHON_CMD exit /b 0
 py -%1 -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 exit /b 0
+if not errorlevel 0 exit /b 0
 set "PYTHON_CMD=py -%1"
 exit /b 0
 

@@ -56,7 +56,7 @@ def _hint(pkg, exe=None, info=None):
         return pip_hint(pkg, exe, is_venv=info.get('in_venv'),
                         is_managed=info.get('managed'))
     except Exception:
-        return '"%s" -m pip install --user %s' % (exe or sys.executable, pkg)
+        return '"%s" -m pip install %s' % (exe or sys.executable, pkg)
 
 
 def _installable(info):
@@ -105,6 +105,28 @@ try:
     o['cuda'] = bool(torch.cuda.is_available())
     o['hip'] = getattr(torch.version, 'hip', None)
     o['cuda_build'] = getattr(torch.version, 'cuda', None)
+    # A CUDA 12.8+ build has no kernels for a card older than Turing (7.5),
+    # yet reports it available; the first kernel then fails. CUDA's rule: a
+    # binary for the same major and a lower-or-equal minor runs, and PTX
+    # ('compute_') runs on anything newer.
+    if o['cuda'] and not o['hip']:
+        try:
+            cap = tuple(torch.cuda.get_device_capability(0))
+            o['cuda_cc'] = '%d.%d' % cap
+            fits = False
+            for a in torch.cuda.get_arch_list():
+                kind, _, num = a.partition('_')
+                num = ''.join(ch for ch in num if ch.isdigit())
+                if len(num) < 2:
+                    continue
+                mj, mn = int(num[:-1]), int(num[-1])
+                if kind == 'sm' and mj == cap[0] and mn <= cap[1]:
+                    fits = True
+                if kind == 'compute' and (mj, mn) <= cap:
+                    fits = True
+            o['cuda_fits'] = fits
+        except Exception:
+            pass
     # The embedder runs on Intel Arc and on Apple Metal too. Reporting only
     # CUDA told an Arc owner "CPU only - BUT a GPU is present" and handed
     # them a reinstall command, about a setup that was already using the
@@ -117,6 +139,14 @@ try:
         o['mps'] = bool(torch.backends.mps.is_available())
     except Exception:
         o['mps'] = False
+    # the BUILD as well as the device: an XPU wheel whose driver is missing
+    # is still an XPU wheel, and was reported as CPU-only with a reinstall
+    # command for the very wheel already installed
+    o['xpu_build'] = bool(getattr(torch.version, 'xpu', None))
+    try:
+        o['mps_built'] = bool(torch.backends.mps.is_built())
+    except Exception:
+        o['mps_built'] = False
 except Exception as e:
     o['embed_ok'] = False
     o['embed_err'] = type(e).__name__ + ': ' + str(e)[:110]
@@ -153,10 +183,36 @@ print('@@' + json.dumps(o))
 '''
 
 
+def _decode(b):
+    """Child output as text. The py launcher writes UTF-8 to a pipe, and
+    the Python probes are told to (PYTHONIOENCODING in run); anything else
+    is read in the ANSI code page. Decoding everything in the ANSI code
+    page garbled a path with 'u-umlaut' so it was dropped, and one byte
+    undefined in cp1252 - from 'L-stroke', 'A-acute' or most Cyrillic -
+    failed the whole decode: every py-listed interpreter vanished and the
+    doctor said no Python existed at all."""
+    if not b:
+        return ''
+    try:
+        return b.decode('utf-8')
+    except UnicodeDecodeError:
+        import locale
+        return b.decode(locale.getpreferredencoding(False) or 'utf-8',
+                        'replace')
+
+
+def _setup_line(exe):
+    """The command that runs setup under EXE, with an absolute path: the
+    old relative "_setup.py" failed from any other directory."""
+    return '"%s" "%s"' % (exe, os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '_setup.py'))
+
+
 def run(cmd, timeout=180):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, (p.stdout or '') + (p.stderr or '')
+        env = dict(os.environ, PYTHONIOENCODING='utf-8')
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
+        return p.returncode, _decode(p.stdout) + _decode(p.stderr)
     except Exception as e:
         return -1, str(e)
 
@@ -351,7 +407,7 @@ def main():
                     else:
                         print('      [BROKEN] %-12s %s' % (name, val[4:][:66]))
                 else:
-                    print('      [MISS  ] %-13s %s' % (name, val[4:][:66]))
+                    print('      [MISS ] %-13s %s' % (name, val[4:][:66]))
             else:
                 note = '  (not needed by this toolkit)' if name == 'torchvision' else ''
                 print('      [ok   ] %-13s %s%s' % (name, val[:70], note))
@@ -377,10 +433,9 @@ def main():
                 print('         its compiled _C matches a torch build that is no longer')
                 print('         here (the usual aftermath of a torch reinstall). Fix:')
                 print('           "%s" -m pip uninstall torchvision' % exe)
-                print('         (nothing in this toolkit needs it), or reinstall the pair:')
-                print('           ' + _hint(
-                    '--force-reinstall torch torchvision --index-url '
-                    'https://download.pytorch.org/whl/cu132', exe, info))
+                print('         Nothing in this toolkit needs it. (The old second option,')
+                print('         reinstalling the pair from the CUDA index, swapped a ROCm or')
+                print('         Intel torch for a CUDA one.)')
         print('')
 
     print('  ' + '=' * 64)
@@ -402,23 +457,52 @@ def main():
         # torch.version.cuda is not a reliable discriminator. XPU and Metal
         # come after both, because neither sets torch.version.cuda and a
         # build that does set it is the one being described.
+        info = best_embed[2]
+        xpu_b = info.get('xpu') or info.get('xpu_build')
+        mps_b = info.get('mps') or info.get('mps_built')
         kind = ('ROCm/HIP %s' % hip if hip else
-                'CUDA %s' % best_embed[2].get('cuda_build')
-                if best_embed[2].get('cuda_build') else
-                'Intel XPU' if best_embed[2].get('xpu') else
-                'Apple Metal' if best_embed[2].get('mps') else 'CPU-only')
-        if (best_embed[2].get('cuda') or best_embed[2].get('xpu')
+                'CUDA %s' % info.get('cuda_build')
+                if info.get('cuda_build') else
+                'Intel XPU' if xpu_b else
+                'Apple Metal' if mps_b else 'CPU-only')
+        made_for = ('AMD' if hip else 'NVIDIA' if info.get('cuda_build')
+                    else 'Intel' if xpu_b else None)
+        gpu_v = vendors & {'NVIDIA', 'AMD', 'Intel'}
+        setup_line = _setup_line(info.get('exe') or best_embed[0][0])
+        if best_embed[2].get('cuda') and best_embed[2].get('cuda_fits') is False:
+            print('       CPU only - this %s build has no kernels for the GPU'
+                  % kind)
+            print('       (compute %s; PyTorch\'s CUDA 12.8 and newer builds start'
+                  % best_embed[2].get('cuda_cc'))
+            print('       at 7.5). The CUDA 12.6 build still supports this card.')
+            # setup, not a bare pip line: pip refuses a distro-managed Python,
+            # and setup already knows this card and the index to use
+            print('       Setup replaces the build with that one, and asks first:')
+            print('         ' + setup_line)
+        elif (best_embed[2].get('cuda') or best_embed[2].get('xpu')
                 or best_embed[2].get('mps')):
             print('       GPU acceleration available  (%s build).' % kind)
+        elif made_for and gpu_v and made_for not in gpu_v:
+            # a CUDA build on an AMD-only machine is not a driver problem
+            print('       CPU only - this %s build is made for %s GPUs, and the'
+                  % (kind, made_for))
+            print('       GPU here is %s. Setup replaces it with the right build:'
+                  % ', '.join(sorted(gpu_v)))
+            print('         ' + setup_line)
         else:
-            exe = best_embed[2].get('exe') or best_embed[0][0]
             if gpus and kind == 'CPU-only':
+                v = info.get('v', '')
                 print('       CPU only - BUT a GPU is present (%s).' % gpus[0])
-                print('       A CPU-only wheel (%s) can never use it; that is' % tv)
-                print('       decided when the wheel is installed. To switch:')
-                print('         "%s" -m pip uninstall torch' % exe)
-                print('         "%s" %s_setup.py    (picks the right build)'
-                      % (exe, '' if IS_WIN else ''))
+                if IS_WIN and gpu_v == {'AMD'} and not v.startswith('3.12'):
+                    # nothing to switch TO: removing torch to reinstall the
+                    # same CPU build was all the old advice could achieve
+                    print('       AMD ships its Windows GPU builds for Python 3.12 only;')
+                    print('       see "AMD GPUs" in the README.')
+                else:
+                    print('       A CPU-only wheel (%s) can never use it. Setup replaces'
+                          % tv)
+                    print('       it with the build for this GPU, and asks first:')
+                    print('         ' + setup_line)
             elif gpus:
                 print('       CPU only - a %s build is installed but no device is'
                       % kind)
@@ -428,12 +512,15 @@ def main():
                 print('       CPU only - slower, but fine (no GPU detected).')
         print('')
         exe_pin = best_embed[2].get('exe') or best_embed[0][0]
+        # quoted, so a path with spaces (or "&") can be pasted as it stands:
+        # unquoted, export stopped at the first space and set at the "&"
         if IS_WIN:
             print('  If Embed-Images.bat picks the wrong one, force it:')
-            print('       set IMGDEDUP_PYTHON=%s' % exe_pin)
+            print('       set "IMGDEDUP_PYTHON=%s"' % exe_pin)
         else:
+            import shlex
             print('  If ./imgdedup.sh picks the wrong one, force it:')
-            print('       export IMGDEDUP_PYTHON=%s' % exe_pin)
+            print('       export IMGDEDUP_PYTHON=%s' % shlex.quote(exe_pin))
     else:
         print('  embed-images.py             -> nothing can load torch + transformers.')
         pick = None
@@ -451,26 +538,26 @@ def main():
             exe = pick[2].get('exe') or pick[0][0]
             print('')
             print('     Install into: %s (Python %s)' % (pick[1], pick[2]['v']))
-            if not _installable(pick[2]):
+            if not pick[2].get('pip'):
+                # pip commands for an interpreter with no pip all fail with
+                # "No module named pip", right under its own [MISS] pip line
+                print('       It has no pip, so nothing installs into it as it is.')
+                print('       Setup makes a virtual environment, which brings its own:')
+                print('         ' + _setup_line(exe))
+            elif not _installable(pick[2]):
                 # No pip command can succeed against this interpreter, so the
-                # per-GPU menu below would be three identical copies of the
-                # same refusal under headings that promise commands.
+                # per-GPU menu would be identical copies of the same refusal.
                 print('       ' + _hint('torch', exe, pick[2]))
             else:
-                print('       CPU only:')
+                # setup reads the current index list and the GPU; a fixed
+                # CUDA index here went stale (and was wrong for older cards)
+                print('       Setup picks the PyTorch build for your GPU, and asks first:')
+                print('         ' + _setup_line(exe))
+                print('       Or by hand, CPU only:')
                 print('         ' + _hint('torch --index-url '
                                           'https://download.pytorch.org/whl/cpu',
                                           exe, pick[2]))
-                print('       NVIDIA GPU (CUDA):')
-                print('         ' + _hint('torch --index-url '
-                                          'https://download.pytorch.org/whl/cu132',
-                                          exe, pick[2]))
-                print('       Then, either way:')
                 print('         ' + _hint('transformers', exe, pick[2]))
-            if _installable(pick[2]) and pick[2]['v'].startswith('3.14'):
-                print('')
-                print('     NOTE: on Python 3.14 the cu121 index has NO wheels.')
-                print('           Use cu132 above, not cu121.')
 
     if hollow_seen:
         print('')

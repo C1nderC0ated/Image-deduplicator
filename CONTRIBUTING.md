@@ -46,6 +46,13 @@ the harness was first validated on a corpus built to contain the case
 the change was about, proving the experiment could detect a difference
 before its null result was believed.
 
+**When a release mixes both kinds and no real library is at hand**, one
+check still separates them. Revert exactly the fixes meant to change
+decisions, in a scratch copy, and run it on every fixture: its lists
+must then match the previous release's byte for byte. That proves
+nothing else moved a decision. It does not replace the A/B; it says the
+A/B only has those fixes to judge. v4.4.2 was checked this way.
+
 **Byte-parity is a within-machine comparison, and that is all it needs
 to be.** Moving to a new machine does not weaken the gate: run the
 shipped code there once, and that run is your baseline. Every comparison
@@ -79,8 +86,14 @@ candidate set is stable, but verify rather than assume it.
 
 **Self-tests**: `python analyze-inventory.py --self-test`. It spawns real
 worker processes, holds both signature sweeps against brute-force
-oracles, and exercises the OpenCV-absent fallbacks. Nothing ships
-without it passing.
+oracles, and exercises the OpenCV-absent fallbacks. It also writes real
+files to a temporary folder and runs the generated recycler on them with
+the trash call stubbed (`_run_recycler`), so a recycler rule can be
+tested as the user meets it. Nothing ships without it passing.
+
+A new check is not done until it has failed once: disable the fix it
+guards, run the self-test, and see that check report FAIL. A check that
+passes either way tests nothing.
 
 **Agent benchmark**: `.benchmarks/agent-control/` scores an AI agent
 driving the toolkit end to end (`benchmark.py prepare | launch | validate
@@ -104,6 +117,28 @@ All measured on a real 36,410-image library.
   grayscale work. A `cores // 2` default would hand exactly two workers
   to every four-thread machine. Below four logical cores it stays on
   threads.
+
+## Set by reasoning, not yet measured
+
+These arrived with the v4.4.2 bug fixes. Each has a stated reason, and
+none has had the real-library A/B that the settled defaults above had.
+Measure before building on them:
+
+- `FLAT_STD` **1.0**: a thumbnail whose luma standard deviation is below
+  this is flat, and never counts as a crop or luma match.
+- `DENSE_K` **16**: an image is in a dense pocket when 16 or more others
+  reach CLIP 0.90 with it. It equals the default `--clip-neighbors`, so a
+  default run on a folder of 17 or more images gets the answer it
+  always did.
+- The crop matcher stops early at `C_NCC_GATE` (**0.95**), not the 0.90
+  B gate, so a dense or dark pair is not capped below the score it needs.
+- The keeper ranking: frames, colour, area, full colour over palette,
+  lossless, size, `qsum`. It decides which file is proposed for deletion,
+  and it is a heuristic. Its known blind spot is a large upscale ranking
+  over its smaller original.
+- `MIN_TORCH` **(2, 4)** and `LEGACY_CUDA_MAX` **cu126** in `_setup.py`
+  follow upstream facts, transformers 5's torch floor and PyTorch's
+  Turing cut-off from CUDA 12.8, and move when those do.
 
 ## Measured and refuted — do not retry
 
@@ -245,10 +280,26 @@ inventing a second name. Handle singular and plural rather than writing
 Changes are verified where they can actually run. The `.bat` launchers
 need a real Windows shell — `cmd.exe` semantics around delayed
 expansion, drag-and-drop quoting and trailing backslashes have all
-produced real bugs, and none of them reproduce anywhere else. The
-install paths need a distro-managed Linux: on Arch, Debian 12+, Ubuntu
-23.04+, Fedora 38+ and Homebrew, pip refuses every install into the
-system interpreter, `--user` is not exempt, and `pip uninstall` is
+produced real bugs, and none of them reproduce anywhere else. Three traps
+from v4.4.2 are worth knowing before testing one:
+
+- Explorer quotes a dropped path only when it contains a space, so a
+  drop test from a folder like `C:\Users\First Last\...` is always
+  quoted and cannot show a split. Use the 8.3 short form of the path,
+  which has no spaces.
+- A substitution on `!cmdcmdline!` rewrites `cmdcmdline` in place, so a
+  second comparison against it reads the altered text. Copy it into a
+  variable first and substitute on the copy.
+- An `if defined X` does not guard a `%X:~-1%` or `%X:a=b%` on the same
+  line. cmd expands and parses the whole line first, and an empty `X`
+  leaves text it cannot parse, which ends the script. Put the guard on
+  its own line above. Start every launcher once with no argument, too:
+  every earlier test passed a folder, which is how a double-click crash
+  lasted from v4.2f to v4.4.2.
+
+The install paths need a distro-managed Linux: on Arch, Debian 12+,
+Ubuntu 23.04+, Fedora 38+ and Homebrew, pip refuses every install into
+the system interpreter, `--user` is not exempt, and `pip uninstall` is
 blocked too. Reason about that case before calling install-path work
 done, and check claims about it against the installed pip's own source
 rather than recalling them.

@@ -43,7 +43,8 @@ TIERS
                       generation text refuse it.
   C  weaker evidence - NCC in a dense/dark pocket, or CLIP-strong with no
                       crop confirm. All ".", no suggested keeper. You may
-                      still mark X; the last copy in a cluster cannot.
+                      still mark X; a file goes only while a copy it was
+                      matched with stays unmarked.
 
 THE INVARIANTS (enforced in code, not by memory)
   1. every file appears at most once as a deletion candidate
@@ -90,7 +91,7 @@ def _hint(pkg):
         from _setup import pip_hint
         return pip_hint(pkg)
     except Exception:
-        return '"%s" -m pip install --user %s' % (sys.executable, pkg)
+        return '"%s" -m pip install %s' % (sys.executable, pkg)
 
 
 try:
@@ -103,6 +104,14 @@ try:
 except ImportError:
     print('Pillow is required:  ' + _hint('pillow'))
     sys.exit(2)
+# The 512 px confirm opens originals, and Pillow refuses a PNG whose text
+# chunk inflates past 1 MB (see collect-image-inventory.py): raised to the
+# same 16 MB, so such a file is compared rather than skipped as unreadable.
+try:
+    from PIL import PngImagePlugin as _png
+    _png.MAX_TEXT_CHUNK = max(_png.MAX_TEXT_CHUNK, 16 * 1024 * 1024)
+except Exception:
+    pass
 
 _HAVE_CV2 = False
 # OpenCV is optional (it powers the crop tier), but when present it also
@@ -179,37 +188,122 @@ def find_inventory(arg):
         c = glob.glob(os.path.join(glob.escape(arg), '*image-inventory*.jsonl'))
         c = [p for p in c if '.part' not in os.path.basename(p)] or c
         if c:
-            return max(c, key=os.path.getmtime)
+            return pick_inventory(c)
     return None
 
 
-def load_inventory(path):
+def inventory_parts(path):
+    """The files of one inventory: the named file and its .partN siblings,
+    base file first. A file whose name does not end in .jsonl is read on its
+    own - chopping six characters off it blindly found nothing at all."""
     d, b = os.path.split(path)
+    if not b.lower().endswith('.jsonl'):
+        return [path]
     b = b[:-len('.jsonl')]
     if '.part' in b:                     # basename only: a folder named
         b = b.split('.part')[0]          # 'archive.part' must not truncate
     stem = os.path.join(glob.escape(d), glob.escape(b)) if d else glob.escape(b)
-    paths = sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
-    root, recs, errs = None, [], []
+    return sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
+
+
+def same_run(paths, lines_of):
+    """Keep the parts written by ONE run: the one the first file belongs to.
+
+    Every part repeats the header, with the run's start time. A copy that
+    is overwritten by name - the --share / --mirror-dir copy - kept the
+    .partN files of an earlier, longer run, and they were read as part of
+    this one: deleted files came back, and a file could be its own
+    duplicate. lines_of(p) yields the parsed lines of p.
+    Returns [(path, [dict, ...])] for the parts kept, and the paths dropped."""
+    kept, dropped, ref = [], [], None
     for p in paths:
-        with open(p, encoding='utf-8') as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(r, dict):
-                    continue
-                if 'root' in r and root is None:
-                    root = r['root']
-                # control lines carry 'kind'; older files are detected by shape
-                if r.get('kind') or r.get('schema') or r.get('done'):
-                    continue
-                if 'p' in r and 'sha' in r and 'tb' in r:
-                    recs.append(r)
-                elif 'p' in r and 'err' in r:
-                    errs.append(r)
-    return root, recs, errs, paths
+        rows = list(lines_of(p))
+        stamp = next((r.get('started') for r in rows
+                      if r.get('kind') == 'header' or r.get('schema')), None)
+        if ref is None:
+            ref = stamp
+        elif stamp is not None and stamp != ref:
+            dropped.append(p)
+            continue
+        kept.append((p, rows))
+    if dropped:
+        print('[WARN] %d part file%s from a different scan run ignored:'
+              % (len(dropped), '' if len(dropped) == 1 else 's'))
+        for p in dropped[:4]:
+            print('         ' + os.path.basename(p))
+    return kept, dropped
+
+
+def _json_rows(p):
+    # Bytes, decoded by json.loads inside the try: a line torn mid-character
+    # (power loss, full disk) used to raise UnicodeDecodeError in the loop
+    # itself and stop the run, every run, until the file was hand-edited.
+    with open(p, 'rb') as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(r, dict):
+                yield r
+
+
+def inventory_status(path):
+    """'done' when the scan that wrote this inventory finished, 'aborted'
+    when it recorded an interruption, None when no footer says either way (a
+    killed run, or an inventory older than footers)."""
+    status = None
+    for p in inventory_parts(path):
+        try:
+            with open(p, 'rb') as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 65536))
+                tail = fh.read().splitlines()[-3:]
+        except OSError:
+            continue
+        for line in tail:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(r, dict) and r.get('kind') == 'footer':
+                status = 'done' if r.get('done') else 'aborted'
+    return status
+
+
+def pick_inventory(cands):
+    """Of several inventories in one folder, the newest COMPLETE one. An
+    interrupted rescan leaves a newer, partial image-inventory-2.jsonl
+    beside the finished one, and newest-by-date alone analyzed the partial
+    one - "still usable", but missing every file it never reached."""
+    newest = sorted(cands, key=os.path.getmtime, reverse=True)
+    status = dict((p, inventory_status(p)) for p in newest)
+    for want in ('done', None):
+        for p in newest:
+            if status[p] == want:
+                if p != newest[0]:
+                    print('Note: %s is from a scan that did not finish; using %s.'
+                          % (os.path.basename(newest[0]), os.path.basename(p)))
+                    print('      Name the file to use the other one.')
+                return p
+    return newest[0]
+
+
+def load_inventory(path):
+    root, recs, errs = None, [], []
+    kept, _dropped = same_run(inventory_parts(path), _json_rows)
+    for _p, rows in kept:
+        for r in rows:
+            if 'root' in r and root is None:
+                root = r['root']
+            # control lines carry 'kind'; older files are detected by shape
+            if r.get('kind') or r.get('schema') or r.get('done'):
+                continue
+            if 'p' in r and 'sha' in r and 'tb' in r:
+                recs.append(r)
+            elif 'p' in r and 'err' in r:
+                errs.append(r)
+    return root, recs, errs, [p for p, _rows in kept]
 
 
 def load_embeddings(inv_path, recs):
@@ -234,7 +328,7 @@ def load_embeddings(inv_path, recs):
     named = [p for p in cands if os.path.basename(p) == want + '.jsonl']
     path = named[0] if named else max(cands, key=os.path.getmtime)
     vec, model = {}, None
-    with open(path, encoding='utf-8') as f:
+    with open(path, 'rb') as f:              # bytes: see load_inventory
         for line in f:
             try:
                 r = json.loads(line)
@@ -433,8 +527,12 @@ def sweep_candidates(C, cut):
     block = max(64, min(2048, int(8_000_000 // max(1, n))))
     for a in range(0, n, block):
         b = min(n, a + block)
-        # rows a..b only need columns up to the last row still within `cut`
-        hi = int(np.searchsorted(ms, ms[b - 1] + cut, side='right'))
+        # rows a..b only need columns up to the last row still within `cut`.
+        # Widened by 0.01, as the cross sweep is: ms is float32, and the sum
+        # rounded twice could fall just short of a pair at exactly `cut`
+        # when its first image was the last row of a block. Anything the
+        # margin adds is re-checked exactly below, so it only costs checks.
+        hi = int(np.searchsorted(ms, ms[b - 1] + cut + 0.01, side='right'))
         if hi <= a + 1:
             continue
         D2 = sq[a:b, None] + sq[None, a:hi] - 2.0 * (Cs[a:b] @ Cs[a:hi].T)
@@ -536,14 +634,30 @@ def oriented_signatures(C, k):
         fn(G.transpose(1, 2, 0, 3)).transpose(2, 0, 1, 3)).reshape(n, 192)
 
 
+def same_shape(A, B):
+    """The pair at one shape: the LARGER thumbnail brought down to the
+    smaller, whichever of the two came first. "Resize the second to the
+    first" upscaled the smaller copy when its file sorted first and
+    downscaled the larger when it sorted second, and the two scores differ
+    - by up to 0.44 MAD measured - so the same two pictures under swapped
+    names could land on opposite sides of the Tier A gate. Equal areas are
+    ordered by shape, which does not depend on file order either."""
+    if A.shape == B.shape:
+        return A, B
+    if (A.shape[0] * A.shape[1], A.shape) > (B.shape[0] * B.shape[1], B.shape):
+        A = np.asarray(Image.fromarray(A).resize(
+            (B.shape[1], B.shape[0]), Image.LANCZOS), dtype=np.uint8)
+    else:
+        B = np.asarray(Image.fromarray(B).resize(
+            (A.shape[1], A.shape[0]), Image.LANCZOS), dtype=np.uint8)
+    return A, B
+
+
 def mad_pair(TH, i, j):
     # Shares absdiff_mean rather than repeating its body: this is the single
     # hottest call in the analyzer (376,660 pairs on a 36k library), and it
     # had been left on the slow float32 path when the fast one was added.
-    A, B = TH[i], TH[j]
-    if A.shape != B.shape:
-        B = np.asarray(Image.fromarray(B).resize(
-            (A.shape[1], A.shape[0]), Image.LANCZOS), dtype=np.uint8)
+    A, B = same_shape(TH[i], TH[j])
     return absdiff_mean(A, B)
 
 
@@ -629,17 +743,20 @@ def luma(a):
 def luma_mad_pair(TH, i, j):
     """mad ignoring colour: catches a grayscale or recoloured copy, which
     differs hugely in RGB (~30) but barely at all in brightness (~2)."""
-    A, B = TH[i], TH[j]
-    if A.shape != B.shape:
-        B = np.asarray(Image.fromarray(B).resize(
-            (A.shape[1], A.shape[0]), Image.LANCZOS), dtype=np.uint8)
+    A, B = same_shape(TH[i], TH[j])
     # one matmul instead of three multiplies and two adds per channel, and
     # one mean instead of two: (la - la.mean()) - (lb - lb.mean()) is
     # algebraically d - d.mean() for d = la - lb
     d = (A @ _LUMA_W) - (B @ _LUMA_W)
     # normalise out a flat brightness offset - a desaturated copy is often
     # also slightly lifted or darkened, and that is not a different picture
-    return float(np.abs(d - d.mean()).mean())
+    mad = float(np.abs(d - d.mean()).mean())
+    # ...which also removes the whole of a solid swatch (see FLAT_STD). Only
+    # a near-zero score can be that, so only then is flatness checked.
+    if mad <= 32.0 and (float((A @ _LUMA_W).std()) < FLAT_STD
+                        or float((B @ _LUMA_W).std()) < FLAT_STD):
+        return 255.0
+    return mad
 
 
 def compute_luma_mads(TH, pairs, workers):
@@ -751,6 +868,16 @@ def gray_small(TH, x, cap=64):
 NCC_SCALES = (0.35, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.9, 0.92,
               0.95, 0.97, 1.0)
 NCC_GATE = 0.90
+# A picture with no structure - a blank page, a solid swatch, a fully
+# transparent PNG flattened onto white - breaks both normalised measures.
+# OpenCV's TM_CCOEFF_NORMED returns 1.0 at EVERY position for a template
+# with zero variance: a perfect "crop" of anything. And the luma MAD, which
+# removes a brightness offset, scores two solid swatches of any colours
+# 0.0: a "match at duplicate level". Such pairs went to Tier B, the other
+# image flagged for deletion, and one blank image could chain unrelated
+# pictures into a single cluster. Below this spread, in grey levels, there
+# is nothing to compare, so neither measure may match on it.
+FLAT_STD = 1.0
 # 80% crops keep 84% at the 64 px pass and 97% at 128. Retry only the
 # band that almost cleared the gate, closest first, and never lower a
 # score. Cap stops a 37k-pair crop list from becoming a second full pass.
@@ -996,12 +1123,15 @@ def compute_nccs(TH, pairs, workers, procs=None, max_side=64):
     tcache = {}
 
     def template(idx, s, small):
+        """The scaled template, or False when it is flat (FLAT_STD)."""
         t = tcache.get((idx, s))
         if t is None:
             th, tw = int(small.shape[0] * s), int(small.shape[1] * s)
             t = np.ascontiguousarray(np.asarray(
                 Image.fromarray(small.astype('uint8')).resize(
                     (tw, th), Image.LANCZOS), dtype=np.float32))
+            if float(t.std()) < FLAT_STD:
+                t = False
             tcache[(idx, s)] = t
         return t
 
@@ -1025,9 +1155,16 @@ def compute_nccs(TH, pairs, workers, procs=None, max_side=64):
                 if th < 8 or tw < 8 or th > big.shape[0] or tw > big.shape[1]:
                     continue
                 t = template(sidx, s, small)
+                if t is False:
+                    continue
                 best = max(best, float(cv2.matchTemplate(
                     big, t, cv2.TM_CCOEFF_NORMED).max()))
-                if best >= NCC_GATE:
+                # Stop only once the score clears the HIGHEST gate that reads
+                # it (C_NCC_GATE). Stopping at the B gate stored the first
+                # scale past 0.90, not the best: 156 of 240 genuine crops
+                # kept a value in [0.90, 0.95) whose true best was 0.99, and
+                # the 0.95 gate for dense and dark pairs then dropped them.
+                if best >= C_NCC_GATE:
                     return p, best
         return p, best
 
@@ -1073,12 +1210,30 @@ class UF(object):
 # would be over-credited here; that is rare and costs one kept copy, not a
 # deletion, since the loser of this tiebreak is still the same picture.
 LOSSLESS_FMTS = ('PNG', 'BMP', 'TIFF')
+# ...and for the same reason as GIF, a PNG, BMP or TIFF in a PALETTE mode is
+# not credited either: it holds at most 256 colours, so a 256-colour PNG
+# made from a JPEG was kept over the full-colour original, which got the X.
+PALETTE_MODES = ('P', 'PA')
+# Modes with no colour at all. A greyscale copy has lost what the colour
+# copy still has, and was kept over a colour JPEG whenever it was a PNG.
+GRAY_MODES = ('1', 'L', 'LA', 'La', 'I', 'I;16', 'I;16B', 'I;16L', 'I;16N',
+              'F')
+
+
+def media_kind(r):
+    """(animated, greyscale). Tier B never suggests deleting a copy of one
+    kind to keep a copy of another: an animation and a still of it, or a
+    colour picture and a greyscale version, each hold something the other
+    does not - a Live Photo GIF beside the full-resolution still, say - so
+    that choice is left to the person reviewing."""
+    return (bool(r.get('anim')), (r.get('mode') or '') in GRAY_MODES)
 
 
 def quality_key(recs, i):
-    """Which copy of a duplicate group to KEEP: most pixels, then a
-    lossless encoding over a lossy one, then largest file, then finest
-    JPEG quantisation (a smaller qsum is finer).
+    """Which copy of a duplicate group to KEEP: most animation frames,
+    then colour over greyscale, then most pixels, then full colour over a
+    palette, then a lossless encoding over a lossy one, then largest file,
+    then finest JPEG quantisation (a smaller qsum is finer).
 
     File size ranked second until now, and that quietly preferred the
     re-save: a 2.1 MB JPEG exported from a 1.6 MB PNG original is bigger
@@ -1103,8 +1258,21 @@ def quality_key(recs, i):
     why it is still unmeasured rather than quietly assumed fine.
     """
     r = recs[i]
-    lossless = 1 if (r.get('fmt') or '').upper() in LOSSLESS_FMTS else 0
-    return (r['w'] * r['h'], lossless, r['b'], -r.get('qsum', 10 ** 9))
+    mode = r.get('mode') or ''
+    # More frames first: a trimmed copy of an animation, even a slightly
+    # larger one, was kept and the complete clip pre-marked X. Then colour
+    # over greyscale. Records from before 'mode' was stored read as colour
+    # and as not-palette, so they rank exactly as they always did.
+    frames = int(r.get('anim') or 1)
+    colour = 0 if mode in GRAY_MODES else 1
+    # Palette ranks below full colour at the same size, ahead of the byte
+    # count: a 256-colour PNG is often LARGER than the JPEG it was made
+    # from, so dropping only its lossless credit still kept it.
+    full = 0 if mode in PALETTE_MODES else 1
+    lossless = 1 if ((r.get('fmt') or '').upper() in LOSSLESS_FMTS
+                     and mode not in PALETTE_MODES) else 0
+    return (frames, colour, r['w'] * r['h'], full, lossless, r['b'],
+            -r.get('qsum', 10 ** 9))
 
 
 def anim_compatible(ra, rb):
@@ -1238,6 +1406,9 @@ def shown_dims(r):
     return (h, w) if r.get('ori') in (5, 6, 7, 8) else (w, h)
 
 
+GENERATION_KEYS = ('parameters', 'prompt', 'workflow')
+
+
 def generation_params_conflict(ra, rb):
     """True when both records carry PNG generation text and a shared key differs.
 
@@ -1246,13 +1417,22 @@ def generation_params_conflict(ra, rb):
     string compare is free and only fires when BOTH sides recorded the
     field. One-sided or empty text is silence, not a veto.
     """
+    # Digests of the full values where both records have them: the stored
+    # text is cut at 300 characters, which dropped an A1111 seed past a
+    # long prompt, so two re-rolls compared equal. And generation keys
+    # only: a re-save by other software changes Software or Comment, and
+    # that is not a different picture.
+    def gen(d):
+        return {str(k).lower(): ('' if v is None else str(v).strip())
+                for k, v in d.items() if str(k).lower() in GENERATION_KEYS}
+    ha, hb = ra.get('txth'), rb.get('txth')
     ta, tb = ra.get('txt'), rb.get('txt')
-    if not isinstance(ta, dict) or not isinstance(tb, dict) or not ta or not tb:
+    if isinstance(ha, dict) and isinstance(hb, dict) and ha and hb:
+        keys_a, keys_b = gen(ha), gen(hb)
+    elif isinstance(ta, dict) and isinstance(tb, dict) and ta and tb:
+        keys_a, keys_b = gen(ta), gen(tb)
+    else:
         return False
-    keys_a = {str(k).lower(): ('' if v is None else str(v).strip())
-              for k, v in ta.items()}
-    keys_b = {str(k).lower(): ('' if v is None else str(v).strip())
-              for k, v in tb.items()}
     shared = set(keys_a) & set(keys_b)
     if not shared:
         return False
@@ -1285,6 +1465,10 @@ DARK_LUMA = 12.0
 # larger than one CLIP neighbourhood are omitted, not sliced into
 # equally-unreviewable chunks.
 C_CLUSTER_MAX = 16
+# An image is in a dense CLIP pocket - a screenshot genre, say - when at
+# least this many others clear the 0.90 neighbour floor: the default K, at
+# which the neighbour cap binds.
+DENSE_K = 16
 
 
 def weaker_review(dense_i, dense_j, luma_i, luma_j, dark_cut=DARK_LUMA):
@@ -1309,7 +1493,12 @@ def review_lane(ncc, cos, dense_i=False, dense_j=False,
     if ncc_v >= NCC_GATE:
         if not weaker_review(dense_i, dense_j, luma_i, luma_j):
             return 'B'
-        return 'C' if ncc_v >= C_NCC_GATE else None
+        if ncc_v >= C_NCC_GATE:
+            return 'C'
+        # A dense/dark crop score in [0.90, 0.95) is no evidence either way,
+        # so it falls through to the CLIP test below. Returning None here
+        # made better pixel evidence a worse outcome: NCC 0.87 with cosine
+        # 0.98 went to Tier C, the same pair at 0.93 was dropped.
     if cos is not None and float(cos) >= CLIP_TIER_C:
         return 'C'
     return None
@@ -1393,7 +1582,13 @@ def inventory_abspath(root, rel):
     component on Windows. '..' is refused so a stored path cannot walk
     out of the scan root.
     """
-    rel = (rel or '').replace('\\', '/')
+    # Backslash is a separator only on Windows. On Linux it is a legal
+    # character in a name, and turning it into '/' looked the file up at a
+    # different path from the one the recycler uses - the confirm then
+    # counted it unreadable and left the pair in Tier A unchecked.
+    rel = rel or ''
+    if os.name == 'nt':
+        rel = rel.replace('\\', '/')
     parts = [p for p in rel.split('/') if p and p != '.']
     if not parts or any(p == '..' for p in parts):
         return None
@@ -1478,23 +1673,29 @@ def confirm_hires_mad(root, ra, rb, max_side=CONFIRM_PX):
 
 
 def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
-                         cap=CONFIRM_CAP):
+                         cap=CONFIRM_CAP, state=None):
     """Re-score borderline keeper-drop pairs at 512 px.
 
     Only pairs that matched the keeper (so they would be pre-marked X),
     are not byte-identical, and sit in (2, gate] at thumbnail size.
     Failures are demoted to review. Unreadable originals are left in
     Tier A: the thumbnail already passed two gates, and the recycler
-    will refuse if the file is gone or has changed.
+    will refuse if the file is gone or has changed. They are counted as
+    unreadable, not as checked, and do not use up the cap.
+
+    state carries the cap, the counts and the results across the rounds of
+    settle_tier_a, so no pair is read twice and the cap is one cap.
 
     Returns (new_tier_a, demoted_pairs, n_checked, n_capped).
     """
+    if state is None:
+        state = {'checked': 0, 'unreadable': 0, 'cache': {}}
+    cache = state['cache']
     demoted = []
-    checked = 0
     capped = 0
     new_a = []
     if not root or not tier_a:
-        return tier_a, demoted, checked, capped
+        return tier_a, demoted, state['checked'], capped
     for k, drops, members in tier_a:
         keep_drops = []
         gone = set()
@@ -1505,25 +1706,80 @@ def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
             if (k, d) not in a_edges and (d, k) not in a_edges:
                 keep_drops.append(d)
                 continue
-            mad = mad_of(k, d)
-            if not needs_hires_confirm(mad, False, checked, cap=cap, hi=gate):
-                if (mad is not None and checked >= cap
-                        and CONFIRM_MAD_LO < float(mad) <= float(gate)):
-                    capped += 1
-                keep_drops.append(d)
-                continue
-            checked += 1
-            hi = confirm_hires_mad(root, recs[k], recs[d])
+            key = (k, d) if k < d else (d, k)
+            if key in cache:
+                hi = cache[key]
+            else:
+                mad = mad_of(k, d)
+                if not needs_hires_confirm(mad, False, state['checked'],
+                                           cap=cap, hi=gate):
+                    if (mad is not None and state['checked'] >= cap
+                            and CONFIRM_MAD_LO < float(mad) <= float(gate)):
+                        capped += 1
+                    keep_drops.append(d)
+                    continue
+                hi = confirm_hires_mad(root, recs[k], recs[d])
+                cache[key] = hi
+                if hi is None:
+                    state['unreadable'] += 1
+                else:
+                    state['checked'] += 1
             if hi is None or hi <= gate:
                 keep_drops.append(d)
             else:
                 gone.add(d)
-                demoted.append((k, d) if k < d else (d, k))
+                demoted.append(key)
         if not keep_drops:
             continue
         new_members = [m for m in members if m not in gone]
         new_a.append((k, keep_drops, new_members))
-    return new_a, demoted, checked, capped
+    return new_a, demoted, state['checked'], capped
+
+
+def build_tier_a(recs, a_edges, order):
+    """Tier A clusters: connected components of the pairs that matched, each
+    with the best copy (quality_key) as its keeper. The pairs are joined in
+    ORDER - the order they were found - so the clusters, and the numbers the
+    list and report give them, come out as they always have."""
+    uf = UF()
+    for i, j in order:
+        if (i, j) in a_edges:
+            uf.union(i, j)
+    out = []
+    for members in uf.groups():
+        k = max(members, key=lambda i: quality_key(recs, i))
+        out.append((k, [i for i in members if i != k], members))
+    return out
+
+
+def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP):
+    """Build Tier A, confirm it at 512 px, and rebuild it WITHOUT the pairs
+    that failed, until nothing more fails.
+
+    A failed pair used to be cut out of its cluster and nothing more. When
+    the keeper failed against every drop, the cluster vanished - even though
+    the drops still matched EACH OTHER - and Tier B then elected the failed
+    keeper again (it was the largest) and flagged every unedited copy for
+    deletion. A pair that failed at 512 px is simply not a Tier A match, so
+    the clusters are recomputed without it: copies that still match stay a
+    cluster under a keeper of their own, and a member that only reached the
+    keeper through the failed pair becomes LINKED, not pre-marked.
+
+    Returns (tier_a, demoted_pairs, n_checked, n_capped, n_unreadable).
+    a_edges is left as it was; the caller removes the demoted pairs."""
+    state = {'checked': 0, 'unreadable': 0, 'cache': {}}
+    live = set(a_edges)
+    demoted = []
+    while True:
+        tier_a = build_tier_a(recs, live, order)
+        _new_a, dem, _n, capped = apply_hires_confirms(
+            tier_a, recs, root, mad_of, live, gate, cap=cap, state=state)
+        if not dem:
+            return tier_a, demoted, state['checked'], capped, state['unreadable']
+        for i, j in dem:
+            live.discard((i, j))
+            live.discard((j, i))
+        demoted.extend(dem)
 
 
 # ------------------------------------------------------------- invariants --
@@ -1614,6 +1870,39 @@ def build_tier_b(groups, recs, tier_a):
             # pre-marked.
             info_b.append(surv)
     return tier_b, info_b
+
+
+def premarked(tier_a, a_edges=None):
+    """The Tier A drops the list pre-marks X: those that matched their
+    keeper directly. A LINKED member stays '.', so counting it as droppable
+    made the console and the report promise more than the list marks."""
+    return [i for k, drops, _m in tier_a for i in drops
+            if a_edges is None or (k, i) in a_edges]
+
+
+def cluster_neighbours(plan, recs, a_edges=None, b_edges=None, c_edges=None):
+    """cl_id -> {rel: [rel, ...]}: for each file that can be deleted in a
+    cluster, the members it was matched with DIRECTLY, or is byte-identical
+    to. Its surviving copy has to be one of these.
+
+    A cluster is a connected component, so "some member survives" was never
+    the same as "a copy of THIS picture survives": in a chain a-b-c, marking
+    a and b left c - a member only b had matched, 5.79 MAD from a - as the
+    survivor of both. Reference-only clusters are absent: nothing is deleted
+    in them. Where a tier's matches are not known, every member counts."""
+    out = {}
+    for cl_id, key, _keeper, editable, refs in plan:
+        if not editable:
+            continue
+        edges = c_edges if key == 'C' else b_edges if key == 'B' else a_edges
+        members = list(editable) + list(refs)
+        nb = {}
+        for i in editable:
+            nb[recs[i]['p']] = [recs[j]['p'] for j in members if j != i and (
+                edges is None or (i, j) in edges
+                or recs[j].get('sha') == recs[i].get('sha'))]
+        out[cl_id] = nb
+    return out
 
 
 def build_emission_plan(tier_a, tier_b, recs, info_b=None, tier_c=None):
@@ -1845,6 +2134,54 @@ def cv2_fallback_tests():
     case('OpenCV is restored afterwards',
          lambda: _cv2 is not None and __import__('cv2') is not None)
     return ok
+
+
+def _run_recycler(td, recs, tier_a, tier_b=(), info_b=None, b_edges=None,
+                  a_edges=None, edit=None, answer='y', list_encoding=None):
+    """Self-test harness: write the list and recycler for these clusters
+    into td, optionally rewrite the list's lines with edit(lines), run the
+    recycler with the trash call stubbed, and return what it would bin."""
+    import contextlib
+    write_list_and_script(
+        os.path.join(td, 'l.txt'), os.path.join(td, 'R.py'),
+        os.path.join(td, 'R.bat'), os.path.join(td, 'R.sh'),
+        recs, list(tier_a), list(tier_b), td, info_b or [],
+        b_edges or set(), a_edges)
+    if edit is not None:
+        with open(os.path.join(td, 'l.txt'), encoding='utf-8-sig') as fh:
+            lines = fh.read().split('\n')
+        with open(os.path.join(td, 'l.txt'), 'w', encoding='utf-8',
+                  newline='') as fh:
+            fh.write('\n'.join(edit(lines)))
+    if list_encoding is not None:
+        # re-saved in another encoding, as an editor or PowerShell would
+        with open(os.path.join(td, 'l.txt'), encoding='utf-8-sig') as fh:
+            text = fh.read()
+        with open(os.path.join(td, 'l.txt'), 'w', encoding=list_encoding,
+                  newline='') as fh:
+            fh.write(text)
+    with open(os.path.join(td, 'R.py'), encoding='utf-8') as fh:
+        src = fh.read()
+    g = {'__file__': os.path.join(td, 'R.py'), '__name__': 'rec_selftest'}
+    exec(compile(src, 'R.py', 'exec'), g)
+    sent = []
+    g['send_to_trash'] = lambda p: (sent.append(
+        os.path.relpath(p, td).replace(os.sep, '/')) or (True, 'stub'))
+    g['input'] = lambda *_a: answer
+    with contextlib.redirect_stdout(io.StringIO()):
+        g['main']()
+    return sent
+
+
+def _file_rec(td, rel, **extra):
+    """A minimal inventory record for a real file under td."""
+    import hashlib
+    with open(os.path.join(td, *rel.split('/')), 'rb') as fh:
+        data = fh.read()
+    r = {'p': rel, 'b': len(data), 'w': 40, 'h': 40,
+         'sha': hashlib.sha256(data).hexdigest()}
+    r.update(extra)
+    return r
 
 
 def self_test():
@@ -2414,9 +2751,20 @@ def self_test():
         t_diff = generation_params_conflict(
             {'txt': {'prompt': 'cat', 'parameters': 'seed=1'}},
             {'txt': {'prompt': 'cat', 'parameters': 'seed=2'}})
+        # the digest of the FULL value decides where both records carry one
+        # (the stored text is cut at 300 characters, past which an A1111
+        # seed sits), and a key outside generation text never vetoes
+        long_p = 'a castle, ' * 40
+        t_seed = generation_params_conflict(
+            {'txt': {'parameters': long_p[:300]}, 'txth': {'parameters': 'aaaa'}},
+            {'txt': {'parameters': long_p[:300]}, 'txth': {'parameters': 'bbbb'}})
+        t_soft = not generation_params_conflict(
+            {'txt': {'parameters': 'x', 'Software': 'GIMP'}},
+            {'txt': {'parameters': 'x', 'Software': 'Photoshop'}})
+        t_all = t_none and t_empty and t_same and t_diff and t_seed and t_soft
         print('  [%s] generation text conflicts only when a shared key differs'
-              % ('PASS' if t_none and t_empty and t_same and t_diff else 'FAIL'))
-        ok = ok and t_none and t_empty and t_same and t_diff
+              % ('PASS' if t_all else 'FAIL'))
+        ok = ok and t_all
     except Exception as exc:
         print('  [FAIL] generation text: %s: %s' % (type(exc).__name__, exc))
         ok = False
@@ -2457,6 +2805,9 @@ def self_test():
         lane_b = review_lane(0.93, 0.92) == 'B'
         lane_c_ncc = review_lane(0.96, 0.92, dense_i=True) == 'C'
         lane_c_ncc_lo = review_lane(0.93, 0.92, dense_i=True) is None
+        # better pixel evidence must never give a worse outcome: a dense
+        # crop score in [0.90, 0.95) falls through to the CLIP test
+        lane_c_fall = review_lane(0.93, 0.98, dense_i=True) == 'C'
         lane_c_miss = review_lane(0.5, 0.975) == 'C'
         lane_c_miss_lo = review_lane(0.5, 0.95) is None
         lane_drop = review_lane(0.5, 0.91) is None
@@ -2467,10 +2818,12 @@ def self_test():
         a_only = scan_has_output([(0, [1], [0, 1])], [])
         print('  [%s] weaker-evidence lane: dense/dark/CLIP-miss to C, rest B or drop'
               % ('PASS' if (w_den and w_dark and w_one and w_ok and lane_b
-                            and lane_c_ncc and lane_c_ncc_lo and lane_c_miss
+                            and lane_c_ncc and lane_c_ncc_lo and lane_c_fall
+                            and lane_c_miss
                             and lane_c_miss_lo and lane_drop and lane_dead
                             and lane_clip and empty and c_only and a_only)
                  else 'FAIL'))
+        ok = ok and lane_c_fall
         ok = ok and w_den and w_dark and w_one and w_ok and lane_b and lane_c_ncc \
             and lane_c_ncc_lo and lane_c_miss and lane_c_miss_lo and lane_drop \
             and lane_dead and lane_clip and empty and c_only and a_only
@@ -2657,6 +3010,343 @@ def self_test():
         print('  [FAIL] Tier C list/report: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # The surviving copy must be a different file ON DISK. A hard link to
+    # the file being deleted hashes perfectly - so do a symlink and a folder
+    # swapped for a junction after the scan - and each once let the
+    # recycler bin the only real copy while "keeping" another name for it.
+    try:
+        import tempfile as _tfl
+        import shutil as _shl
+        tdl = _tfl.mkdtemp()
+        for n, byte in (('keep.png', b'H'), ('c1.png', b'C'), ('c2.png', b'C')):
+            with open(os.path.join(tdl, n), 'wb') as fh:
+                fh.write(byte * 300)
+        os.link(os.path.join(tdl, 'keep.png'), os.path.join(tdl, 'twin.png'))
+        recs_l = [_file_rec(tdl, n)
+                  for n in ('keep.png', 'twin.png', 'c1.png', 'c2.png')]
+        sent = _run_recycler(tdl, recs_l, [(0, [1], [0, 1]), (2, [3], [2, 3])])
+        same_ok = sent == ['c2.png']
+        print('  [%s] a hard link to the file being deleted is not its survivor'
+              % ('PASS' if same_ok else 'FAIL'))
+        ok = ok and same_ok
+        _shl.rmtree(tdl, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] same-file survivor: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A name with two spaces and an unclosed '[' used to be cut at that
+    # bracket by the parser, so the X on "a.png  [v2.png" became an X on
+    # "a.png" - a different file, whose own line said keep.
+    try:
+        import tempfile as _tfb
+        import shutil as _shb
+        tdb = _tfb.mkdtemp()
+        names_b = ['a.png', 'a_dup.png', 'a.png  [v2.png', 'b_dup.png']
+        for n, byte in zip(names_b, (b'A', b'A', b'B', b'B')):
+            with open(os.path.join(tdb, n), 'wb') as fh:
+                fh.write(byte * 300)
+        recs_b = [_file_rec(tdb, n) for n in names_b]
+        sent = _run_recycler(tdb, recs_b, [(0, [1], [0, 1]), (3, [2], [2, 3])])
+        br_ok = sorted(sent) == ['a.png  [v2.png', 'a_dup.png']
+        print('  [%s] a "  [" inside a file name keeps its mark on that file'
+              % ('PASS' if br_ok else 'FAIL'))
+        ok = ok and br_ok
+        _shb.rmtree(tdb, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] bracket in a name: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A chain a-b-c where a and c never matched: with the keeper a marked X
+    # as well, c used to stand in as the survivor of BOTH, and every copy of
+    # a's picture went. Each file needs a survivor it matched directly: b
+    # still has c, a has nothing left - so only b goes.
+    try:
+        import tempfile as _tfn
+        import shutil as _shn
+        tdn = _tfn.mkdtemp()
+        for n, byte in (('a.png', b'1'), ('b.png', b'2'), ('c.png', b'3')):
+            with open(os.path.join(tdn, n), 'wb') as fh:
+                fh.write(byte * 300)
+        recs_n = [_file_rec(tdn, n) for n in ('a.png', 'b.png', 'c.png')]
+        e_n = {(0, 1), (1, 0), (1, 2), (2, 1)}
+
+        def _mark_a(lines):
+            return ['X' + ln[1:] if ln.startswith('.  a.png') else ln
+                    for ln in lines]
+        sent = _run_recycler(tdn, recs_n, [(0, [1, 2], [0, 1, 2])],
+                             a_edges=e_n, edit=_mark_a)
+        chain_ok = sent == ['b.png']
+        print('  [%s] a file is deleted only while a copy it matched survives'
+              % ('PASS' if chain_ok else 'FAIL'))
+        ok = ok and chain_ok
+        _shn.rmtree(tdn, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] direct survivor: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # Parts from another scan run - left behind where a copy is overwritten
+    # by name - were read as part of this one. Only the first file's run is
+    # kept; an inventory not named .jsonl is read as the one file it is.
+    try:
+        import contextlib as _ctx
+        rows_by = {'x.jsonl': [{'schema': 's', 'started': 1}, {'p': 'a'}],
+                   'x.part2.jsonl': [{'kind': 'header', 'started': 1}, {'p': 'b'}],
+                   'x.part3.jsonl': [{'kind': 'header', 'started': 7}, {'p': 'z'}]}
+        with _ctx.redirect_stdout(io.StringIO()):
+            kept_r, dropped_r = same_run(sorted(rows_by), lambda q: rows_by[q])
+        r_ok = ([q for q, _rows in kept_r] == ['x.jsonl', 'x.part2.jsonl']
+                and dropped_r == ['x.part3.jsonl']
+                and inventory_parts('C:\\x\\my-inventory.json')
+                == ['C:\\x\\my-inventory.json'])
+        print('  [%s] parts from another scan run are not read as this one'
+              % ('PASS' if r_ok else 'FAIL'))
+        ok = ok and r_ok
+    except Exception as exc:
+        print('  [FAIL] scan-run parts: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A lone surrogate in a name (not valid UTF-8 on Linux, an unpaired
+    # UTF-16 unit on NTFS) crashed the list writer after truncating the
+    # list. It must come out escaped - so the file is never editable - and
+    # every output text must be encodable.
+    try:
+        odd = 'b' + chr(0xD800) + '.png'
+        ls_odd = list_safe(odd)
+        s_ok = (ls_odd != odd and '\\ud800' in ls_odd
+                and bool(ls_odd.encode('utf-8'))
+                and bool(esc('x' + chr(0xDCF6)).encode('utf-8'))
+                and list_safe('plain.png') == 'plain.png')
+        print('  [%s] a name with a lone surrogate is escaped, never editable'
+              % ('PASS' if s_ok else 'FAIL'))
+        ok = ok and s_ok
+    except Exception as exc:
+        print('  [FAIL] lone surrogate: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # Re-running analyze rewrote a hand-edited list from the scan. An edit
+    # is a mark that differs from the one this tool wrote (the recycler's
+    # 'm0'); an untouched list is replaced, an edited one moved aside.
+    try:
+        import tempfile as _tfe
+        import shutil as _she
+        tde = _tfe.mkdtemp()
+        recs_e = [{'p': n, 'b': 400 + k, 'sha': chr(110 + k) * 64,
+                   'w': 40, 'h': 40} for k, n in enumerate(('k.png', 'd.png'))]
+        le, pe = os.path.join(tde, 'x-list.txt'), os.path.join(tde, 'R.py')
+        write_list_and_script(le, pe, os.path.join(tde, 'R.bat'),
+                              os.path.join(tde, 'R.sh'), recs_e,
+                              [(0, [1], [0, 1])], [], tde, [], set())
+        untouched = keep_edited_list(le, pe) is None and os.path.exists(le)
+        with open(le, encoding='utf-8-sig') as fh:
+            txt_e = fh.read().replace('.  k.png', 'X  k.png')
+        with open(le, 'w', encoding='utf-8') as fh:
+            fh.write(txt_e)
+        kept_e = keep_edited_list(le, pe)
+        e_ok = (untouched and kept_e is not None and not os.path.exists(le)
+                and os.path.basename(kept_e) == 'x-list.edited.txt')
+        print('  [%s] an edited list is kept aside, an untouched one replaced'
+              % ('PASS' if e_ok else 'FAIL'))
+        ok = ok and e_ok
+        _she.rmtree(tde, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] edited list: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A list re-saved as UTF-16 (PowerShell 5.1's Out-File) crashed the
+    # recycler with a traceback; it is read now. An ANSI save cannot carry
+    # a non-ASCII name faithfully, so that one is refused - nothing binned.
+    try:
+        import tempfile as _tfu
+        import shutil as _shu
+        tdu = _tfu.mkdtemp()
+        names_u = ['keep.png', 'd' + chr(0xE9) + '.png']
+        for n in names_u:
+            with open(os.path.join(tdu, n), 'wb') as fh:
+                fh.write(b'U' * 300)
+        recs_u = [_file_rec(tdu, n) for n in names_u]
+        sent16 = _run_recycler(tdu, recs_u, [(0, [1], [0, 1])],
+                               list_encoding='utf-16')
+        try:
+            sent_ansi = _run_recycler(tdu, recs_u, [(0, [1], [0, 1])],
+                                      list_encoding='cp1252')
+        except SystemExit as se:
+            sent_ansi = 'refused' if se.code == 1 else se.code
+        u_ok = sent16 == [names_u[1]] and sent_ansi == 'refused'
+        print('  [%s] a UTF-16 list is read, an ANSI one refused'
+              % ('PASS' if u_ok else 'FAIL'))
+        ok = ok and u_ok
+        _shu.rmtree(tdu, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] list encodings: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A Tier B chain: k matched c1, c1 matched c2, k never met c2. c2 is
+    # LINKED, and "Mark all Tier B suggestions" / the recycler's "b" must
+    # not propose it - only a member the keeper was compared with.
+    try:
+        import tempfile as _tfs
+        import shutil as _shs
+        tds = _tfs.mkdtemp()
+        recs_s = [{'p': n, 'b': 500 + k, 'sha': chr(100 + k) * 64,
+                   'w': 40, 'h': 40}
+                  for k, n in enumerate(('k.png', 'c1.png', 'c2.png'))]
+        e_s = {(0, 1), (1, 0), (1, 2), (2, 1)}
+        _n, _L, _at, sugg_s, _all = write_list_and_script(
+            os.path.join(tds, 'l.txt'), os.path.join(tds, 'R.py'),
+            os.path.join(tds, 'R.bat'), os.path.join(tds, 'R.sh'),
+            recs_s, [], [(0, [1, 2], [0, 1, 2])], tds, [], e_s)
+        s_ok = sugg_s == ['c1.png']
+        print('  [%s] a LINKED Tier B member is never a bulk suggestion'
+              % ('PASS' if s_ok else 'FAIL'))
+        ok = ok and s_ok
+        _shs.rmtree(tds, ignore_errors=True)
+    except Exception as exc:
+        print('  [FAIL] Tier B suggestions: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # The keeper rule could not see motion, colour or palette: a trimmed
+    # animation was kept over the full clip, a 256-colour PNG over the JPEG
+    # it was made from, a greyscale PNG over the colour original. And Tier
+    # B must never suggest deleting one KIND of copy to keep another.
+    try:
+        def _qr(**kw):
+            r = {'w': 100, 'h': 100, 'b': 1000, 'fmt': 'PNG'}
+            r.update(kw)
+            return r
+
+        def _pick(a, b):
+            return max([0, 1], key=lambda i: quality_key([a, b], i))
+        clip_full = _qr(anim=60, w=240, h=180, fmt='GIF', mode='P')
+        clip_trim = _qr(anim=56, w=252, h=189, fmt='GIF', mode='P')
+        jpg = _qr(fmt='JPEG', mode='RGB', b=210000, w=1200, h=900)
+        pal = _qr(fmt='PNG', mode='P', b=300000, w=1200, h=900)
+        gry = _qr(fmt='PNG', mode='L', b=320000, w=900, h=600)
+        col = _qr(fmt='JPEG', mode='RGB', b=140000, w=900, h=600)
+        old_png = _qr(b=900)                 # no 'mode': ranks as before
+        old_jpg = _qr(fmt='JPEG', b=2000)
+        import tempfile as _tfk
+        import shutil as _shk
+        tdk = _tfk.mkdtemp()
+        gif = _qr(p='clip.gif', sha='g' * 64, anim=12, fmt='GIF', mode='P',
+                  b=90000)
+        still = _qr(p='frame0.png', sha='f' * 64, mode='RGB', b=40000)
+        tb_k, _ib = build_tier_b([[0, 1]], [gif, still], [])
+        _n, _L, at_k, sugg_k, _all = write_list_and_script(
+            os.path.join(tdk, 'l.txt'), os.path.join(tdk, 'R.py'),
+            os.path.join(tdk, 'R.bat'), os.path.join(tdk, 'R.sh'),
+            [gif, still], [], tb_k, tdk, [], {(0, 1), (1, 0)})
+        _shk.rmtree(tdk, ignore_errors=True)
+        keep_ok = (_pick(clip_trim, clip_full) == 1 and _pick(pal, jpg) == 1
+                   and _pick(gry, col) == 1 and _pick(old_png, old_jpg) == 0
+                   and sugg_k == [] and 'frame0.png' in at_k)
+        print('  [%s] keeper prefers the full animation, full colour and colour; '
+              'no cross-kind Tier B drop' % ('PASS' if keep_ok else 'FAIL'))
+        ok = ok and keep_ok
+    except Exception as exc:
+        print('  [FAIL] keeper rule: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # Two thumbnails of different shapes must score the same whichever file
+    # comes first: resizing "the second to the first" differed by direction,
+    # and the same pair under swapped names could straddle the Tier A gate.
+    try:
+        rng_s = np.random.default_rng(11)
+        big = rng_s.integers(0, 256, (96, 128, 3), dtype=np.uint8)
+        small = np.asarray(Image.fromarray(big).resize((100, 75), Image.LANCZOS),
+                           dtype=np.uint8)
+        m_ab = mad_pair([big, small], 0, 1)
+        m_ba = mad_pair([small, big], 0, 1)
+        l_ab = luma_mad_pair([big, small], 0, 1)
+        l_ba = luma_mad_pair([small, big], 0, 1)
+        sym_ok = abs(m_ab - m_ba) < 1e-9 and abs(l_ab - l_ba) < 1e-9
+        print('  [%s] a differently-shaped pair scores the same in either order'
+              % ('PASS' if sym_ok else 'FAIL'))
+        ok = ok and sym_ok
+    except Exception as exc:
+        print('  [FAIL] order symmetry: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # When the keeper fails the 512 px confirm against every drop, the drops
+    # that still match EACH OTHER must stay a Tier A pair - not be dissolved
+    # and handed to Tier B under the failed keeper as suggested deletions.
+    try:
+        g_7 = globals()
+        real_confirm = g_7['confirm_hires_mad']
+        recs_7 = [{'p': 'k_edit.png', 'sha': 'k' * 64, 'w': 2048, 'h': 2048,
+                   'b': 6000000, 'fmt': 'PNG'},
+                  {'p': 'd1.png', 'sha': '1' * 64, 'w': 1024, 'h': 1024,
+                   'b': 1900000, 'fmt': 'PNG'},
+                  {'p': 'd2.jpg', 'sha': '2' * 64, 'w': 1024, 'h': 1024,
+                   'b': 290000, 'fmt': 'JPEG'}]
+        e_7 = {(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)}
+        mads_7 = {(0, 1): 2.9, (0, 2): 2.9, (1, 2): 0.55}
+        g_7['confirm_hires_mad'] = (
+            lambda root, ra, rb, max_side=CONFIRM_PX:
+            20.0 if 'k_edit.png' in (ra['p'], rb['p']) else 1.0)
+        try:
+            ta_7, dem_7, _chk, _cap, _unr = settle_tier_a(
+                recs_7, 'unused-root', lambda i, j: mads_7[(min(i, j), max(i, j))],
+                e_7, [(0, 1), (0, 2), (1, 2)], 4.0)
+        finally:
+            g_7['confirm_hires_mad'] = real_confirm
+        h7_ok = (ta_7 == [(1, [2], [1, 2])]
+                 and sorted(dem_7) == [(0, 1), (0, 2)])
+        print('  [%s] a keeper that fails at 512 px leaves its matching copies '
+              'in Tier A' % ('PASS' if h7_ok else 'FAIL'))
+        ok = ok and h7_ok
+    except Exception as exc:
+        print('  [FAIL] 512 px rebuild: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A picture with no structure must not match anything through a
+    # normalised measure: a flat template scored NCC 1.0 against pure
+    # noise, and two solid swatches of different colours scored luma MAD 0.
+    # A real grayscale copy of a textured picture still matches on luma.
+    try:
+        rng_f = np.random.default_rng(7)
+        noise = rng_f.integers(0, 256, (96, 128, 3), dtype=np.uint8)
+        blank = np.full((96, 128, 3), 250, dtype=np.uint8)
+        red = np.zeros((96, 128, 3), dtype=np.uint8)
+        red[:, :, 0] = 200
+        teal = np.zeros((96, 128, 3), dtype=np.uint8)
+        teal[:, :, 1:] = 128
+        gray = np.repeat((noise @ _LUMA_W).astype(np.uint8)[:, :, None], 3,
+                         axis=2)
+        TH_f = [noise, blank, red, teal, gray]
+        n_flat = compute_nccs(TH_f, [(0, 1)], 1, procs=0).get((0, 1), 1.0)
+        l_flat = luma_mad_pair(TH_f, 2, 3)
+        l_gray = luma_mad_pair(TH_f, 0, 4)
+        f_ok = n_flat < NCC_GATE and l_flat > 12.0 and l_gray < 4.0
+        print('  [%s] a blank or solid picture matches nothing (ncc %.2f, '
+              'luma %.1f; grayscale copy %.2f)'
+              % ('PASS' if f_ok else 'FAIL', n_flat, l_flat, l_gray))
+        ok = ok and f_ok
+    except Exception as exc:
+        print('  [FAIL] flat pictures: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # Windows measures the recycle limit in UTF-16 units, where an emoji is
+    # two. Counted in characters, a 259-character path of 260 units passed,
+    # and the shell destroyed the file while reporting it recycled.
+    if os.name == 'nt':
+        try:
+            d = os.path.dirname(os.path.abspath(__file__))
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            import _trash as _tr
+            base_t = 'C:\\imgdedup-selftest\\'
+            p260 = base_t + 'a' * (258 - len(base_t)) + '\U0001F600'
+            p258 = base_t + 'a' * (258 - len(base_t))
+            u_ok = (not _tr._win_precheck(p260)[0]
+                    and _tr._win_precheck(p258)[0])
+            print('  [%s] the recycle length limit counts an emoji as two'
+                  % ('PASS' if u_ok else 'FAIL'))
+            ok = ok and u_ok
+        except Exception as exc:
+            print('  [FAIL] recycle length limit: %s: %s'
+                  % (type(exc).__name__, exc))
+            ok = False
+
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
     # fallback suite away the moment anything above it failed
@@ -2670,14 +3360,24 @@ def self_test():
 def list_safe(p):
     """A path as it may appear in the hand-edited selection list: control
     characters escaped so a filename can never span lines or forge a mark
-    line. Paths that come back unchanged are safe to emit raw."""
-    return ''.join(ch if (ch >= ' ' and ch != '\x7f') else repr(ch)[1:-1]
-                   for ch in p)
+    line. Paths that come back unchanged are safe to emit raw.
 
+    Lone surrogates are escaped too - a name that is not valid UTF-8 on
+    Linux, or an unpaired UTF-16 unit on NTFS. The list is UTF-8, and one
+    such name made analyze crash while writing it, after truncating the
+    list already there. Escaped, the file takes the existing route for
+    names with control characters: shown, never editable, always kept."""
+    return ''.join(ch if (' ' <= ch != '\x7f'
+                          and not '\ud800' <= ch <= '\udfff')
+                   else repr(ch)[1:-1] for ch in p)
 
 
 def esc(s):
-    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+    s = str(s)
+    # a lone surrogate cannot be written to the UTF-8 page (see list_safe)
+    if any('\ud800' <= ch <= '\udfff' for ch in s):
+        s = ''.join('\ufffd' if '\ud800' <= ch <= '\udfff' else ch for ch in s)
+    return (s.replace('&', '&amp;').replace('<', '&lt;')
             .replace('>', '&gt;').replace('"', '&quot;'))
 
 
@@ -2712,8 +3412,9 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     # branch) every drop still counts, which is the honest fallback.
     def _markable(i):
         return editable_at is None or recs[i]['p'] in editable_at
-    dn = sum(1 for _, d, _ in tier_a for i in d if _markable(i))
-    db = sum(recs[i]['b'] for _, d, _ in tier_a for i in d if _markable(i))
+    pm = [i for i in premarked(tier_a, a_edges) if _markable(i)]
+    dn = len(pm)
+    db = sum(recs[i]['b'] for i in pm)
     A('<!doctype html><html lang="en"><meta charset="utf-8"><title>Duplicate report</title>')
     A('<meta name="viewport" content="width=device-width,initial-scale=1"><style>'
       # Dark by design: this report is looked at next to the pictures it is
@@ -2795,17 +3496,20 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
           '<button id="breset">Reset to scan defaults</button>'
           '<span class="sp"></span>'
           '<span class="tally"><b id="nx">0</b> marked X</span>'
-          '<button class="go" id="bdl">Download %s</button></div>'
+          '<button class="go" id="bdl" title="The list as this scan wrote it, '
+          'plus the marks made on this page">Download %s</button></div>'
           % esc(list_name or 'duplicates-list.txt'))
     A('<h1>Duplicate report</h1>')
     if live:
         A('<p class="hint">Click a thumbnail to mark or unmark it. '
           '<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move, <kbd>X</kbd> toggles. '
           'Nothing is deleted here: download the list, save it beside the images, '
-          'and run the recycler. Any copy can be marked, including the suggested '
-          'keeper &mdash; the last remaining copy in a cluster cannot, so a group '
-          'is never emptied. Tier C is weaker evidence: all unmarked, no suggested '
-          'keeper, still markable one file at a time.</p>')
+          'and run the recycler. The download is the list as this scan wrote it '
+          'plus the marks made on this page &mdash; edits made to the list in a '
+          'text editor are not in it. Any copy can be marked, including the '
+          'suggested keeper, while a copy it was matched with stays unmarked, so a '
+          'picture never loses its last copy. Tier C is weaker evidence: all '
+          'unmarked, no suggested keeper, still markable one file at a time.</p>')
     if not tier_a and not tier_b and not (tier_c or []):
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
           'No duplicates found &mdash; every image in this folder is distinct. '
@@ -2853,8 +3557,10 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
 
     for tier, key, colour, bg, title, lead in (
             (tier_a, 'A', '#3ddc97', '#12281e', 'DUPLICATE',
-             'Same picture, re-encoded or resized. Keeper is highest resolution, then '
-             'largest file, then finest JPEG quantization. '
+             'Same picture, re-encoded or resized. Keeper has the most animation '
+             'frames, then colour over greyscale, the highest resolution, full colour '
+             'over a palette, a lossless format, the largest file, and the finest JPEG '
+             'quantization. '
              '<b style="color:var(--drop)">DROP</b> matched the keeper directly and is '
              'pre-set to <code>X</code>; '
              '<b style="color:#b3a0d4">LINKED</b> (dashed) reached this cluster through '
@@ -2873,7 +3579,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
              'NCC in a dense screenshot pocket or on near-black thumbs, or a high '
              'cosine with no crop confirm. Nothing is pre-marked and there is '
              '<b>no suggested keeper</b>. You may still mark <code>X</code> to recycle; '
-             'the last remaining copy in a cluster cannot.')):
+             'a file goes only while a copy it was matched with stays unmarked.')):
         if plan:
             groups = plan_by_key.get(key, [])
         elif key == 'C':
@@ -2999,11 +3705,17 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             return (json.dumps(o).replace('<', '\\u003c').replace('>', '\\u003e')
                     .replace('&', '\\u0026'))
         A('<script>')
-        A('var LINES=%s,AT=%s,SUGG=%s,TIERB=%s,CLUSTERS=%s,NAME=%s,CRLF=%s;'
+        nbmap = cluster_neighbours(plan, recs, a_edges, b_edges, c_edges)
+        homes = dict((recs[i]['p'], c) for i, c in (home or {}).items()
+                     if recs[i]['p'] in (editable_at or {}))
+        A('var LINES=%s,AT=%s,SUGG=%s,TIERB=%s,CLUSTERS=%s,NAME=%s,CRLF=%s,'
+          'NB=%s,HOME=%s;'
           % (js(list_lines), js(editable_at), js(suggested_b or []),
              js(tier_b_all or []), js(clusters),
              js(list_name or 'duplicates-list.txt'),
-             'true' if os.name == 'nt' else 'false'))
+             'true' if os.name == 'nt' else 'false',
+             js(dict((str(c), v) for c, v in nbmap.items())),
+             js(dict((k, str(v)) for k, v in homes.items()))))
         A(r'''
 var ORIG=LINES.slice(), tiles=[].slice.call(document.querySelectorAll('.it[data-p]')), cur=0;
 function mark(p,on){var i=AT[p]; if(i===undefined)return;
@@ -3027,13 +3739,24 @@ for(var c in CLUSTERS){CLUSTERS[c].forEach(function(p){
   if(!(p in CLOF))CLOF[p]=[]; CLOF[p].push(c);});}
 function survivors(cl){var m=CLUSTERS[cl]||[],n=0;
   for(var i=0;i<m.length;i++){if(!isOn(m[i]))n++;} return n;}
-// The only rule: a cluster keeps at least one copy. WHICH one is yours to
-// pick, the suggested keeper included. Refusing to mark the keeper was
-// simpler and wrong - preferring the other copy could not be said at all.
+// The rule the recycler applies: every file binned in a cluster keeps an
+// unmarked copy it was matched with DIRECTLY (NB) - "some member survives"
+// let a chain's far end, a different picture, stand in as the survivor.
+// WHICH copy is yours to pick, the suggested keeper included. A cluster
+// with nothing to delete (references only) is not the recycler's concern,
+// so it is not the page's either.
 function canBin(p){var cls=CLOF[p];
   if(!cls)return true;
-  // every cluster this file counts in must keep someone, not just its home
-  for(var i=0;i<cls.length;i++){if(survivors(cls[i])<=1)return false;}
+  for(var i=0;i<cls.length;i++){var cl=cls[i],nb=NB[cl];
+    if(!nb)continue;
+    if(survivors(cl)<=1)return false;
+    var m=CLUSTERS[cl]||[];
+    for(var j=0;j<m.length;j++){var x=m[j];
+      if(x!==p&&!isOn(x))continue;
+      if(HOME[x]!==cl)continue;
+      var n=nb[x]||[],ok=false;
+      for(var k=0;k<n.length;k++){if(n[k]!==p&&!isOn(n[k])){ok=true;break;}}
+      if(!ok)return false;}}
   return true;}
 function say(t,msg){var b=t&&t.querySelector('.tg'); if(!b)return;
   var old=b.textContent; b.textContent=msg; b.classList.add('no');
@@ -3120,17 +3843,17 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
 
     L = ['# ' + '=' * 74,
          '#  DUPLICATE SELECTION LIST',
-         '#  Root: ' + root,
+         '#  Root: ' + list_safe(root),
          '#',
          '#  EVERY member of every cluster is an editable line. The first',
          '#  character decides what happens:',
          '#      X  = send this file to the OS trash (Recycle Bin / Trash)',
          '#      .  = keep this file',
          '#  Want to keep a different copy than suggested? Just MOVE the X.',
-         '#  The Recycle script deletes a file only while at least one other',
-         '#  member of the same cluster stays unmarked AND still verifies',
-         '#  against its scan-time hash - so a cluster can never be wiped out,',
-         '#  by edit or by accident.',
+         '#  The Recycle script deletes a file only while a copy it was matched',
+         '#  with directly stays unmarked, still verifies against its scan-time',
+         '#  hash, and is a different file on disk (not a link to it) - so no',
+         '#  picture can lose its last copy, by edit or by accident.',
          '#',
          '#  A file can belong to two clusters (an exact duplicate that is also',
          '#  the uncropped original of something). It gets its editable line in',
@@ -3140,11 +3863,11 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
          '#  TIER A: suggested keeper pre-set to ".", the rest to X.',
          '#  TIER B: everything pre-set to "." - review in the HTML report first.',
          '#  TIER C: weaker evidence. Everything pre-set to "." - no suggested',
-         '#          keeper. You may still mark X. The last remaining copy in',
-         '#          a cluster cannot be deleted.',
+         '#          keeper. You may still mark X; the rule above applies.',
          '# ' + '=' * 74]
     rows = []
     last_key = None
+    nbmap = cluster_neighbours(plan, recs, a_edges, b_edges, c_edges)
     for cl_id, key, keeper, editable, refs in plan:
         if key != last_key:
             if key == 'A':
@@ -3221,8 +3944,20 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             # mark it X and delete it - the one thing that branch promises
             # cannot happen. So the suggestion is conditional on the file
             # having a line to be suggested in.
-            sd = 1 if (key == 'B' and not is_keeper and i in b_sugg
-                       and recs[i]['p'] in editable_at) else 0
+            #
+            # Nor is a LINKED member a suggestion - one that joined the
+            # cluster through another file and was never compared with the
+            # keeper. Tier A has left those unmarked since v4.3.6; Tier B
+            # still flagged them, so "Mark all Tier B suggestions" and the
+            # recycler's "b" answer binned pictures the keeper had never
+            # been measured against, with the keeper passing as their
+            # survivor. On the reference library that was 43% of review tiles.
+            # And never a copy of another KIND than the keeper (media_kind):
+            # the lossless-first rule kept a GIF's first frame and suggested
+            # binning the animation itself.
+            sd = 1 if (key == 'B' and not is_keeper and not linked
+                       and i in b_sugg and recs[i]['p'] in editable_at
+                       and media_kind(recs[i]) == media_kind(recs[keeper])) else 0
             if sd:
                 suggested_b.append(recs[i]['p'])
             # Keepers included: "Clear Tier B marks" has to be able to undo
@@ -3231,7 +3966,8 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             if key == 'B' and recs[i]['p'] in editable_at:
                 tier_b_all.append(recs[i]['p'])
             row = {'rel': recs[i]['p'], 'size': recs[i]['b'],
-                   'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key}
+                   'sha': recs[i]['sha'], 'cl': cl_id, 'home': cl_id, 't': key,
+                   'nb': nbmap.get(cl_id, {}).get(recs[i]['p'], [])}
             if sd:
                 row['sd'] = 1
             if mark is not None:
@@ -3247,12 +3983,16 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     # implementations of these rules would drift, and this project has
     # already been bitten by exactly that (see "launcher fleet drift", v3).
     trash_src = _vendored_trash_source()
+    manifest = json.dumps(rows, ensure_ascii=False, indent=1)
+    try:
+        manifest.encode('utf-8')
+    except UnicodeEncodeError:        # a lone surrogate: see list_safe
+        manifest = json.dumps(rows, indent=1)
     py = (PY_RECYCLER_TEMPLATE
           .replace('__TRASH_MODULE__', trash_src)
           .replace('__ROOT_JSON__', json.dumps(root))
           .replace('__LIST_JSON__', json.dumps(os.path.basename(list_path)))
-          .replace('__MANIFEST_JSON__', json.dumps(rows, ensure_ascii=False,
-                                                   indent=1)))
+          .replace('__MANIFEST_JSON__', manifest))
     with open(py_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(py)
     try:
@@ -3260,15 +4000,12 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     except OSError:
         pass
 
-    stem = os.path.basename(py_path)
-    bat = BAT_TEMPLATE.replace('__PY__', stem) \
-                      .replace('__LIST__', os.path.basename(list_path))
+    # The wrappers carry no file names (see BAT_TEMPLATE): each runs the .py
+    # that shares its own name, so every name that is legal on disk works.
     with open(bat_path, 'wb') as f:
-        f.write(bat.replace('\n', '\r\n').replace('\r\r\n', '\r\n').encode('ascii'))
-    sh = SH_TEMPLATE.replace('__PY__', stem) \
-                    .replace('__LIST__', os.path.basename(list_path))
+        f.write(BAT_TEMPLATE.replace('\n', '\r\n').encode('ascii'))
     with open(sh_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(sh)
+        f.write(SH_TEMPLATE)
     try:
         os.chmod(sh_path, 0o755)
     except OSError:
@@ -3319,9 +4056,12 @@ PY_RECYCLER_TEMPLATE = r'''#!/usr/bin/env python3
 # member is fully supported - the suggested keeper is only a suggestion.
 #
 # Safety, enforced per cluster at run time:
-#   - a file is deleted only if at least one OTHER member of its cluster is
-#     left unmarked, still exists, and still matches its scan-time SHA-256
-#     (the "surviving witness");
+#   - a file is deleted only if a member it was matched with directly (or
+#     is byte-identical to) is left unmarked, still exists, and still
+#     matches its scan-time SHA-256 (the "surviving witness"), and that
+#     witness is a different file on
+#     disk from everything being deleted - not a symlink, junction or hard
+#     link to one of them;
 #   - a cluster with every member marked X is refused outright;
 #   - a file marked X is deletable only in the cluster that OWNS its line,
 #     so one X can never become two deletions and a refusal cannot be
@@ -3364,9 +4104,13 @@ def sha256_of(path):
     return h.hexdigest()
 
 
+def abspath_of(e):
+    return os.path.join(ROOT, *e['rel'].split('/'))
+
+
 def entry_ok(e):
     """Still the file the scan saw: exists, same size, same hash."""
-    full = os.path.join(ROOT, *e['rel'].split('/'))
+    full = abspath_of(e)
     try:
         if not os.path.isfile(full):
             return False
@@ -3377,48 +4121,121 @@ def entry_ok(e):
     return sha256_of(full) == e['sha']
 
 
+_VERIFIED = {}
+
+
+def verified(e):
+    """entry_ok, remembered: a surviving copy can be asked about twice."""
+    got = _VERIFIED.get(e['rel'])
+    if got is None:
+        got = _VERIFIED[e['rel']] = entry_ok(e)
+    return got
+
+
+def _file_ids(path, follow):
+    """Keys for the file a path names on disk: (device, inode) where the
+    filesystem reports one - that collapses symlinks, junctions, hard links
+    and bind mounts - and the resolved path, which still collapses symlinks
+    and junctions where the inode is reported as 0 (FAT)."""
+    out = set()
+    try:
+        st = os.stat(path) if follow else os.lstat(path)
+        if st.st_ino:
+            out.add(('ino', st.st_dev, st.st_ino))
+    except OSError:
+        pass
+    try:
+        if follow:
+            rp = os.path.realpath(path)
+        else:
+            rp = os.path.join(os.path.realpath(os.path.dirname(path)),
+                              os.path.basename(path))
+        out.add(('path', os.path.normcase(rp)))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def removed_ids(path):
+    """What trashing this path takes away. A symlink named here is itself
+    what goes, not its target, so the last link is not followed."""
+    return _file_ids(path, follow=False)
+
+
+def reached_ids(path):
+    """What a surviving copy actually is, with links followed."""
+    return _file_ids(path, follow=True)
+
+
+def list_lines():
+    """The list's lines. UTF-16 is read too: PowerShell 5.1 writes it for
+    `>` and Out-File, and a list re-saved that way crashed this script with
+    a traceback. Anything else that is not UTF-8 - ANSI with non-ASCII
+    names - is refused in words: its names would not match. Lines split on
+    CR and LF only, as a text file reads; splitlines() would also split a
+    name holding U+2028 or U+0085."""
+    with open(LIST_FILE, 'rb') as fh:
+        raw = fh.read()
+    if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        text = raw.decode('utf-16')
+    else:
+        try:
+            text = raw.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            print('')
+            print('  [FAIL] %s is not saved as UTF-8, so its file names cannot'
+                  % LIST_NAME)
+            print('         be matched reliably. Open it, save it as UTF-8, and')
+            print('         run this again. Nothing was changed.')
+            print('')
+            raise SystemExit(1)
+    return text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+
 def read_marks():
     """Returns (marks, unknown). Last mark on a path wins, matching the
     order a human reads the file in."""
     marks, unknown = {}, []
     by_rel = set(e['rel'] for e in MANIFEST)
-    with open(LIST_FILE, encoding='utf-8-sig') as f:
-        for line in f:
-            line = line.rstrip('\r\n')
-            if not re.match(r'^[Xx.]\s', line):
-                continue
-            mark = line[0].upper()
-            body = line[1:]
-            # The writer emits exactly "<mark><2 spaces><path>", so take the
-            # separator by width rather than by stripping whitespace.
-            #
-            # It used to do line[1:].strip(), which also ate any leading
-            # whitespace belonging to the PATH - and a leading space is a
-            # legal filename that walk_images accepts, because the extension
-            # check only looks at the tail. So " p.jpg" and "p.jpg" both
-            # became the key "p.jpg", the later line silently overwrote the
-            # earlier, and an X the user put on one file landed on the
-            # other. Nothing appeared in `unknown`, because the collapsed
-            # name did match a real manifest row - just the wrong one. The
-            # per-cluster survivor check and the sha check then both passed,
-            # and the recycler binned a file whose own line read "." and
-            # "suggested keeper".
-            exact = body[2:] if body.startswith('  ') else body.lstrip()
-            # strip only the TRAILING "   [WxH, size]" block, anchored and
-            # with no ']' inside, so a name like "photo  [final].jpg" is safe
-            rest = re.sub(r'\s{2,}\[[^\]]*\]\s*$', '', exact)
-            if rest not in by_rel:
-                # A hand-edited line whose spacing no longer matches what was
-                # written. Fall back to the forgiving parse, but only after
-                # the exact one has failed, so a path that really does begin
-                # with a space can never be captured by its trimmed twin.
-                alt = re.sub(r'\s{2,}\[[^\]]*\]\s*$', '', body.strip())
-                if alt in by_rel:
-                    rest = alt
-            if rest in by_rel:
-                marks[rest] = mark
-            elif mark == 'X':
-                unknown.append(rest)
+    for line in list_lines():
+        if not re.match(r'^[Xx.]\s', line):
+            continue
+        mark = line[0].upper()
+        body = line[1:]
+        # The writer emits exactly "<mark><2 spaces><path>", so take the
+        # separator by width rather than by stripping whitespace.
+        #
+        # It used to do line[1:].strip(), which also ate any leading
+        # whitespace belonging to the PATH - and a leading space is a
+        # legal filename that walk_images accepts, because the extension
+        # check only looks at the tail. So " p.jpg" and "p.jpg" both
+        # became the key "p.jpg", the later line silently overwrote the
+        # earlier, and an X the user put on one file landed on the
+        # other. Nothing appeared in `unknown`, because the collapsed
+        # name did match a real manifest row - just the wrong one. The
+        # per-cluster survivor check and the sha check then both passed,
+        # and the recycler binned a file whose own line read "." and
+        # "suggested keeper".
+        exact = body[2:] if body.startswith('  ') else body.lstrip()
+        # strip only the TRAILING "   [WxH, size]" block. Anchoring at
+        # the end is not enough on its own: a search takes the LEFTMOST
+        # match, so with only ']' excluded it began at a "  [" inside
+        # the NAME - "a.png  [v2.png" read as "a.png", and an X meant
+        # for one file landed on another. Neither bracket may appear
+        # inside the block, so a match can only start at the block.
+        rest = re.sub(r'\s{2,}\[[^\[\]]*\]\s*$', '', exact)
+        if rest not in by_rel:
+            # A hand-edited line whose spacing no longer matches what was
+            # written. Fall back to the forgiving parse, but only after
+            # the exact one has failed, so a path that really does begin
+            # with a space can never be captured by its trimmed twin.
+            alt = re.sub(r'\s{2,}\[[^\[\]]*\]\s*$', '', body.strip())
+            if alt in by_rel:
+                rest = alt
+        if rest in by_rel:
+            marks[rest] = mark
+        elif mark == 'X':
+            unknown.append(rest)
     return marks, unknown
 
 
@@ -3527,6 +4344,7 @@ def main():
     print('  Duplicate cleanup -- preview')
     print('  ----------------------------')
     print('  %d marked X, %d marked . (kept)' % (nx, nk))
+    print('  Image folder:    %s' % ROOT)
     print('  Deletions go to: %s' % trash_backend_name())
     print('')
     if unknown:
@@ -3545,7 +4363,7 @@ def main():
     for e in MANIFEST:
         clusters.setdefault(e['cl'], []).append(e)
 
-    plan, skipped, total_bytes = [], 0, 0
+    plan, pending, skipped, total_bytes = [], [], 0, 0
     for cl in sorted(clusters):
         members = clusters[cl]
         # Deletable here only if this cluster OWNS the row. A file shared
@@ -3570,25 +4388,14 @@ def main():
             skipped += len(xs)
             continue
 
-        witness = None
-        for k in keeps:
-            if entry_ok(k):
-                witness = k
-                break
-        if witness is None:
-            print('  [SKIP] cluster %d: no unmarked copy still verifies against the'
-                  % cl)
-            print('         scan - the surviving copy would be unproven. Re-scan first.')
-            skipped += len(xs)
-            continue
-
+        good = []
         for e in xs:
-            full = os.path.join(ROOT, *e['rel'].split('/'))
+            full = abspath_of(e)
             name = os.path.basename(e['rel'])
             if not os.path.lexists(full):
                 skipped += 1
                 continue
-            if not entry_ok(e):
+            if not verified(e):
                 print('  [SKIP] %s' % name)
                 print('         contents changed since the scan - verify by hand')
                 skipped += 1
@@ -3599,6 +4406,57 @@ def main():
                 print('            %s' % why)
                 print('            Left untouched on purpose. Move it somewhere')
                 print('            shorter and re-scan if you still want it gone.')
+                skipped += 1
+                continue
+            good.append((e, full, name))
+        if good:
+            pending.append((cl, keeps, good))
+
+    # The surviving copy has to be a different file ON DISK from everything
+    # this run sends to the trash. Checking its hash is not enough: a
+    # symlink to the file being deleted hashes perfectly - it reads through
+    # to the very bytes about to go - and so does a folder swapped for a
+    # junction to its twin after the scan. Both were measured passing as
+    # the survivor while the only real copy went to the trash, leaving the
+    # "keeper" a dangling link. So the whole plan is assembled first, and a
+    # witness that reaches any file in it is not a witness.
+    doomed = set()
+    for _cl, _keeps, good in pending:
+        for _e, full, _name in good:
+            doomed |= removed_ids(full)
+    #
+    # And the survivor has to be a copy of THIS file: a member it was
+    # matched with directly, or byte-identical to (the row's "nb"). A
+    # cluster is a chain, and "some member is left" let its far end - a
+    # different picture - stand in for a file whose every real copy was
+    # being deleted.
+    for cl, keeps, good in pending:
+        for e, full, name in good:
+            nbs = set(e['nb']) if 'nb' in e else None
+            witness = same = None
+            direct = False
+            for k in keeps:
+                if nbs is not None and k['rel'] not in nbs:
+                    continue
+                direct = True
+                if reached_ids(abspath_of(k)) & doomed:
+                    same = same or k
+                    continue
+                if verified(k):
+                    witness = k
+                    break
+            if witness is None:
+                print('  [SKIP] %s  (cluster %d)' % (name, cl))
+                if not direct:
+                    print('         every copy it was matched with is marked X; the')
+                    print('         files left reached it only through other files')
+                elif same is not None:
+                    print('         its unmarked copy %s is the same file on disk'
+                          % os.path.basename(same['rel']))
+                    print('         (a symlink, junction or hard link). Re-scan first.')
+                else:
+                    print('         no unmarked copy of it still verifies against the')
+                    print('         scan - the survivor would be unproven. Re-scan first.')
                 skipped += 1
                 continue
             plan.append({'path': full, 'name': name, 'size': e['size']})
@@ -3642,7 +4500,9 @@ def main():
         print('  Finished with %d failure(s). %d moved to the trash.' % (fail, done))
     print('  Restore anything from the trash if you change your mind.')
     print('')
-    return fail
+    # The count of failures, capped: POSIX keeps 8 bits of an exit code, so
+    # 256 failures used to come out as 0 - success.
+    return min(fail, 255)
 
 
 if __name__ == '__main__':
@@ -3656,32 +4516,22 @@ if __name__ == '__main__':
 
 
 BAT_TEMPLATE = r'''@echo off
-setlocal EnableExtensions
-cd /d "%~dp0"
+setlocal EnableExtensions DisableDelayedExpansion
 rem ---------------------------------------------------------------
 rem  Recycle-Duplicates.bat   (generated by analyze-inventory.py)
-rem  Edit __LIST__ first: X = delete, . = keep.
-rem  Keep this .bat, __PY__ and __LIST__ together.
+rem  Edit the list beside this file first: X = delete, . = keep.
+rem  Keep this .bat, the .py of the same name and the list together.
 rem  This only finds a Python; every rule lives in the .py.
+rem
+rem  No file name is written into this file. One with ")" closed an
+rem  if-block early and cmd refused the whole script; one with a
+rem  non-ASCII letter could not be written at all. It runs the .py
+rem  that shares its own name, and the .py checks for its list.
 rem ---------------------------------------------------------------
-set "_PY=%~dp0__PY__"
-set "_LIST=%~dp0__LIST__"
-
-if not exist "%_PY%" (
-    echo [FAIL] __PY__ not found next to this file.
-    echo.
-    pause
-    exit /b 1
-)
-if not exist "%_LIST%" (
-    echo [FAIL] __LIST__ not found next to this file.
-    echo.
-    pause
-    exit /b 1
-)
+if not exist "%~dpn0.py" goto :nopy
 
 set "PYCMD="
-if defined IMGDEDUP_PYTHON set "PYCMD="%IMGDEDUP_PYTHON%""
+if defined IMGDEDUP_PYTHON set PYCMD="%IMGDEDUP_PYTHON:"=%"
 if not defined PYCMD (
     where py >nul 2>&1
     if not errorlevel 1 set "PYCMD=py -3"
@@ -3690,38 +4540,45 @@ if not defined PYCMD (
     where python >nul 2>&1
     if not errorlevel 1 set "PYCMD=python"
 )
-if not defined PYCMD (
-    echo [FAIL] No Python found. Install Python 3 from python.org, or set
-    echo        IMGDEDUP_PYTHON to a python.exe.
-    echo.
-    pause
-    exit /b 1
-)
+if not defined PYCMD goto :nopython
 
-%PYCMD% "%_PY%"
+%PYCMD% "%~dpn0.py"
 set "_RC=%ERRORLEVEL%"
 echo.
 pause
 exit /b %_RC%
+
+:nopy
+echo [FAIL] Not found next to this file: "%~n0.py"
+echo.
+pause
+exit /b 1
+
+:nopython
+echo [FAIL] No Python found. Install Python 3 from python.org, or set
+echo        IMGDEDUP_PYTHON to a python.exe.
+echo.
+pause
+exit /b 1
 '''
 
 
 SH_TEMPLATE = '''#!/bin/sh
 # ---------------------------------------------------------------
 #  Recycle-Duplicates.sh   (generated by analyze-inventory.py)
-#  Edit __LIST__ first: X = delete, . = keep.
-#  Keep this .sh, __PY__ and __LIST__ together.
+#  Edit the list beside this file first: X = delete, . = keep.
+#  Keep this .sh, the .py of the same name and the list together.
 #  This only finds a Python; every rule lives in the .py.
+#  It runs the .py that shares its own name; no file name is written
+#  in here, so none can break the quoting.
 # ---------------------------------------------------------------
 set -u
-cd "$(dirname "$0")" || exit 1
-
-if [ ! -f "__PY__" ]; then
-    printf '[FAIL] %s not found next to this file.\\n' "__PY__" >&2
-    exit 1
-fi
-if [ ! -f "__LIST__" ]; then
-    printf '[FAIL] %s not found next to this file.\\n' "__LIST__" >&2
+# CDPATH cleared: exported, it let cd land in ANOTHER folder of the same
+# name - and run that folder's recycler.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+py="$here/$(basename -- "$0" .sh).py"
+if [ ! -f "$py" ]; then
+    printf '[FAIL] Not found next to this file: %s\\n' "$py" >&2
     exit 1
 fi
 
@@ -3738,11 +4595,103 @@ if [ -z "$PYCMD" ]; then
     exit 1
 fi
 
-"$PYCMD" "__PY__"
+"$PYCMD" "$py"
 '''
 
 
 # -------------------------------------------------------------------- main --
+def keep_edited_list(lst, rpy):
+    """Move LST aside when it holds marks changed since analyze wrote it,
+    and return the new name; None when it is untouched or absent.
+
+    Re-running analyze - after adding embeddings, say, which the run itself
+    suggests - rewrote the list from the scan with no warning, and a keeper
+    swap made by hand came back as the scan's X on the file chosen to keep.
+    The recycler beside the list records the marks this tool wrote ('m0'),
+    so an edit is any line whose mark differs from that. A list that cannot
+    be compared is treated as edited: moving it costs nothing."""
+    import re
+    if not os.path.exists(lst):
+        return None
+    try:
+        with open(lst, encoding='utf-8-sig') as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        lines = None
+    m0 = None
+    try:
+        with open(rpy, encoding='utf-8') as fh:
+            m = re.search(r'^MANIFEST = (\[.*?\n\])\n', fh.read(),
+                          re.S | re.M)
+        if m:
+            m0 = dict((r['rel'], r['m0']) for r in json.loads(m.group(1))
+                      if 'm0' in r)
+    except (OSError, ValueError, KeyError):
+        m0 = None
+    edited = True
+    if lines is not None and m0:
+        edited = False
+        for ln in lines:
+            if not re.match(r'^[Xx.]\s', ln):
+                continue
+            body = ln[1:]
+            exact = body[2:] if body.startswith('  ') else body.lstrip()
+            rel = re.sub(r'\s{2,}\[[^\[\]]*\]\s*$', '', exact)
+            if rel in m0 and m0[rel] != ln[0].upper():
+                edited = True
+                break
+    if not edited:
+        return None
+    stem, ext = os.path.splitext(lst)
+    n, dst = 1, stem + '.edited' + ext
+    while os.path.exists(dst):
+        n += 1
+        dst = '%s.edited-%d%s' % (stem, n, ext)
+    os.replace(lst, dst)
+    return dst
+
+
+def copied_folder(inv, root, recs, sample=24):
+    """The inventory's own folder when it is a COPY of the folder it lists,
+    else None. Outputs are written beside the inventory but act on the
+    recorded root, so an inventory carried along when a folder was copied
+    produces, in the copy, a recycler aimed at the original."""
+    here = os.path.dirname(os.path.abspath(inv))
+    if not root:
+        return None
+    try:
+        if (os.path.normcase(os.path.realpath(here))
+                == os.path.normcase(os.path.realpath(root))):
+            return None
+    except (OSError, ValueError):
+        return None
+    probe = [r['p'] for r in recs[:sample] if r.get('p')]
+    hits = sum(1 for q in probe
+               if os.path.isfile(os.path.join(here, *q.split('/'))))
+    return here if probe and hits * 2 > len(probe) else None
+
+
+def open_report_if_asked(rep):
+    """Find-Duplicates.bat sets IMGDEDUP_OPEN_REPORT: it cannot know the
+    report's name itself, because a second scan of a folder is written to
+    image-inventory-2.jsonl and its report is duplicates-2-report.html.
+    Opening a fixed name showed the FIRST scan's report on every re-run."""
+    if os.environ.get('IMGDEDUP_OPEN_REPORT') != '1' or not os.path.exists(rep):
+        return
+    print('')
+    print('Opening the report. Mark files to delete, download the list over the')
+    print('old one, then run the recycler beside it.')
+    try:
+        if os.name == 'nt':
+            os.startfile(rep)
+        else:
+            import webbrowser
+            import pathlib
+            webbrowser.open(pathlib.Path(rep).resolve().as_uri())
+    except Exception as exc:
+        print('Could not open it (%s). It is here: %s' % (exc, rep))
+
+
 def main():
     ap = argparse.ArgumentParser(description='Find duplicates in an image inventory.')
     ap.add_argument('inventory', nargs='?', help='inventory .jsonl, or a folder containing one')
@@ -3812,6 +4761,16 @@ def main():
     ap.add_argument('--no-embeddings', action='store_true')
     ap.add_argument('--self-test', action='store_true')
     args = ap.parse_args()
+    try:
+        # a folder dropped on a launcher, as it really was (see _setup)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _setup import dropped_path
+        _was = args.inventory
+        args.inventory = dropped_path(args.inventory, os.path.dirname(os.path.abspath(__file__)))
+        if args.inventory != _was:
+            print('Using the dropped path as Windows passed it in full: ' + args.inventory)
+    except Exception:
+        pass
 
     global _HAVE_CV2
     try:
@@ -3834,6 +4793,16 @@ def main():
     print('Inventory: %s%s' % (os.path.basename(inv),
                                '  (+%d parts)' % (len(parts) - 1) if len(parts) > 1 else ''))
     print('Images: %d   unreadable: %d   root: %s' % (n, len(errs), root))
+    copy_here = copied_folder(inv, root, recs)
+    if copy_here:
+        print('')
+        print('[WARN] This inventory lists the files in')
+        print('         %s' % root)
+        print('       but it sits in a copy of that folder:')
+        print('         %s' % copy_here)
+        print('       The list and recycler written here act on the first folder.')
+        print('       To clean the copy, scan the copy first.')
+        print('')
     if n < 2:
         print('Nothing to compare.')
         return 0
@@ -3941,14 +4910,29 @@ def main():
         # counted, or the note overstates and sends users chasing a cap
         # that never bound.
         kk1 = min(kk + 1, n - 1)
+        # Density is a property of the library, not of the neighbour knob:
+        # an image sits in a dense pocket when at least DENSE_K others clear
+        # the CLIP floor. Tied to min(K, n - 1), an image in a folder of 16
+        # or fewer was "dense" whenever every other image cleared the floor
+        # - in a 2-image folder, on the pair's own cosine - and a real crop
+        # there needed 0.95 and was lost; with --clip-neighbors 1 nearly
+        # every image was. A default run on 17 or more images gathers the
+        # same columns and gets the same answer as before.
+        kg = min(max(kk1, DENSE_K), n - 1)
         for a in range(0, n, block):
             b = min(n, a + block)
             Sb = V[a:b] @ V.T
             rows = np.arange(a, b)
             Sb[np.arange(b - a), rows] = -1.0        # never its own neighbour
-            idx1 = np.argpartition(Sb, -kk1, axis=1)[:, -kk1:]
-            vals1 = np.take_along_axis(Sb, idx1, axis=1)
-            dense[a:b] = (vals1 >= 0.90).sum(axis=1) >= kk
+            idxg = np.argpartition(Sb, -kg, axis=1)[:, -kg:]
+            valsg = np.take_along_axis(Sb, idxg, axis=1)
+            dense[a:b] = (valsg >= 0.90).sum(axis=1) >= DENSE_K
+            if kg > kk1:
+                sel = np.argpartition(valsg, -kk1, axis=1)[:, -kk1:]
+                idx1 = np.take_along_axis(idxg, sel, axis=1)
+                vals1 = np.take_along_axis(valsg, sel, axis=1)
+            else:
+                idx1, vals1 = idxg, valsg
             if kk1 > kk:
                 drop = np.argmin(vals1, axis=1)      # the (K+1)-th nearest
                 capped += int((vals1[np.arange(b - a), drop] >= 0.90).sum())
@@ -4036,8 +5020,8 @@ def main():
     # every cheaper test has already rejected. Deciding first and computing
     # second keeps that set small: on a real library almost every candidate
     # exits above, and what remains is a rounding error next to the sweep.
-    uf_a = UF()
     a_edges = set()          # which Tier A members actually matched EACH OTHER
+    a_order = []             # the same pairs, in the order they were found
     tierb_pairs = []
     tierc_pairs = []
     fallback = []
@@ -4050,7 +5034,7 @@ def main():
         is_dup = ((m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos)
                   and anim_compatible(recs[i], recs[j]))
         if is_dup:
-            uf_a.union(i, j)
+            a_order.append((i, j))
             a_edges.add((i, j))
             a_edges.add((j, i))
         elif m <= args.tier_b_mad:
@@ -4153,8 +5137,13 @@ def main():
             leftover.append(p)
     # CLIP still says same picture, crop matching did not, luma/orient did
     # not. Bounded by CLIP_TIER_C (0.97), not the 0.90 neighbour floor.
+    # The dense/dark flags go in here too: without them a dense crop score
+    # past 0.90 read as a Tier B pass, which is not 'C', and the pair was
+    # dropped even at cosine 0.98.
     for i, j in leftover:
-        if review_lane(nccs.get((i, j), 0.0), cos_of(i, j)) == 'C':
+        if review_lane(nccs.get((i, j), 0.0), cos_of(i, j),
+                       bool(dense[i]), bool(dense[j]),
+                       float(sig_luma[i]), float(sig_luma[j])) == 'C':
             tierc_pairs.append((i, j))
 
     if dead_zone:
@@ -4169,8 +5158,7 @@ def main():
     # Byte-identical files are duplicates by definition - cluster them even
     # if the sweep or the embeddings could not vouch for them.
     for members in exact:
-        for i in members[1:]:
-            uf_a.union(members[0], i)
+        a_order.extend((members[0], i) for i in members[1:])
         # Byte-identical, so every member really does match every other -
         # unlike a pixel-scored chain, an exact group is a genuine clique
         # and each of its edges is real.
@@ -4178,11 +5166,6 @@ def main():
             for b_ in members:
                 if a_ != b_:
                     a_edges.add((a_, b_))
-
-    tier_a = []
-    for members in uf_a.groups():
-        k = max(members, key=lambda i: quality_key(recs, i))
-        tier_a.append((k, [i for i in members if i != k], members))
 
     mad_map = {}
     for t, (i, j) in enumerate(cand):
@@ -4192,11 +5175,16 @@ def main():
         return mad_map.get((i, j) if i < j else (j, i))
 
     phase('Confirming borderline Tier A pairs at %d px ...' % CONFIRM_PX)
-    tier_a, demoted, n_hires, n_cap = apply_hires_confirms(
-        tier_a, recs, root, mad_of, a_edges, args.tier_a_mad)
-    if n_hires or n_cap or demoted:
-        print('  512 px confirm: %d pair(s) checked, %d demoted to review%s'
+    tier_a, demoted, n_hires, n_cap, n_unread = settle_tier_a(
+        recs, root, mad_of, a_edges, a_order, args.tier_a_mad)
+    for i, j in demoted:
+        a_edges.discard((i, j))
+        a_edges.discard((j, i))
+    if n_hires or n_cap or demoted or n_unread:
+        print('  512 px confirm: %d pair(s) checked, %d demoted to review%s%s'
               % (n_hires, len(demoted),
+                 ', %d could not be read (left in Tier A)' % n_unread
+                 if n_unread else '',
                  ', %d skipped (cap %d)' % (n_cap, CONFIRM_CAP) if n_cap else ''))
     for p in demoted:
         tierb_pairs.append(p)
@@ -4243,8 +5231,9 @@ def main():
         return 3
     print('Invariants: OK')
 
-    dn = sum(len(d) for _, d, _ in tier_a)
-    db = sum(recs[i]['b'] for _, d, _ in tier_a for i in d)
+    pm = premarked(tier_a, a_edges)
+    dn = len(pm)
+    db = sum(recs[i]['b'] for i in pm)
     tot = sum(r['b'] for r in recs)
     print('')
     print('Tier A duplicates : %d clusters, %d droppable, %.1f MB of %.1f MB (%.1f%%)'
@@ -4261,8 +5250,16 @@ def main():
               % (c_omit_files, c_omit_groups, C_CLUSTER_MAX))
 
     outdir = os.path.dirname(os.path.abspath(inv))
-    stem = os.path.basename(inv)[:-len('.jsonl')].replace('image-inventory', 'duplicates')
-    if stem == os.path.basename(inv)[:-len('.jsonl')]:
+    # The inventory's own name without .jsonl or .partN, as load_embeddings
+    # takes it: chopping six characters blindly mangled a name that did not
+    # end in .jsonl, and a part file named directly kept its ".partN".
+    inv_base = os.path.basename(inv)
+    if inv_base.endswith('.jsonl'):
+        inv_base = inv_base[:-len('.jsonl')]
+    if '.part' in inv_base:
+        inv_base = inv_base.split('.part')[0]
+    stem = inv_base.replace('image-inventory', 'duplicates')
+    if stem == inv_base:
         stem = stem + '-duplicates'
     rep = os.path.join(outdir, stem + '-report.html')
     lst = os.path.join(outdir, stem + '-list.txt')
@@ -4320,12 +5317,20 @@ def main():
             for q in stale:
                 print('   ' + q)
         print('')
+        open_report_if_asked(rep)
         return 0
 
     # The list is written first so the report can carry a copy of it. The
     # page edits the very lines this wrote; rendering the format a second
     # time in JavaScript would leave two implementations free to drift, and
     # this project has been bitten by exactly that before.
+    kept = keep_edited_list(lst, rpy)
+    if kept:
+        print('')
+        print('Your edited %s was kept as %s.'
+              % (os.path.basename(lst), os.path.basename(kept)))
+        print('The new list starts from the scan again; carry your marks over'
+              ' by hand.')
     nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
         lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges,
         a_edges, tier_c, c_edges)
@@ -4354,6 +5359,7 @@ def main():
         print('NOTE: %s is from an older version and is now superseded by the'
               % os.path.basename(old_ps))
         print('      .py above. Delete it so it cannot be run by mistake.')
+    open_report_if_asked(rep)
     return 0
 
 

@@ -44,6 +44,17 @@ PCI_VENDORS = {0x1002: 'AMD', 0x10DE: 'NVIDIA', 0x8086: 'Intel'}
 # run time (see newest_index) because they move: the stable ROCm index went
 # 6.4 -> 7.0 -> 7.1 -> 7.2 within a few releases.
 FALLBACK_CUDA = 'cu132'
+
+# PyTorch's CUDA 12.8 and newer builds carry kernels for Turing (compute
+# 7.5) and later only, and CUDA 13 cannot compile for anything older. On a
+# GTX 9xx or 10xx, a Titan X/Xp/V or a Quadro M/P, torch.cuda.is_available()
+# still says True and the first kernel then fails with "no kernel image is
+# available". Such a card gets the newest index at or below CUDA 12.6.
+LEGACY_CUDA_MAX = (126,)
+FALLBACK_CUDA_LEGACY = 'cu126'
+_LEGACY_NVIDIA = re.compile(
+    r'GTX\s*(9\d\d|10\d\d)|\bGT\s*10\d\d|TITAN\s*(X|XP|V)\b|'
+    r'QUADRO\s*[KMP]\d|TESLA\s*[KMPV]\d|\bMX\s*[1-3]\d\d', re.I)
 FALLBACK_ROCM = 'rocm7.2'
 
 # AMD's ROCm-on-Windows wheels. Pinned URLs, not an index, and cp312 ONLY -
@@ -76,7 +87,7 @@ def detect_gpus():
                 ['powershell', '-NoProfile', '-Command',
                  'Get-CimInstance Win32_VideoController | '
                  'Select-Object Name,PNPDeviceID | ConvertTo-Json -Compress'],
-                capture_output=True, text=True, timeout=40)
+                capture_output=True, text=True, errors='replace', timeout=40)
             data = json.loads(p.stdout or 'null')
             if isinstance(data, dict):
                 data = [data]
@@ -112,6 +123,34 @@ def detect_gpus():
     return out
 
 
+def nvidia_compute_caps():
+    """Compute capabilities nvidia-smi reports, e.g. [(6, 1)]; [] when it
+    is not installed or too old to know the field."""
+    try:
+        p = subprocess.run(['nvidia-smi', '--query-gpu=compute_cap',
+                            '--format=csv,noheader'], capture_output=True,
+                           text=True, errors='replace', timeout=20)
+    except Exception:
+        return []
+    caps = []
+    if p.returncode == 0:
+        for line in (p.stdout or '').splitlines():
+            m = re.match(r'\s*(\d+)\.(\d+)\s*$', line)
+            if m:
+                caps.append((int(m.group(1)), int(m.group(2))))
+    return caps
+
+
+def nvidia_is_legacy(names):
+    """True when an NVIDIA card here predates Turing (compute 7.5).
+    nvidia-smi's answer wins; the model name decides before a driver is
+    installed, which is exactly when setup runs."""
+    caps = nvidia_compute_caps()
+    if caps:
+        return min(caps) < (7, 5)
+    return any(_LEGACY_NVIDIA.search(n or '') for n in names)
+
+
 def driver_ready(vendor):
     """Is a usable compute driver present for this vendor (not just a card)?"""
     probes = {'NVIDIA': ['nvidia-smi'], 'AMD': ['rocm-smi', 'rocminfo']}
@@ -124,6 +163,23 @@ def driver_ready(vendor):
             continue
     if vendor == 'NVIDIA' and not IS_WIN:
         return os.path.isdir('/proc/driver/nvidia/gpus')
+    # rocm-smi and rocminfo are not part of AMD's Windows driver, and Intel
+    # had no probe at all, so both always read "compute driver: not found" -
+    # a working Arc included. Each vendor's compute runtime is looked for
+    # where its driver puts it instead.
+    sysdir = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32')
+    if vendor == 'AMD':
+        if IS_WIN:
+            return bool(glob.glob(os.path.join(sysdir, 'amdhip64*.dll')))
+        return os.path.exists('/dev/kfd')          # the ROCm kernel driver
+    if vendor == 'Intel':
+        if IS_WIN:
+            return os.path.exists(os.path.join(sysdir, 'ze_loader.dll'))
+        try:
+            import ctypes.util
+            return bool(ctypes.util.find_library('ze_loader'))   # Level Zero
+        except Exception:
+            return False
     return False
 
 
@@ -147,11 +203,14 @@ def _wheel_tags():
     return py, plat
 
 
-def _index_has_wheel(idx, timeout=15):
-    """True when .../whl/<idx>/torch/ lists a torch wheel this interpreter
-    can install. A directory existing proves nothing: cu134 was published
-    with only torch 2.0 aarch64 wheels in it, so the newest directory name
-    is not the newest usable build."""
+# transformers 5 switches torch off below this ("PyTorch >= 2.4 is
+# required"), so an older wheel installs cleanly and then does nothing.
+MIN_TORCH = (2, 4)
+
+
+def _index_best_torch(idx, timeout=15):
+    """The newest torch version .../whl/<idx>/torch/ offers for this Python
+    and platform, as a tuple; None when it offers none or cannot be read."""
     py, plat = _wheel_tags()
     try:
         from urllib.request import urlopen
@@ -159,16 +218,25 @@ def _index_has_wheel(idx, timeout=15):
         with urlopen(url, timeout=timeout) as r:
             html = r.read().decode('utf-8', 'replace')
     except Exception:
-        return False
-    pat = r'torch-\d[^"<]*-%s-%s-[^"<]*%s[^"<]*\.whl' % (py, py, plat)
-    return re.search(pat, html) is not None
+        return None
+    pat = r'torch-(\d+(?:\.\d+)*)[^"<]*?-%s-%s-[^"<]*%s[^"<]*\.whl' % (py, py, plat)
+    vers = [tuple(int(x) for x in m.group(1).split('.'))
+            for m in re.finditer(pat, html)]
+    return max(vers) if vers else None
 
 
-def newest_index(prefix, timeout=15):
-    """Newest .../whl/<prefix>N index that actually carries a torch wheel
-    for this Python and platform, or None offline. The listing is a plain
-    PEP-503 anchor page; candidates are checked newest-first, and only a
-    few, because each check downloads that index's wheel list."""
+def newest_index(prefix, timeout=15, max_key=None):
+    """The .../whl/<prefix>N index to install torch from: of the newest few,
+    the one whose best wheel for this Python and platform is the newest
+    torch, and at least MIN_TORCH. None when the listing cannot be reached
+    (offline); '' when it can but no index has a usable wheel here.
+
+    A directory existing proves nothing - cu134 was published holding only
+    torch 2.0 aarch64 wheels - and "has a wheel" was not enough either:
+    that 2.0.1 wheel still won on Linux aarch64 with Python 3.10 and 3.11,
+    and transformers then refused it. The listing is a plain PEP-503 anchor
+    page; only a few candidates are checked, because each check downloads
+    that index's wheel list."""
     try:
         from urllib.request import urlopen
         with urlopen('https://download.pytorch.org/whl/', timeout=timeout) as r:
@@ -177,10 +245,26 @@ def newest_index(prefix, timeout=15):
         return None
     found = set(re.findall(r'>\s*(%s[\d.]+)\s*/?\s*<' % prefix, html))
     found |= set(re.findall(r'href="[^"]*?(%s[\d.]+)/' % prefix, html))
+    if max_key is not None:
+        found = set(f for f in found if _ver_key(f) <= max_key)
+    best = None
     for idx in sorted(found, key=_ver_key, reverse=True)[:4]:
-        if _index_has_wheel(idx, timeout):
-            return idx
-    return None
+        v = _index_best_torch(idx, timeout)
+        if v is None or v < MIN_TORCH:
+            continue
+        if best is None or v > best[0]:       # ties keep the newer index
+            best = (v, idx)
+    return best[1] if best else ''
+
+
+def no_wheel_note():
+    pv = sys.version_info[:2]
+    return ('the newest indexes on download.pytorch.org have no PyTorch %d.%d+ '
+            'build for Python %d.%d on this platform%s'
+            % (MIN_TORCH[0], MIN_TORCH[1], pv[0], pv[1],
+                                    ' (current PyTorch releases need Python 3.10'
+                                    ' or newer)'
+                                    if pv < (3, 10) else ''))
 
 
 # --------------------------------------------------------------- backends --
@@ -197,17 +281,33 @@ class Backend(object):
         return not self.blocked
 
 
-def backends_for(vendors, online=True):
+def backends_for(vendors, online=True, names=()):
     """Every torch build worth offering on this machine, best first."""
     pv = sys.version_info[:2]
     out = []
 
     if 'NVIDIA' in vendors:
-        idx = (newest_index('cu') if online else None) or FALLBACK_CUDA
-        out.append(Backend(
-            'cuda', 'NVIDIA GPU (CUDA)',
-            ['torch', '--index-url', 'https://download.pytorch.org/whl/' + idx],
-            note='needs a current NVIDIA driver'))
+        legacy = nvidia_is_legacy(names)
+        if legacy:
+            idx = newest_index('cu', max_key=LEGACY_CUDA_MAX) if online else None
+            fallback = FALLBACK_CUDA_LEGACY
+        else:
+            idx = newest_index('cu') if online else None
+            fallback = FALLBACK_CUDA
+        if idx == '':
+            # Reached, and nothing fits: the fallback would fail the same way
+            # in pip, as a bare "No matching distribution".
+            out.append(Backend('cuda', 'NVIDIA GPU (CUDA)', [],
+                               blocked=no_wheel_note()))
+        else:
+            idx = idx or fallback
+            label = ('NVIDIA GPU (CUDA %s build - this card predates Turing)' % (
+                '.'.join((idx[2:-1], idx[-1])) if idx[2:].isdigit() else idx)
+                if legacy else 'NVIDIA GPU (CUDA)')
+            out.append(Backend(
+                'cuda', label,
+                ['torch', '--index-url', 'https://download.pytorch.org/whl/' + idx],
+                note='needs a current NVIDIA driver'))
 
     if 'AMD' in vendors:
         if IS_WIN:
@@ -231,12 +331,17 @@ def backends_for(vendors, online=True):
             out.append(Backend('rocm', 'AMD GPU (ROCm)', [],
                                blocked='ROCm is Linux-only.'))
         else:
-            idx = (newest_index('rocm') if online else None) or FALLBACK_ROCM
-            out.append(Backend(
-                'rocm', 'AMD GPU (ROCm, %s)' % idx,
-                ['torch', '--index-url',
-                 'https://download.pytorch.org/whl/' + idx],
-                note='needs the amdgpu/ROCm kernel driver'))
+            idx = newest_index('rocm') if online else None
+            if idx == '':
+                out.append(Backend('rocm', 'AMD GPU (ROCm)', [],
+                                   blocked=no_wheel_note()))
+            else:
+                idx = idx or FALLBACK_ROCM
+                out.append(Backend(
+                    'rocm', 'AMD GPU (ROCm, %s)' % idx,
+                    ['torch', '--index-url',
+                     'https://download.pytorch.org/whl/' + idx],
+                    note='needs the amdgpu/ROCm kernel driver'))
 
     if 'Intel' in vendors and not IS_MAC:
         out.append(Backend(
@@ -280,7 +385,29 @@ try:
     except Exception: o['xpu_ok'] = False
     try: o['mps_ok'] = bool(torch.backends.mps.is_available())
     except Exception: o['mps_ok'] = False
+    # the BUILD, not the device: an XPU wheel without its driver is still an
+    # XPU wheel, and was reported as "CPU-only" and sent round a reinstall
+    o['xpu_build'] = bool(getattr(torch.version, 'xpu', None))
+    try: o['mps_built'] = bool(torch.backends.mps.is_built())
+    except Exception: o['mps_built'] = False
     o['gpu_name'] = torch.cuda.get_device_name(0) if o['cuda_ok'] else ''
+    if o['cuda_ok'] and not o['hip']:
+        try:
+            cap = tuple(torch.cuda.get_device_capability(0))
+            o['cuda_cc'] = '%d.%d' % cap
+            fits = False
+            for a in torch.cuda.get_arch_list():
+                kind, _, num = a.partition('_')
+                num = ''.join(ch for ch in num if ch.isdigit())
+                if len(num) < 2:
+                    continue
+                mj, mn = int(num[:-1]), int(num[-1])
+                if (kind == 'sm' and mj == cap[0] and mn <= cap[1]) or \
+                        (kind == 'compute' and (mj, mn) <= cap):
+                    fits = True
+            o['cuda_fits'] = fits
+        except Exception:
+            pass
 except Exception:
     o['torch'] = 'ERR'
 print('@@' + json.dumps(o))
@@ -311,11 +438,34 @@ def torch_flavour(st):
         return 'rocm', 'ROCm/HIP %s' % st['hip']
     if st.get('cuda_build'):
         return 'cuda', 'CUDA %s' % st['cuda_build']
-    if st.get('xpu_ok'):
+    if st.get('xpu_build') or st.get('xpu_ok'):
         return 'xpu', 'Intel XPU'
-    if st.get('mps_ok'):
+    if st.get('mps_built') or st.get('mps_ok'):
         return 'mps', 'Apple Metal'
     return 'cpu', 'CPU-only build'
+
+
+def wrong_build(flav, st, vendors):
+    """Why the installed torch can never use this machine's GPU, or ''.
+
+    A CUDA build on an AMD-only machine read as a driver problem, and setup
+    then said "Nothing to do" because every package was present; the doctor
+    sent a CPU-only build round "uninstall, then setup" with no way back in.
+    What is wrong is the build, so setup offers to replace it."""
+    gpu = set(vendors) & {'NVIDIA', 'AMD', 'Intel'}
+    if not gpu:
+        return ''
+    made_for = {'cuda': 'NVIDIA', 'rocm': 'AMD', 'xpu': 'Intel'}.get(flav)
+    if made_for and made_for not in gpu:
+        return ('made for %s GPUs, and the GPU here is %s.'
+                % (made_for, ', '.join(sorted(gpu))))
+    if flav == 'cuda' and st.get('cuda_fits') is False:
+        return ('with no kernels for this card (compute %s); PyTorch\'s CUDA '
+                '12.8 and newer builds start at 7.5.' % st.get('cuda_cc', '?'))
+    if flav == 'cpu' and any(b.usable and b.key != 'cpu'
+                             for b in backends_for(gpu, online=False)):
+        return 'which can never use the %s GPU here.' % ', '.join(sorted(gpu))
+    return ''
 
 
 def missing_packages(st, want_embed=True):
@@ -458,6 +608,26 @@ BOOTSTRAP = (
 )
 
 
+def is_distro_python3():
+    """True when THIS interpreter is the distribution's own python3 - the one
+    its python3-* packages are built for. imgdedup.sh runs setup with the
+    newest python3.X it finds, which on Ubuntu 24.04 with a deadsnakes 3.13
+    is not python3 (3.12): "apt install python3-venv" then installed the
+    3.12 module, and re-running setup showed the same message again."""
+    try:
+        other = shutil.which('python3')
+        if not other:
+            return False
+        if os.path.realpath(other) == os.path.realpath(sys.executable):
+            return True
+        out = subprocess.check_output(
+            [other, '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'],
+            stderr=subprocess.DEVNULL, timeout=30).decode('ascii', 'replace')
+        return out.strip() == '%d.%d' % sys.version_info[:2]
+    except Exception:
+        return False
+
+
 def bootstrap_hint(what):
     """The command that installs pip ('pip') or the venv machinery ('venv')
     on this distro, or None when we cannot say."""
@@ -465,6 +635,10 @@ def bootstrap_hint(what):
     for keys, pm, names in BOOTSTRAP:
         if any(k in ident for k in keys):
             pkg = names.get(what)
+            if 'debian' in keys and not is_distro_python3():
+                # versioned for a second Python (deadsnakes and the like);
+                # its pip comes with the venv, python3-pip is the other one's
+                pkg = 'python%d.%d-venv' % sys.version_info[:2]
             if not pkg:
                 return None
             if '%(v)s' in pkg:
@@ -539,6 +713,51 @@ def distro_packages():
     return None
 
 
+def dropped_path(arg, here):
+    """The path a folder dropped on one of the .bat launchers really had.
+
+    Explorer quotes a dropped path only when it contains a space, so cmd
+    splits D:\\Photos&Videos at the "&" - and D:\\Paris,2019 at the comma,
+    and drops a "^" - before the .bat starts: the argument that arrives is
+    D:\\Photos, a DIFFERENT folder that may well exist, and that is the one
+    that got scanned. The launchers keep cmd's untouched command line in
+    IMGDEDUP_RAWCMD; the dropped path is the first argument after the
+    launcher there. It is used only when the launcher is one of this
+    toolkit's, and the path extends the argument that arrived and exists.
+    Anything else returns ARG unchanged."""
+    raw = os.environ.get('IMGDEDUP_RAWCMD')
+    if not raw or not IS_WIN:
+        return arg
+    low, here_n = raw.lower(), os.path.normcase(os.path.abspath(here))
+    i = low.find('.bat"')
+    while i != -1:
+        bat = raw[raw.rfind('"', 0, i) + 1:i + 4]
+        if os.path.normcase(os.path.dirname(os.path.abspath(bat))) == here_n:
+            break
+        i = low.find('.bat"', i + 1)
+    if i == -1:
+        return arg
+    rest = raw[i + 5:].strip()
+    if rest.endswith('"'):
+        rest = rest[:-1].rstrip()         # the quote closing cmd /c "..."
+    if not rest:
+        return arg
+    if rest.startswith('"'):
+        end = rest.find('"', 1)
+        cand = rest[1:end] if end != -1 else rest[1:]
+    else:
+        cand = rest.split(' ')[0]         # unquoted means it had no space
+    if not cand or not os.path.exists(cand):
+        return arg
+    got = os.path.normcase(os.path.abspath(arg)) if arg else ''
+    want = os.path.normcase(os.path.abspath(cand))
+    if got == want:
+        return arg
+    if got and not want.replace('^', '').startswith(got.rstrip('\\.')):
+        return arg
+    return cand
+
+
 def pip_hint(pkg, exe=None, is_venv=None, is_managed=None):
     """The install line to PRINT for EXE. Kept here so the four stage scripts
     do not each hard-code advice that is wrong on Arch.
@@ -559,10 +778,18 @@ def pip_hint(pkg, exe=None, is_venv=None, is_managed=None):
     if is_venv:
         return '"%s" -m pip install %s' % (exe, pkg)      # a venv owns itself
     if is_managed:
-        return ('this Python is managed by your distribution, so pip will '
-                'refuse.\n       Run the setup helper instead:  '
-                './imgdedup.sh setup')
-    return '"%s" -m pip install --user %s' % (exe, pkg)
+        # marked by a distribution - or by uv or Homebrew, which do it on
+        # Windows and macOS too, where "./imgdedup.sh" cannot run
+        return ('this Python is marked as managed by another tool (a Linux '
+                'distribution, uv, Homebrew), so pip will refuse.\n       '
+                'Run the setup helper instead:  %s'
+                % ('"%s" "%s"' % (exe, os.path.abspath(__file__)) if IS_WIN
+                   else './imgdedup.sh setup'))
+    # No --user: pip picks a user install by itself when site-packages is
+    # not writable (a Python in Program Files), and forcing it elsewhere
+    # sent a conda or pyenv Python's packages into ~/.local - where the
+    # system Python of the same version reads them too.
+    return '"%s" -m pip install %s' % (exe, pkg)
 
 
 # ------------------------------------------------------------ installing --
@@ -576,7 +803,7 @@ def pip_base(exe=None, break_system=False):
         if break_system:
             cmd.append('--break-system-packages')
         return cmd
-    cmd.append('--user')
+    # No --user (see pip_hint): pip falls back to it by itself when it must.
     return cmd
 
 
@@ -615,9 +842,13 @@ def venv_python(path):
 def offer_managed_routes(need, args):
     """Explain PEP 668 and let the user pick a way forward.
 
-    Returns True if the caller should go on to install with pip into THIS
-    interpreter (i.e. the user knowingly chose --break-system-packages), and
-    False when everything that is going to happen already has."""
+    Returns (proceed, rc). proceed is True when the caller should go on to
+    install with pip into THIS interpreter (the user knowingly chose
+    --break-system-packages); otherwise everything that is going to happen
+    already has, and rc is the exit code: 0 only when something was
+    installed. Every route used to end in exit 0 - a failed venv, a route
+    the user still had to run by hand - and imgdedup.sh then said "Setup
+    finished"."""
     here = os.path.dirname(os.path.abspath(__file__))
     venv_dir = os.path.join(here, '.venv')
     dp = distro_packages()
@@ -657,15 +888,20 @@ def offer_managed_routes(need, args):
         if vcmd:
             print('     Install that first, then re-run setup:')
             print('       %s' % vcmd)
-    if dp:
+    # route 2's packages are built for the distribution's python3 only, so
+    # a second Python cannot load them; and the pip name 'opencv-python-
+    # headless' has to be looked up as 'opencv', or OpenCV was never mapped
+    # and the route vanished whenever only it and the embed packages were due
+    if dp and is_distro_python3():
         pm, names = dp
-        mapped = [names[p] for p in need if p in names]
+        key = {'opencv-python-headless': 'opencv'}
+        mapped = [names[key.get(p, p)] for p in need if key.get(p, p) in names]
         if mapped:
             routes.append('2')
             print('')
             print('  2) Install from your package manager instead')
             print('       %s %s' % (pm, ' '.join(mapped)))
-            rest = [p for p in need if p not in names]
+            rest = [p for p in need if key.get(p, p) not in names]
             if rest:
                 print('     Does not cover %s - that still wants a venv.'
                       % ', '.join(rest))
@@ -680,6 +916,10 @@ def offer_managed_routes(need, args):
     default = '1' if can_venv else ('2' if '2' in routes else '3')
     if args.yes:
         # never pick 3 unattended - it can break a package-managed system
+        if not can_venv and '2' not in routes:
+            print('  --yes: no route can be taken unattended here - nothing '
+                  'was installed.')
+            return False, 1
         choice = '1' if can_venv else '2'
         print('  --yes: taking route %s.' % choice)
     else:
@@ -692,28 +932,29 @@ def offer_managed_routes(need, args):
         print('')
         print('  That route is not available until the venv module is')
         print('  installed - nothing was done.')
-        return False
+        return False, 1
 
     if choice == '2' and '2' in routes:
         print('')
         print('  Nothing installed. Run the command above, then re-run setup.')
-        return False
+        return False, 1
     if choice == '3':
         print('')
         print('  Proceeding with --break-system-packages, as chosen.')
-        return True
+        return True, 0
     if choice != '1':
         print('')
         print('  Not a listed choice - nothing installed.')
-        return False
+        return False, 1
 
-    return create_venv_and_rerun(args)
+    return False, create_venv_and_rerun(args)
 
 
 def create_venv_and_rerun(args):
-    """Build .venv beside the toolkit and re-run setup inside it. Always
-    returns False: whatever was going to be installed has been, by the
-    child process, and the caller must not carry on installing here."""
+    """Build .venv beside the toolkit and re-run setup inside it. Returns
+    the exit code to pass on - the child's, or 1 when the venv could not be
+    made. Whatever was going to be installed has been, by the child, and
+    the caller must not carry on installing here."""
     venv_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             '.venv')
     existed = os.path.isdir(venv_dir)
@@ -749,7 +990,7 @@ def create_venv_and_rerun(args):
                 print('  Could NOT remove %s (%s).' % (venv_dir, exc))
                 print('  Delete it by hand: while it exists the launchers')
                 print('  will keep choosing it.')
-        return False
+        return 1
 
     print('')
     print('  Creating %s' % venv_dir)
@@ -763,13 +1004,16 @@ def create_venv_and_rerun(args):
                        'installed into it (ensurepip was unavailable).')
     print('  OK. Re-running setup inside it:')
     print('    "%s" "%s"' % (vpy, os.path.abspath(__file__)))
-    subprocess.call([vpy, os.path.abspath(__file__)]
-                    + (['--yes'] if args.yes else [])
-                    + (['--offline'] if args.offline else []))
+    rc = subprocess.call([vpy, os.path.abspath(__file__)]
+                         + (['--yes'] if args.yes else [])
+                         + (['--offline'] if args.offline else []))
     print('')
+    if rc != 0:
+        print('  Setup inside the venv did not finish (exit %d).' % rc)
+        return rc
     print('  From now on the toolkit uses that venv - imgdedup.sh looks for')
     print('  .venv beside itself before falling back to the system Python.')
-    return False
+    return 0
 
 
 def main():
@@ -819,6 +1063,11 @@ def main():
                                 else 'NOT usable (driver missing or too old)'))
 
     need = missing_packages(st)
+    why = wrong_build(flav, st, vendors) if 'torch' not in need else ''
+    if why:
+        print('')
+        print('  torch here is a %s build, %s' % (desc, why))
+        need.append('torch')
     if not need:
         print('')
         print('  Everything the toolkit needs is present. Nothing to do.')
@@ -846,14 +1095,14 @@ def main():
         if ans not in ('y', 'yes'):
             print('  Nothing installed.')
             return 1
-        create_venv_and_rerun(args)
-        return 0
+        return create_venv_and_rerun(args)
 
     # PEP 668 distros refuse pip outright; ask before doing anything.
     breaksys = False
     if em_marker():
-        if not offer_managed_routes(need, args):
-            return 0
+        proceed, rc = offer_managed_routes(need, args)
+        if not proceed:
+            return rc
         breaksys = True
 
     plain = [p for p in need if p != 'torch']
@@ -867,7 +1116,8 @@ def main():
     if 'torch' not in need:
         return 0
 
-    opts = backends_for(vendors, online=not args.offline)
+    opts = backends_for(vendors, online=not args.offline,
+                        names=[n for v, n in gpus if v == 'NVIDIA'])
     print('')
     print('  PyTorch build to install (only the Embed stage uses the GPU):')
     usable = [b for b in opts if b.usable]
@@ -897,6 +1147,14 @@ def main():
             return 1
         pick = usable[n - 1]
     print('  -> %s' % pick.label)
+    if flav != 'none':
+        # pip takes "torch" as already satisfied by the build that is there
+        # and installs nothing from the new index, so that one goes first
+        un = [sys.executable, '-m', 'pip', 'uninstall', '-y', 'torch']
+        if breaksys:
+            un.append('--break-system-packages')
+        if not show_and_run(un, args.yes, 'the %s torch build' % desc):
+            return 1
     if not show_and_run(pip_base(break_system=breaksys) + pick.args, args.yes,
                         'torch (%s)' % pick.key):
         return 1

@@ -3,7 +3,285 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.4.1 — 2026-09-20 (current)
+## v4.4.2 — 2026-09-23 (current)
+
+**A bug audit of v4.4.1, and every finding fixed.** Eight reviewers each
+took one area: the recycler, analyze scoring, tiers and keepers, the list
+and report, collect, embed, setup and the doctor, and the launchers.
+Every finding needed a concrete failure case, and most were reproduced
+on real files in a scratch folder. They found 3 critical, 8 high, 21
+medium and 31 low. **Several of these fixes change duplicate decisions,
+and none of those has been measured on a real library yet**; see the
+last paragraph.
+
+Could trash a file that should survive:
+
+- **A symlinked copy vouched for its own target.** Collect recorded a
+  file symlink and its target as two files with one SHA, so they
+  clustered as exact duplicates. When the link sorted first it became
+  the keeper, the real file got the `X`, and the recycler's hash check
+  read straight through the link and passed it as the survivor: the
+  "kept" copy was left dangling. A folder swapped for a junction to its
+  twin after the scan did the same, and needs no admin rights. Collect
+  now records each physical file once: a link whose target the walk
+  reaches anyway is skipped and listed, and so is a second hard link.
+  The recycler assembles its whole trash plan first and refuses any
+  witness that reaches a file in it, by device and inode and by
+  resolved path.
+- **Find-Duplicates.bat always analyzed the first scan.** It named
+  `image-inventory.jsonl`, and collect writes `image-inventory-2.jsonl`
+  on a re-run. So every re-run embedded and analyzed the old scan,
+  overwrote the edited list with it, and brought back files already
+  trashed. On a copied folder it was worse: the copied inventory still
+  named the original as its root, and the recycler written in the copy
+  trashed the marked files in the original. It now passes the folder,
+  so the newest complete inventory is used, and analyze opens the report
+  it actually wrote. Analyze warns when an inventory sits in a copy of
+  the folder it lists, and the recycler's preview names the image folder
+  it will act on.
+- **The list parser could move an `X` onto another file.** The pattern
+  that strips the trailing `[WxH, size]` block excluded only `]`, so a
+  search began at the first two-spaces-then-`[` inside a name:
+  `a.png  [v2.png` read as `a.png`, and the `X` meant for one file
+  trashed the other. Neither bracket may now appear inside the block.
+
+Wrong decisions, silently wrong output, or a broken install:
+
+- **Windows could destroy a file and report it recycled.** The long-path
+  guard counted characters, but the shell limit is 260 UTF-16 units and
+  an emoji is two. A 259-character path of 260 units passed the guard;
+  Windows deleted the file permanently and reported success. It now
+  measures UTF-16 units, and sets `FOF_WANTNUKEWARNING`, so Windows asks
+  before any other permanent delete (a bin turned off, a file bigger
+  than the bin) and a "no" comes back as a failure.
+- **Tier B bulk suggestions included files the keeper never matched.**
+  Since v4.3.6 Tier A has left LINKED members unmarked; Tier B did not.
+  "Mark all Tier B suggestions" and the recycler's `b` answer marked
+  them, and the keeper passed as their survivor. They were 43% of review
+  tiles on the reference library. Only direct matches are suggested now.
+- **A blank or solid-colour image was a perfect crop of anything.**
+  OpenCV's normalised match returns 1.0 everywhere for a constant
+  template, so blank pages, colour swatches and fully transparent PNGs
+  entered Tier B as crops, and one of them could chain unrelated images
+  into a cluster. A flat template (luma standard deviation under 1.0) is
+  skipped, and the luma matcher, which removes a brightness offset and
+  with it the whole of a swatch, returns no match for one.
+- **The 512 px confirm could hand the keeper role to the copy that
+  failed it.** When a keeper failed against all its drops, the cluster
+  was dissolved even where the drops still matched each other. Tier B
+  then elected the larger, failed file as keeper and flagged every
+  unedited copy. Tier A is now rebuilt without the failed pairs until
+  nothing more fails, so copies that still match keep a keeper of their
+  own.
+- **The keeper rule could not see animation, colour or palette.** A
+  trimmed 56-frame GIF at a slightly larger size was kept over the full
+  60-frame clip, and a 256-colour PNG made from a JPEG over the
+  full-colour original. Collect now records the colour mode, and the
+  keeper ranks most frames, then colour over greyscale, then area, then
+  full colour over palette, then lossless, then size, then `qsum`. Tier B
+  never suggests deleting an animation to keep a still, or a colour
+  picture to keep a greyscale copy. The rule is still reasoned rather
+  than measured, and its known blind spot remains: a large upscale
+  outranks its smaller original.
+- **A symlinked folder could hide the real folder from the scan.** The
+  v4.3.6 junction fix recorded a symlink's target as walked, but
+  `os.walk` never enters symlinks. With `albums/best -> ../photos/2020`
+  met first, `photos/2020` was then skipped as a second route and
+  scanned zero times. A symlinked folder no longer claims its target;
+  one pointing outside the tree is listed instead of silently missing.
+  This was a v4.3.6 regression, mostly on Linux and macOS.
+- **The doctor lost interpreters on non-ASCII paths.** `py -0p` writes
+  UTF-8, and the doctor decoded it in the ANSI code page. A "ü" dropped
+  that interpreter, and one byte undefined in cp1252 (from Ł, Á, or most
+  Cyrillic) failed the whole decode, so a user with such an account name
+  could be told no Python existed. Output is read as UTF-8 first, and
+  the probes are told to write it.
+- **Setup installed a CUDA build that older NVIDIA cards cannot run.**
+  PyTorch's CUDA 12.8 and newer builds start at Turing (compute 7.5), so
+  a GTX 9xx or 10xx, a Titan X, Xp or V, or a Quadro M or P failed at
+  the first kernel while the doctor reported GPU acceleration. Setup
+  recognises these cards, by `nvidia-smi` when the driver is in and by
+  model name before that, and installs from `cu126` or older. The doctor
+  and the embedder check the build's kernel list against the card and
+  say so.
+
+Medium, by area:
+
+- **Analyze decisions.** A LINKED Tier A member counted as the survivor,
+  so marking the keeper could trash every copy of a picture while a
+  different picture survived: each deletable row now carries the members
+  it matched directly or is byte-identical to, and the recycler and the
+  report page both require one of those as its witness. The crop matcher
+  stopped at the first scale clearing 0.90, which truncated scores the
+  0.95 dense/dark gate then refused; it now stops at 0.95, a dense or
+  dark score in [0.90, 0.95) falls through to the CLIP test instead of
+  being dropped, and the final Tier C pass gets the dense and dark flags
+  it was called without. Density was tied to `--clip-neighbors`, so in a
+  folder of 16 images or fewer an image was "dense" whenever every other
+  image was CLIP-similar to it, and a crop in a two-image folder was
+  lost to the stricter gate. It is now 16 neighbours at CLIP 0.90, which
+  gives the old answer on a default run over 17 or more images. The
+  generation-text veto compared text cut at 300 characters, so the seed
+  at the end of a long prompt was lost and re-rolls looked identical;
+  collect now stores a digest of each full value, and only `parameters`,
+  `prompt` and `workflow` can veto, not Software or Comment.
+- **Outputs and recycler.** Re-running analyze overwrote an edited list
+  without a word; a list whose marks differ from what the last run wrote
+  is now kept as `<name>-list.edited.txt`. The generated `.bat` broke on
+  inventory names holding `)`, `%` or non-ASCII (a `--share` copy of
+  "Fotos (2019)", a downloaded `image-inventory (1).jsonl`), and a
+  non-ASCII name crashed analyze with a 0-byte `.bat` and no report. The
+  wrappers now name no file at all: each runs the `.py` of its own name.
+- **Collect and embed data.** A file name that is not valid Unicode
+  (common from old Linux zip archives) crashed the scan, and a resumed
+  scan crashed at the same file; in the root folder it crashed analyze
+  after it had truncated the list. Such names are now written as escaped
+  JSON, shown in the report, and listed as uneditable lines. A torn last
+  line after a power loss or a full disk broke resume, and a cut inside
+  a multi-byte character crash-looped embed and analyze; readers now
+  decode line by line and skip it, and embed starts a new line before
+  appending. Embed's resume guards passed whenever a header field was
+  missing, so fp16 vectors went into pre-v4.2 fp32 files and a file with
+  no header accepted any model. Share and mirror copies kept stale
+  `.partN` files and mixed libraries that share a folder name; collect
+  now clears its own stale parts and numbers a second library's copy,
+  and analyze and embed read only the parts written by one run.
+- **Launchers.** A native crash ends with a negative exit code, which
+  `if errorlevel 1` does not catch, so Find-Duplicates analyzed half an
+  inventory and exited 0. A dropped folder named with `&`, `,`, `;`, `=`
+  or `^` and no space arrived split, because Explorer quotes only paths
+  with spaces: `D:\Photos&Videos` scanned `D:\Photos` and ran the rest as
+  a command. The launchers now keep cmd's raw command line and take the
+  real path from it, and end a dropped run with `exit`. The Microsoft
+  Store python stub made `_offer-setup.bat` report an installed Python
+  with packages missing. An exported `CDPATH` could send `imgdedup.sh`
+  or a generated `.sh` into another folder of the same name. A toolkit,
+  `.venv` or `IMGDEDUP_PYTHON` path holding `&`, `%` or `^` broke
+  interpreter selection, through the `set "X="%path%""` idiom and the
+  second expansion inside `call`. A relative folder argument resolved
+  against the toolkit folder.
+- **Setup and the doctor.** The v4.4.1 index check accepted a torch
+  wheel of any age, so Linux aarch64 on Python 3.10 and 3.11 still got
+  cu134's torch 2.0.1, which transformers 5 refuses; the index must now
+  offer torch 2.4 or newer for this Python and platform, and when none
+  does the backend is shown as unavailable rather than falling back to
+  an index that fails the same way. `--user` was forced on conda and
+  pyenv Pythons, putting packages where the system Python of the same
+  version reads them. An XPU build with no visible device was called
+  CPU-only, and a CUDA build on an AMD or Intel machine was called a
+  driver problem; builds are now classified by what they were built for,
+  and setup offers to replace a build that cannot use the GPU here,
+  uninstalling it first. The doctor printed commands that failed or did
+  harm when pasted: a torchvision fix that swapped a ROCm or XPU torch
+  for CUDA, uninstall advice PEP 668 refuses, a same-build reinstall for
+  Windows AMD users off Python 3.12, an unquoted `export`, a relative
+  `_setup.py`, pip lines for an interpreter with no pip, and
+  `./imgdedup.sh setup` for a uv-managed Windows Python. The apt and
+  pacman hints named packages for the distro's default `python3`, not
+  the `python3.X` setup was running under.
+
+Low, in brief:
+
+- Report and recycler: the page refused edits the recycler allowed in
+  reference-only clusters; the Download button's tooltip now says it
+  carries the page's marks, not edits made in a text editor; a list
+  re-saved as UTF-16 crashed the recycler, which now reads it and
+  refuses an ANSI one in words; the exit code, the failure count,
+  wrapped to 0 at 256 on POSIX and is capped at 255; droppable totals
+  counted LINKED members the list does not mark; the 512 px confirm
+  counted unreadable files as checked and against its cap, and on Linux
+  read a backslash in a name as a separator.
+- Collect: "Reuse it?" crashed with no input (Windows reports NUL as a
+  terminal); a PNG whose text chunk inflates past 1 MB, easily a ComfyUI
+  workflow, was recorded as unreadable; folders that could not be
+  listed dropped out silently; an aborted run's partial `-2` inventory
+  was picked as the newest; the v4.4.1 AVIF check assumed pillow-heif
+  decodes AVIF, which its 1.x does not, and printed a warning on every
+  run under Pillow older than 11.2.
+- Analyze scoring: the main sweep could miss a pair at exactly the cut
+  distance on a block boundary; the pixel score of a differently-sized
+  pair depended on which file sorted first, by up to 0.44, so swapping
+  two names could move a pair across the Tier A gate.
+- Embed: a failed `--device` got advice for the wrong backend;
+  `--gpu-preprocess` was silently ignored on CPU; transformers 5's
+  `SizeDict` was not read, so non-default models used a 224 px edge;
+  `--share` did nothing when nothing was new; an inventory not ending in
+  `.jsonl` was ignored; `--fp16` was refused on Apple Metal, and now
+  works there from torch 2.5.
+- Setup: the PEP 668 menu returned 0 after a failed venv step; its
+  distro route never mapped OpenCV to a package; Intel and AMD-on-Windows
+  compute drivers were always "not found"; Python 3.9 with an AMD GPU
+  fell back to an index with no wheel for it.
+- Launchers: a symlinked `imgdedup.sh` looked for the toolkit beside the
+  link; delayed expansion turned on in the registry ate `!` in paths;
+  Find-Duplicates' torch probe lacked the Pillow import Embed's has; a
+  failing `IMGDEDUP_PYTHON` was dropped without a word on Windows; stages
+  2 and 3 ran on a folder with no images, which collect now reports with
+  exit code 3; the `imgdedup.sh` failure report omitted the override and
+  the `.venv`; `imgdedup.sh` said "Setup finished" and exited 0 without
+  running the stage; `usage()` broke under zsh.
+
+Found afterwards by a review of the .bat files against a catalog of cmd
+pitfalls. Each was reproduced in real cmd runs before it was fixed:
+
+- **Double-clicking Collect, Analyze or Embed crashed them.** With no
+  argument, the line that makes a trailing backslash safe expanded to
+  text cmd could not parse. The `if defined TARGET` in front of it, on
+  the same line, could not prevent that: cmd expands and parses a whole
+  line before running any of it. The window closed on "The syntax of the
+  command is incorrect." before anything printed, and had since v4.2f,
+  although the README says Collect can be double-clicked. The test now
+  sits below its own guard line; Embed sets its default folder first.
+- **A lone double quote typed at "Run setup now? (Y/N)" killed the
+  launcher** the same way. Quotes are stripped from the answer before it
+  is compared.
+- **The no-Python report crashed on an `IMGDEDUP_PYTHON` set with quotes
+  around a path holding a parenthesis**, such as a Python under
+  `Program Files (x86)`. `_why-no-python.bat` did not strip the quotes as
+  the other helpers do, so the `)` closed its block early. The doctor
+  reaches that report whenever no interpreter works.
+- **Setup said "A Python is installed" for an `IMGDEDUP_PYTHON` naming a
+  file that does not exist**, and offered a setup command that could not
+  start. The override now has to run, as `py` and `python` already did.
+- **After a drop split at `&`, a failed run still ran the rest of the
+  name as a command.** Only the success paths ended with `exit`; the
+  "file missing" and "no Python" exits returned with `exit /b`, and cmd
+  then ran the tail. Every launcher now leaves through one `:quit` label
+  that ends a dropped run properly.
+
+A cmd harness covers the five: 25 checks, all passing on the fixed
+launchers. On the unfixed ones every one of the 16 fix checks fails and
+the 9 regression checks still pass.
+
+The self-test gained 13 checks: the hard-link witness, the bracket in a
+name, the per-file witness, parts from another run, lone surrogates,
+the edited list, UTF-16 and ANSI lists, LINKED Tier B members, the
+keeper ranking, size-order symmetry, the 512 px rebuild, flat images
+and the UTF-16 length count. Four of them run the generated recycler on
+real files in a temporary folder with the trash call stubbed. Each was
+mutation-checked: disabling its fix fails it. Launcher fixes were tested
+in real `cmd.exe` runs, including an unquoted drop through a space-free
+8.3 path, since Explorer quotes any path with a space and hides the bug.
+
+**Not yet measured.** CONTRIBUTING asks for a decision-level A/B on a
+real library for anything that changes decisions. That covers the flat
+image rule, the 512 px rebuild, the keeper rule, the crop matcher's
+early exit and lane, the density definition, the generation-text veto,
+the resize direction and the sweep's band margin. None has had one: no
+library inventory was available where these changes were made. What
+was checked is narrower. Across 14 synthetic fixtures, 6 lists changed,
+and with exactly those fixes reverted every one of them comes out
+identical to v4.4.1, so nothing else in this release moved a decision.
+Until the A/B runs, treat those changes as reasoned, not measured.
+
+Also untested on the platform they are for, since the work was done on
+Windows: the Linux and macOS paths (the `/dev/kfd` and Level Zero driver
+probes, `imgdedup.sh` through a symlink, under zsh and after setup,
+`rocm7.14` index selection), fp16 on Apple Metal, and the Windows
+permanent-delete warning dialog, which needs a drive whose Recycle Bin
+is turned off.
+
+## v4.4.1 — 2026-09-20
 
 **Setup could pick a PyTorch index with no wheels in it.** Nothing here
 changes a duplicate decision.

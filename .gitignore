@@ -11,6 +11,7 @@ image-inventory*.jsonl
 image-embeddings*.jsonl
 *-report.html
 *-list.txt
+*-list.edited*.txt
 Recycle-Duplicates*.py
 Recycle-Duplicates*.bat
 Recycle-Duplicates*.sh
