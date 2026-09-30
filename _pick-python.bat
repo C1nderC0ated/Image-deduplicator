@@ -50,6 +50,14 @@ set "PYTHON_CMD="
 set "PICK_ERR=1"
 
 if not defined IMGDEDUP_PYTHON goto :pp_launcher
+rem  A batch file cannot stand in for python.exe. Run without CALL it never
+rem  returns, so the launcher ended at this probe with nothing said; with
+rem  CALL every argument is parsed a second time, and a "%%" or a "^" in a
+rem  folder name is lost. pyenv-win's python.bat is the usual one.
+set "_PP_OV=%IMGDEDUP_PYTHON:"=%"
+if not defined _PP_OV goto :pp_override_bad
+if /i "%_PP_OV:~-4%"==".bat" goto :pp_override_shim
+if /i "%_PP_OV:~-4%"==".cmd" goto :pp_override_shim
 "%IMGDEDUP_PYTHON:"=%" -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 goto :pp_override_bad
 if not errorlevel 0 goto :pp_override_bad
@@ -62,6 +70,11 @@ goto :pp_done
 rem  Said, not skipped quietly: the override is a deliberate choice, and
 rem  passing it over in silence looked like it had been ignored.
 echo [WARN] IMGDEDUP_PYTHON cannot run this check - trying the others:
+echo        "%IMGDEDUP_PYTHON:"=%"
+goto :pp_launcher
+
+:pp_override_shim
+echo [WARN] IMGDEDUP_PYTHON names a batch file, not python.exe - trying the others:
 echo        "%IMGDEDUP_PYTHON:"=%"
 goto :pp_launcher
 
@@ -101,11 +114,27 @@ set PYTHON_CMD="%~dp0.venv\Scripts\python.exe"
 goto :pp_done
 
 :pp_path
+rem  The same for a "python" on PATH that is a batch file: where.exe lists
+rem  what cmd would run, first match first.
+set "_PP_EXT="
+set "_PP_SEEN="
+for /f "delims=" %%P in ('where python 2^>nul') do if not defined _PP_SEEN (
+    set "_PP_SEEN=1"
+    set "_PP_EXT=%%~xP"
+)
+if /i "%_PP_EXT%"==".bat" goto :pp_path_shim
+if /i "%_PP_EXT%"==".cmd" goto :pp_path_shim
 python -c "%_PP_PROBE%" >nul 2>&1
 if errorlevel 1 goto :pp_fail
 if not errorlevel 0 goto :pp_fail
 set "PYTHON_CMD=python"
 goto :pp_done
+
+:pp_path_shim
+echo [WARN] "python" on PATH is a batch file, not python.exe, and cannot be run
+echo        from here. Set IMGDEDUP_PYTHON to the real python.exe. With
+echo        pyenv-win, "pyenv which python" prints it.
+goto :pp_fail
 
 :pp_try_ver
 if defined PYTHON_CMD exit /b 0

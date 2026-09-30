@@ -88,6 +88,11 @@ def _win_send(path):
     shell32 = ctypes.WinDLL('shell32', use_last_error=True)
     shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
     shell32.SHFileOperationW.restype = ctypes.c_int
+    # FOF_WANTNUKEWARNING makes the shell ASK before a permanent delete,
+    # and a "yes" there comes back exactly like a recycle: rc 0, not
+    # aborted, file gone. The bin's own item count tells the two apart.
+    drive = os.path.splitdrive(full)[0]
+    before = _win_bin_items(drive)
     rc = shell32.SHFileOperationW(ctypes.byref(op))
     if rc != 0:
         # Non-zero codes are pre-Win32 values that only partly overlap
@@ -97,6 +102,9 @@ def _win_send(path):
         return False, 'the shell reported the operation was aborted'
     if os.path.exists(full):
         return False, 'the shell reported success but the file is still there'
+    after = _win_bin_items(drive)
+    if before is not None and after is not None and after <= before:
+        return True, 'deleted permanently (Windows asked, and you confirmed)'
     return True, 'Recycle Bin'
 
 
@@ -148,6 +156,25 @@ def _win_volume_has_bin(drive):
         ok = False                    # cannot prove a bin exists: refuse
     _BIN_CACHE[drive] = ok
     return ok
+
+
+def _win_bin_items(drive):
+    """How many items the drive's Recycle Bin holds, or None."""
+    try:
+        import ctypes
+
+        class SHQUERYRBINFO(ctypes.Structure):
+            _fields_ = [('cbSize', ctypes.c_ulong),
+                        ('i64Size', ctypes.c_longlong),
+                        ('i64NumItems', ctypes.c_longlong)]
+
+        q = SHQUERYRBINFO()
+        q.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+        if ctypes.WinDLL('shell32').SHQueryRecycleBinW(drive + '\\', ctypes.byref(q)) != 0:
+            return None
+        return int(q.i64NumItems)
+    except Exception:
+        return None
 
 
 def _win_precheck(path):

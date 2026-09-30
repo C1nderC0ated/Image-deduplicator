@@ -3,7 +3,344 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.4.2 — 2026-09-23 (current)
+## v4.4.3 — 2026-09-30 (current)
+
+**A second bug audit, and the first detection and speed pass scored
+against known answers.** Five areas were reviewed to the end (tiers and
+keepers, the recycler, collect, the list and report, scoring). The embed,
+setup, launcher and cross-stage reviews were stopped half way, and what
+they had run was re-checked by hand; the launchers were also checked
+against the current batch-file pitfall list. For detection, three
+corpora were built from 51 real pictures: a truth set of 25 known
+variants of each, a sparse one of 3 variants each, and 3,000 and 20,000
+crops whose windows are known, so every reported pair can be scored.
+None of them is a real library, so the release was then run beside
+v4.4.2 on one: 35,953 pictures - photos, art, screenshots, memes - on
+one inventory, with every pair that changed tier listed and the changed
+pairs looked at. Three rules were changed by what that showed and are
+described below; the corpora had said nothing about any of them. v4.4.2's
+own decision changes still have no A/B of their own, since both sides
+of this one carry them.
+
+| | v4.4.2 | v4.4.3 |
+|---|---:|---:|
+| Truth set, variants found with embeddings | 60.9% | 91.8% |
+| Truth set, variants found without | 72.9% | 78.5% |
+| Sparse truth set, with / without embeddings | 88.9% / 71.2% | 93.5% / 77.1% |
+| 3,000 crops: pre-marked `X` against a keeper showing another window | 41 of 323 | 2 of 284 |
+| 3,000 crops: planted rotations found / planted crops found | 52 of 76 / 26 of 75 | 76 of 76 / 37 of 75 |
+| 20,000 crops: pre-marked `X` against a keeper showing another window | 316 of 1,422 | 86 of 1,200 |
+| 20,000 crops: planted rotations found / planted crops found | 262 of 589 / 86 of 648 | 551 of 589 / 108 of 648 |
+| Analyze time, 3,000 crops / 20,000 crops | 43 s / 1,116 s | 43 s / 709 s |
+| Real library, 35,953 pictures: files pre-marked `X` | 3, all wrong | 0 |
+| Real library: files in the five review clusters chained by same-frame screenshots | 21, 18, 16, 16, 12 | 7, 8, 14, 0, 5 |
+| Real library: review files / weaker-evidence files, largest review cluster | 343 / 198, 22 | 208 / 350, 14 |
+| Real library: analyze time | 216 s | 200 s, 228 s on two runs |
+
+No run on the truth sets pre-marked a file of another picture, before or
+after. On the 20,000-crop corpus v4.4.2 pre-marked 3 files against a
+different picture altogether; none is now. On the 3,000-crop corpus the two pre-marks that still face
+another window are both crops of near-solid blue, alike to the eye. The three real-library pre-marks
+were a drawing whose copy has another facial expression, a street photo
+whose copy has the people erased, and a diagram with a small edit: each
+`X` would have recycled a picture that exists nowhere else. They are in
+review now, with nothing suggested.
+
+Could pre-mark, suggest or trash the wrong file:
+
+- **White artwork on a transparent background was a duplicate of any
+  other.** Alpha is composited onto white, so a white logo thumbnails as
+  a white square. Four different logos scored a difference of 0, became
+  one Tier A cluster, and three were pre-marked `X`. Two blank
+  thumbnails are now never pre-marked against each other unless the
+  files are byte-identical; they appear as weaker evidence.
+- **A resumed scan switched the v4.4.2 keeper fix off.** `--resume`
+  reused records written before `mode` and `txth` existed, so the keeper
+  rule read a greyscale PNG as colour, kept it, and marked the colour
+  original `X`. The record format now counts what a record holds, and an
+  inventory from before is rescanned. The run says so.
+- **Two pictures with almost nothing in them were duplicates.** The Tier
+  A gate is an absolute difference, and a dark panel with two divider
+  lines is within 4 grey levels of any other such panel. That is the
+  table's third and fourth lines. A pair is now pre-marked only when the
+  two brightness layouts also correlate (0.90 or better; true copies
+  measured 0.976 and up). The luma check and the rotated-copy check ask
+  the same. A pair that fails is weaker evidence, not review, so it no
+  longer chains different pictures into one cluster.
+- **A watermark or a pasted patch was a re-encode.** The gate is a mean
+  over the whole thumbnail, and a mean hides a small region: a copy with
+  a watermark box scored under 4 and was pre-marked, by file size, so
+  the edited copy could be the one kept. A pair inside the gate whose
+  worst 8×8 tile differs by 20 or more is now a local edit: reviewed,
+  never pre-marked, and never suggested, since nothing here can tell
+  the original from the edit. The tiles cover the whole thumbnail. A
+  grid that stopped at the last whole 16-pixel tile skipped the bottom
+  rows, which is where a watermark goes: with it, 15 of 51 watermarked
+  copies still reached Tier A, and 4 do now.
+- **A small edit was a re-encode.** The rule above asks for a tile at
+  20. The real library's three pre-marks were smaller than that: a
+  changed expression, erased people and an edited diagram put their
+  worst tile at 16 to 23 with the whole-picture mean at 0.25 to 1.7,
+  and two of them were under 20. What gives them away is the ratio: a
+  re-encode's noise is spread evenly, and over 407 re-encodes, resizes,
+  palette and upscale copies of the 51 pictures the worst tile never
+  exceeded 3.8 times the mean, where those three sat at 9 to 68 times.
+  A tile at 12 or more that is five times the mean is now an edit. No
+  planted copy on any corpus is caught by it.
+- **The keeper rule could not see transparency.** A flattened export was
+  kept and the transparent original pre-marked. Collect records
+  transparency, the keeper ranks it after colour, and Tier B never
+  suggests deleting a transparent picture to keep a flattened one.
+- **Two animations sharing a first frame became a bulk suggestion.** The
+  shorter clip was suggested against the longer one, and the recycler's
+  `b` answer trashed it. A suggestion now needs the same animation test
+  Tier A uses.
+- **A path with `..` in an inventory reached outside the scanned
+  folder.** Analyze listed `../outside/copy.jpg`, pre-marked it, and the
+  recycler trashed it. Collect never writes such a path; an edited or
+  damaged inventory could hold one. Analyze now ignores those records
+  with a warning, and the recycler refuses to delete through one.
+- **The 512 px confirm never ran on HEIC, or on originals over 179
+  megapixels.** Analyze did not register the HEIF decoder or raise
+  Pillow's pixel limit as Collect does, so those borderline pairs were
+  counted "could not be read" and kept their `X`. It now opens what
+  Collect opens. A pair whose files are present but will not open goes
+  to review; only a pair whose files are not on this machine is left as
+  it was.
+
+Missed duplicates:
+
+- **Embeddings cost rotated copies.** With embeddings covering every
+  image the pixel orientation sweep was skipped, on the reasoning that
+  CLIP sees a rotated picture as the same. It does not: of 51
+  quarter-turns 23 were missed with embeddings, nearly all because CLIP
+  scored the pair under its 0.90 neighbour floor, against 3 without.
+  Half-turns lost 14 and mirrors 7. The sweep now runs either way. It is
+  also one sweep instead of seven: a signature with each rotation
+  orbit's values sorted is the same in all eight orientations and bounds
+  every one of them, so one pass nominates and only its survivors are
+  scored. The candidate set is identical on all three corpora, in about
+  a fifth of the time.
+- **A rotated screenshot was not a rotated copy.** Two copies of a
+  picture thumbnail through the same JPEG block grid, so thumbnail noise
+  cancels. Rotate the picture and it no longer does: lossless half-turns
+  of screenshots scored 4.4 to 7.4 against the 4.0 gate and 10 of 51 were
+  missed. A rotated pair may now score up to 8 when its difference at a
+  quarter of the resolution, where noise has averaged out, is within 3.
+- **A black-and-white copy needed CLIP to be found.** Its colour
+  signature is far from the original's, so only an embedding could
+  nominate the pair, and CLIP reads a greyscale picture differently more
+  often than it seems: 25 of 51 missed with embeddings, 26 without, and
+  1 now either way. A sweep of greyscale pictures against colour ones,
+  on the brightness signature, nominates them on pixels.
+- **An edit that lifted the mean over the gate was dropped.** With the
+  density rule below out of the way, 29 of 51 pictures with a noise
+  patch over 9% of the frame were still never shown; 10 are now. A
+  pair is a local edit when at least three quarters of its detailed
+  16×16 tiles still agree and one differs by 24 or more. Blank tiles do
+  not count on either side, so two logos on white, or two pages of
+  text, do not pass. No pair of different pictures passed among 38,854
+  candidates on the 3,000-crop corpus.
+- **A picture with many copies counted as a crowd.** The density rule
+  demands stronger crop evidence in a pocket of 16 or more CLIP
+  neighbours, and it counted files. A picture's own copies filled the
+  pocket, so its crops needed 0.95 and were lost: on the truth set,
+  where every picture has 25 variants, a 97% crop was missed 40 times
+  in 51 with embeddings and 4 times without. Copies that pass the Tier
+  A test now count once, and that crop is missed twice. "Pass the Tier
+  A test", not "agree in pixels": the first version of this fix took
+  any pair within the gate as one picture, and on the real library
+  that merged the screenshots of one app - same frame, a little other
+  content, within the gate - into one "picture", so their pocket
+  stopped being dense and 147 review pairs of screenshots appeared.
+  The stricter count costs planted crops on the crop corpora, 3 of 75
+  on the 3,000 and 32 of 648 on the 20,000 (3 more go to the window
+  rule below), where every picture has 59 or 390 windows and is dense
+  by construction; the looser count had been merging near-solid
+  windows of one wallpaper into a "copy" and thinning those pockets by
+  accident.
+- **A file rescued from Tier A lost its matches.** When a Tier B
+  cluster's member was a Tier A drop, its keeper stood in without the
+  drop's matches: the rescued file could never be recycled, and the
+  refusal named marks that did not exist. The stand-in now carries them.
+  The Tier C size cap is applied after the stand-ins, so one picture
+  with many copies and one weaker match is no longer dropped as a
+  hairball.
+- **A Tier B keeper that was also a Tier A keeper lost its label.** The
+  list called one of the crops "suggested keeper", every other crop
+  became "linked via another file", and the suggestions vanished. The
+  reference line now carries the keeper label and the suggestions are
+  made against it.
+
+Review clusters that were not worth reviewing:
+
+- **Screenshots of one app chained into review clusters of twenty.**
+  Two screenshots share their frame - the toolbar, the row of
+  participants - and differ in the middle. Their mean difference is
+  within the gate and sits in one region, which is the shape of a
+  picture with a local edit, so the pair went to review, and the
+  reviews chained: 21 screenshots of a video-call app in one cluster,
+  18 of a browser, a 16-file cluster of dark photos, screenshots and
+  memes. On the real library 247 of the 281 within-gate pairs of that
+  shape were two screenshots of one app, and 21 of the 24 over the
+  gate. A pair of that shape is now review only outside a dense pocket
+  and at CLIP 0.90 or better; the rest is weaker evidence, and a
+  genuinely edited copy that CLIP scores under 0.90 goes there with
+  it. The four clusters are 14, 8, 0 and 5 files now; 330 review pairs
+  went, 172 moved to weaker evidence, and of the 22 pairs gained the 4
+  in review are drawings with a small change each (a nail colour, a
+  hair colour).
+- **A crop match on the frame alone was a crop.** The crop matcher
+  says the smaller picture correlates with a window of the larger; it
+  does not say where the agreement comes from. Two screenshots of one
+  app share their frame, and a frame of dark panels and identical
+  icons correlates at 0.99 whatever the pane in the middle shows; 22
+  photographs of one sunset from one window, and six of a notebook's
+  pages, share their edges under other skies and other text. After the
+  fix above those still made review clusters of 22, 14 and 7. At the
+  matched window the tiles that carry detail are now compared one by
+  one, and a pass where a quarter of them, four at least, do not
+  correlate is weaker evidence. On the real library that is 113
+  passes: 67% of the
+  same-app screenshot pairs the matcher had admitted and 29% of the
+  same-view photographs, against 6% of the planted crops the
+  3,000-crop corpus admits, which are shown as weaker evidence instead
+  (none is lost). The sunsets are an oversized weaker-evidence cluster
+  now, omitted; review holds 208 files in 70 clusters, the largest 14,
+  where v4.4.2 held 343 in 88 with 22. Costs 3 s on the real library,
+  4 s on the 3,000-crop corpus and 30 s on the 20,000-crop one, where
+  nearly every image is a pass to check; the last also loses 3 of its
+  648 planted crops to oversized weaker-evidence clusters. A pass the
+  128 px retry admitted is not judged, since the window it would be
+  judged on is the 64 px one the retry exists to repair. Three other
+  measures at the window were refused; CONTRIBUTING has their
+  numbers. What review still collects: screenshots of one app
+  whose difference is small and sits in one region, which no pixel
+  measure tells from a drawing with a retouched detail.
+
+Wrong or misleading output:
+
+- **"No duplicates found - this folder is already clean"** was printed
+  for an interrupted scan and for a folder of unreadable files. The
+  verdict now names what was not compared.
+- The console counted files as droppable whose list line cannot be
+  edited. "Pixel-identical but CLIP-vetoed" was printed for an animation
+  beside its still on runs with no embeddings; the two causes have a
+  line each. The report's `X`, `J` and `K` keys did nothing on a
+  Russian, Greek, Hebrew or Arabic layout. Report tiles showed 44
+  characters of a path with no tooltip. The no-duplicates report opened
+  with instructions for a list that was not written.
+- **The recycler said "contents changed" about a file it could not
+  read**, and ended a re-run after a successful pass with "Nothing
+  survived verification". It now says unreadable, and already gone. A
+  permanent delete confirmed at Windows' own prompt is reported as one.
+  The generated `.py` wrote an emoji in the folder path as two escapes,
+  which broke it on Linux and macOS.
+- **A list edit could be overwritten.** A re-run did not see an edit
+  that deleted a line, or one on a name holding U+2028, U+2029 or
+  U+0085, and replaced the edited list.
+- **Parts were read out of order.** `part10` sorted before `part2`, so
+  an inventory of ten parts or more gave differently numbered clusters
+  than the same scan unsplit. A file named `holiday.partial.jsonl` was
+  read as part of `holiday.jsonl`.
+
+Launchers:
+
+- **A batch-file Python ended the launcher without a word.** With
+  `IMGDEDUP_PYTHON` naming a `.bat` or `.cmd`, or with a `python.bat`
+  shim such as pyenv-win's the only `python` on PATH, the first probe
+  handed control to that batch file and never got it back: no output,
+  no pause, and the generated recycler closed the same way. `call` is
+  not the fix, since it parses every argument a second time and loses a
+  `%` or `^` in a folder name. A batch file is now refused by name, in
+  the launchers and the generated one, with the way to find the real
+  `python.exe`.
+- A generated `.bat` with a stale `IMGDEDUP_PYTHON` printed only "The
+  system cannot find the path specified"; it now says so and tries the
+  others.
+
+Collect:
+
+- A junction met before its target claimed it: the real folder was
+  reported as a second route to itself and its files recorded under the
+  junction's name. macOS `._name` companion files were scanned and
+  reported corrupt. Synology and QNAP trash and thumbnail folders
+  (`#recycle`, `@Recycle`, `@eaDir`, `#snapshot`) were scanned, so
+  deleted files came back as duplicates. An `--out` folder that cannot
+  be written to ended in a traceback after the whole walk.
+- `--resume --lossless-thumbs` reused every lossy thumbnail without a
+  word. The setting is part of the record format now.
+- A file that failed to decode was read whole to see whether it was
+  truncated: 404 MB and 5.5 s for a 400 MB file. Large files are checked
+  by seeking.
+
+Embed:
+
+- **Out of GPU memory, the retry failed too.** The one-by-one retry ran
+  inside the exception handler, where the failed batch's tensors were
+  still referenced, so every image of the batch was written down as an
+  error and the run stopped as "systemic". The retry now runs outside
+  the handler, in halves, and the batch size is halved for the rest of
+  the run.
+- **A re-scan re-embedded everything.** The new inventory's embeddings
+  file now starts with the vectors an earlier one already holds for the
+  same content, model, preprocessing and precision.
+- A file edited in place after the scan was embedded as it is now and
+  stored under the hash of what it was. A changed size is now an error
+  for that file. The shared-folder copy used the bare folder name, so a
+  second library called "Photos" overwrote the first one's vectors.
+  HEIC files with no decoder in the embedding Python ended as "cannot
+  identify image file"; the run now says why, up front. A torch too old
+  for the installed transformers ended in "PyTorch was not found"; the
+  run, setup and the doctor now say what it is.
+
+Setup and the doctor:
+
+- A torch that is installed but will not import was "already satisfied"
+  to pip: setup printed OK, then "Now installed: torch not installed",
+  and exited 0. It is now removed first, and a torch that still does
+  not load is a failure.
+- Setup said "Everything the toolkit needs is present" over torch 2.3,
+  which transformers 5 refuses.
+- The doctor called a working `IMGDEDUP_PYTHON` dead when the value was
+  set with quotes. A toolkit folder with two `İ` in its path read the
+  command line one character off for each, and a dropped
+  `Photos&Videos` was scanned as `Photos`.
+
+Speed:
+
+- **The pixel pass and the orientation check run in worker processes**
+  once there are enough pairs, sharing one pool with the crop matcher.
+  On threads they were one interpreter taking turns: 8 threads ran the
+  pixel score 1.5 times as fast as one, and the score plus luma exactly
+  as fast. The outputs are byte-identical to the thread path.
+- The luma check is scored in the pixel pass, where the pair is already
+  at one shape. It was a phase of its own that resized every pair again,
+  and on the 20,000-crop corpus it was half the run. Byte-identical
+  outputs on all corpora.
+- The thumbnail resize reads the array in place instead of copying it.
+- The signature sweep is bounded. A library of thousands of
+  near-identical pages makes every pair a candidate, at about 290 bytes
+  each; past 6 million pairs each image keeps its nearest partners, and
+  the run says so.
+
+The 3,000-crop corpus gains little: half its run is the crop matcher,
+which was in worker processes already. On the 20,000-crop one half the
+run was the luma phase.
+
+Measured and refused: OpenCV for PNG decoding in Collect (5% faster
+alone, 22% slower once the pixels are handed back to Pillow); a test
+for upscaled copies in the keeper rule (it caught 51 of 51 upscales and
+13 to 20 of 51 genuinely larger originals, so the blind spot stays
+documented); the signature sweep's candidates as the density rule's
+"same picture" (they chain, and a pocket of same-app screenshots would
+stop being dense); three of the four measures at the crop matcher's
+window meant to tell the same view on another day from a crop (the
+tile-by-tile one is in; the residual after a brightness fit, a stricter
+full-frame gate and the window's size each caught less at a higher
+cost in genuine crops).
+
+## v4.4.2 — 2026-09-23
 
 **A bug audit of v4.4.1, and every finding fixed.** Eight reviewers each
 took one area: the recycler, analyze scoring, tiers and keepers, the list

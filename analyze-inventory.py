@@ -36,13 +36,19 @@ Options:
 TIERS
   A  duplicate      - same picture, re-encoded or resized. Pre-set to X.
   B  crop / variant - structurally the same, genuinely different pixels
-                      (crops, rotations, recolours, re-rolls). Pre-set to
-                      "." always - nothing here is deleted unreviewed.
+                      (crops, rotations, recolours, local edits, re-rolls).
+                      Pre-set to "." always - nothing here is deleted
+                      unreviewed.
                       CLIP-only admission now also needs a low pixel
                       distance; dense screenshot pockets and disagreeing
                       generation text refuse it.
-  C  weaker evidence - NCC in a dense/dark pocket, or CLIP-strong with no
-                      crop confirm. All ".", no suggested keeper. You may
+  C  weaker evidence - NCC in a dense/dark pocket, CLIP-strong with no
+                      crop confirm, a crop match whose detailed tiles
+                      disagree (one app's frame around other content),
+                      one frame with other content inside the Tier A
+                      gate, or pixels that agree only because both
+                      pictures are blank or too plain to line up. All ".",
+                      no suggested keeper. You may
                       still mark X; a file goes only while a copy it was
                       matched with stays unmarked.
 
@@ -57,6 +63,7 @@ file something else depends on. Tier B is built from pairs, and pairs chain
 once before; that is why it is asserted here.
 """
 import argparse
+import atexit
 import base64
 import collections
 import glob
@@ -65,6 +72,7 @@ import json
 import os
 import sys
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 # Exotic characters in filenames must not crash a redirected console.
@@ -112,6 +120,22 @@ try:
     _png.MAX_TEXT_CHUNK = max(_png.MAX_TEXT_CHUNK, 16 * 1024 * 1024)
 except Exception:
     pass
+# The same two settings the collector and the embedder run with. Without
+# them the confirm could not open a single .heic (the iPhone default) nor
+# any original between Pillow's stock 179 Mpx limit and the collector's
+# 300: every such borderline pair was counted "could not be read" and kept
+# its X, so the promised re-check never ran on exactly those libraries.
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    try:
+        pillow_heif.register_avif_opener()  # pillow-heif before 1.0 only
+    except Exception:
+        pass
+except Exception:
+    pass
+Image.MAX_IMAGE_PIXELS = 300_000_000
+warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 
 _HAVE_CV2 = False
 # OpenCV is optional (it powers the crop tier), but when present it also
@@ -200,10 +224,30 @@ def inventory_parts(path):
     if not b.lower().endswith('.jsonl'):
         return [path]
     b = b[:-len('.jsonl')]
-    if '.part' in b:                     # basename only: a folder named
-        b = b.split('.part')[0]          # 'archive.part' must not truncate
+
+    def part_no(tail):
+        """N for a '.partN' tail, else None."""
+        t = tail.lower()
+        return int(t[5:]) if t.startswith('.part') and t[5:].isdigit() else None
+
+    # A part was named: its run is the name without the '.partN'. Only a
+    # real part suffix counts - splitting at the first '.part' made
+    # 'holiday.partial.jsonl' the inventory 'holiday', and read a
+    # 'holiday.jsonl' beside it as the same scan.
+    dot = b.lower().rfind('.part')
+    if dot > 0 and part_no(b[dot:]) is not None:
+        b = b[:dot]
     stem = os.path.join(glob.escape(d), glob.escape(b)) if d else glob.escape(b)
-    return sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
+    # In the order they were WRITTEN. Sorted as text, part10 came before
+    # part2, so an inventory split ten ways or more was read out of scan
+    # order and the same folder gave differently numbered clusters split
+    # and unsplit.
+    parts = []
+    for p in set(glob.glob(stem + '.part*.jsonl')):
+        n = part_no(os.path.basename(p)[len(b):-len('.jsonl')])
+        if n is not None:
+            parts.append((n, p))
+    return sorted(glob.glob(stem + '.jsonl')) + [p for _n, p in sorted(parts)]
 
 
 def same_run(paths, lines_of):
@@ -289,8 +333,24 @@ def pick_inventory(cands):
     return newest[0]
 
 
+def escapes_root(rel):
+    """True for a stored path that does not name a file BELOW the scanned
+    folder: empty, absolute, or climbing out through '..'. The collector
+    never writes one. An inventory that holds one was edited or damaged,
+    and the list and the recycler would have followed it: a record naming
+    '../outside/copy.jpg' was listed, pre-marked X and trashed, outside the
+    folder the whole run was supposed to be about."""
+    if not isinstance(rel, str) or not rel:
+        return True
+    norm = rel.replace('\\', '/') if os.name == 'nt' else rel
+    if norm.startswith('/') or os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
+        return True
+    return any(part == '..' for part in norm.split('/'))
+
+
 def load_inventory(path):
     root, recs, errs = None, [], []
+    outside = 0
     kept, _dropped = same_run(inventory_parts(path), _json_rows)
     for _p, rows in kept:
         for r in rows:
@@ -299,10 +359,19 @@ def load_inventory(path):
             # control lines carry 'kind'; older files are detected by shape
             if r.get('kind') or r.get('schema') or r.get('done'):
                 continue
+            if 'p' in r and escapes_root(r['p']):
+                outside += 1
+                continue
             if 'p' in r and 'sha' in r and 'tb' in r:
                 recs.append(r)
             elif 'p' in r and 'err' in r:
                 errs.append(r)
+    if outside:
+        print('[WARN] %d record%s ignored: the path is not inside the scanned '
+              'folder' % (outside, '' if outside == 1 else 's'))
+        print("       (absolute, or climbing out through '..'). Collect never "
+              'writes one;')
+        print('       this inventory was edited or damaged.')
     return root, recs, errs, [p for p, _rows in kept]
 
 
@@ -313,11 +382,11 @@ def load_embeddings(inv_path, recs):
     # when no name matches - several inventories can share one folder. The
     # explicit `want` glob also finds custom-named outputs like
     # myscan-embeddings.jsonl that the generic pattern cannot see.
-    base = os.path.basename(inv_path)
+    # the inventory's own name, whichever of its parts was given
+    base = os.path.basename(inventory_parts(inv_path)[0] if
+                            inventory_parts(inv_path) else inv_path)
     if base.endswith('.jsonl'):
         base = base[:-len('.jsonl')]
-    if '.part' in base:
-        base = base.split('.part')[0]
     want = base.replace('image-inventory', 'image-embeddings')
     if want == base:
         want = base + '-embeddings'
@@ -491,9 +560,19 @@ def _mean_abs_diff(M, ia, ib):
     return a.mean(1)
 
 
-def sweep_candidates(C, cut):
+# The most signature-sweep pairs a run will score. Far above any library of
+# distinct pictures (36,000 real images: 0.4 million pairs; 20,000 small
+# crops of 51 wallpapers: 1.3 million) - it only binds on thousands of
+# near-identical images, where every pair is a candidate.
+SWEEP_MAX_PAIRS = 6000000
+
+
+def sweep_candidates(C, cut, max_pairs=None):
     """All-pairs prefilter on the 8x8 signatures, exactly equivalent to
-    brute-force  mean|a-b| <= cut  over every pair, but fast:
+    brute-force  mean|a-b| <= cut  over every pair, but fast. With
+    MAX_PAIRS it returns (pairs, capped): the same pairs and None while
+    they number MAX_PAIRS or fewer; otherwise each image's nearest
+    partners and (pairs found, partners kept per image, pairs kept).
 
     Since every |d| <= 255,  mean|d| <= cut  implies
         sum(d^2) <= max|d| * sum|d| <= 255 * (192*cut).
@@ -523,7 +602,50 @@ def sweep_candidates(C, cut):
     sq = (Cs * Cs).sum(1)
     # widen by a hair so float32 rounding can never drop a true candidate
     lim = 255.0 * cut * w * 1.0001 + 1000.0
-    cand = []
+    if max_pairs is None:
+        cand = []
+        for lo, hh, _d in _sweep_blocks(Cs, ms, sq, order, cut, lim):
+            cand.extend(zip(lo.tolist(), hh.tolist()))
+        return cand
+    # Bounded: the same pairs while they fit, and each image's nearest
+    # partners when they do not. Held as arrays (12 bytes a pair) until it
+    # is known which, because the tuples, the set, the sorted list and the
+    # score tables downstream come to about 290 bytes a pair: a library of
+    # 8,000 near-identical scanned pages is 32 million pairs, 9 GB before a
+    # single one is scored.
+    los, his, ds, total = [], [], [], 0
+    for lo, hh, d in _sweep_blocks(Cs, ms, sq, order, cut, lim):
+        los.append(lo.astype(np.int32))
+        his.append(hh.astype(np.int32))
+        ds.append(d.astype(np.float32))
+        total += len(lo)
+    if not total:
+        return [], None
+    lo, hi = np.concatenate(los), np.concatenate(his)
+    del los, his
+    if total <= max_pairs:
+        return list(zip(lo.tolist(), hi.tolist())), None
+    d = np.concatenate(ds)
+    del ds
+    keep_n = max(16, max_pairs // max(1, n))
+    # every pair twice, once under each of its images; ordered by image
+    # then distance, the first KEEP_N entries of an image are its nearest
+    node = np.concatenate([lo, hi])
+    by = np.lexsort((np.concatenate([d, d]), node))
+    node = node[by]
+    first = np.flatnonzero(np.r_[True, node[1:] != node[:-1]])
+    rank = np.arange(len(node)) - np.repeat(first, np.diff(np.r_[first, len(node)]))
+    keep = np.zeros(total, dtype=bool)
+    keep[by[rank < keep_n] % total] = True
+    del node, by, rank, first, d
+    return (list(zip(lo[keep].tolist(), hi[keep].tolist())),
+            (total, keep_n, int(keep.sum())))
+
+
+def _sweep_blocks(Cs, ms, sq, order, cut, lim):
+    """The banded sweep itself: yields (lo, hi, distance) arrays, a chunk
+    at a time, in the order sweep_candidates has always listed its pairs."""
+    n = len(Cs)
     block = max(64, min(2048, int(8_000_000 // max(1, n))))
     for a in range(0, n, block):
         b = min(n, a + block)
@@ -549,10 +671,7 @@ def sweep_candidates(C, cut):
             sel = d <= cut
             oi = order[gs[sel]]
             oj = order[js[sel]]
-            lo = np.minimum(oi, oj)
-            hh = np.maximum(oi, oj)
-            cand.extend(zip(lo.tolist(), hh.tolist()))
-    return cand
+            yield np.minimum(oi, oj), np.maximum(oi, oj), d[sel]
 
 
 def sweep_candidates_cross(C, Ck, cut, rows=None):
@@ -634,6 +753,177 @@ def oriented_signatures(C, k):
         fn(G.transpose(1, 2, 0, 3)).transpose(2, 0, 1, 3)).reshape(n, 192)
 
 
+# A thumbnail is greyscale when its channels differ by no more than this on
+# average (8x8 signature, grey levels). A black-and-white JPEG decodes to
+# exactly equal channels; 2 leaves room for a faint scanner cast.
+ACHROMA = 2.0
+GREY_SIG_CORR = 0.90
+
+
+def sweep_grey_copies(C, cut):
+    """Pairs (grey image, colour image) whose 8x8 LUMA signatures agree
+    within CUT once each one's mean brightness is removed - the pairs the
+    luma check exists for, found on pixels.
+
+    A black-and-white copy of a colour photo is far from it in colour (mad
+    ~30), so the signature sweep never nominates the pair, and it reached
+    the luma check only when CLIP vouched for it: without embeddings 26 of
+    51 such copies were missed, with them 9 (CLIP reads a greyscale picture
+    differently more often than it seems). Only grey-against-colour pairs
+    are returned: two colour pictures, or two grey ones, are compared in
+    colour by the main sweep, at its own gate.
+
+    Exact over the rows it looks at: a BLAS squared-distance pass that
+    cannot lose a pair, then the same float32 mean the luma check's own
+    coarse screen uses."""
+    n = len(C)
+    G = np.ascontiguousarray(C, dtype=np.float32).reshape(n, 64, 3)
+    grey = (G.max(2) - G.min(2)).mean(1) <= ACHROMA
+    rows = np.nonzero(grey)[0]
+    if not len(rows) or len(rows) == n:
+        return []
+    L = G @ _LUMA_W
+    L = np.ascontiguousarray(L - L.mean(1, keepdims=True))
+    colour = np.nonzero(~grey)[0]
+    A = np.ascontiguousarray(L[rows])
+    B = np.ascontiguousarray(L[colour])
+    sa, sb = (A * A).sum(1), (B * B).sum(1)
+    # sum(d^2) <= max|d| * sum|d|, and no single |d| can exceed the whole
+    # sum 64*cut (nor 510, the span of two centred values)
+    lim = min(510.0, 64.0 * cut) * (64.0 * cut) * 1.0001 + 1000.0
+    out = []
+    block = max(16, min(2048, int(8_000_000 // max(1, len(colour)))))
+    for a in range(0, len(rows), block):
+        b = min(len(rows), a + block)
+        D2 = sa[a:b, None] + sb[None, :] - 2.0 * (A[a:b] @ B.T)
+        ii, jj = np.nonzero(D2 <= lim)
+        for s0 in range(0, len(ii), _EXACT_CHUNK):
+            i1, j1 = ii[s0:s0 + _EXACT_CHUNK] + a, jj[s0:s0 + _EXACT_CHUNK]
+            t = A[i1]
+            np.subtract(t, B[j1], out=t)
+            np.abs(t, out=t)
+            sel = t.mean(1) <= cut
+            # ...and the layouts correlated, as the luma check will demand
+            # of the thumbnails (GREY_CORR; the coarser signature is held
+            # to a little less). Without it every dark, low-contrast
+            # picture was within the cut of every other: 671,317 pairs on
+            # a 20,000-image corpus that holds no black-and-white copy.
+            dot = (A[i1] * B[j1]).sum(1)
+            sel &= dot >= GREY_SIG_CORR * np.sqrt(sa[i1] * sb[j1])
+            sel &= (sa[i1] > 0) & (sb[j1] > 0)
+            gi, gj = rows[i1[sel]], colour[j1[sel]]
+            out.extend(zip(np.minimum(gi, gj).tolist(),
+                           np.maximum(gi, gj).tolist()))
+    return out
+
+
+def _d4_orbits():
+    """The 8x8 grid's cells grouped by where the eight orientations can send
+    them: ten groups of four or eight cells, as flat cell indices."""
+    seen, orbits = set(), []
+    for r in range(8):
+        for c in range(8):
+            if (r, c) in seen:
+                continue
+            orb = sorted({(r, c), (c, 7 - r), (7 - r, 7 - c), (7 - c, r),
+                          (r, 7 - c), (7 - c, 7 - r), (7 - r, c), (c, r)})
+            seen.update(orb)
+            orbits.append([rr * 8 + cc for rr, cc in orb])
+    return orbits
+
+
+_D4_ORBITS = _d4_orbits()
+
+
+def orbit_sorted_signatures(C):
+    """Each signature with every orbit's values sorted, per channel.
+
+    A rotation or mirror only moves cells WITHIN their orbit, so this is
+    the same vector for a picture in all eight orientations. And sorted
+    against sorted is the closest two sets of numbers can be paired, so
+        mean|S[a] - S[b]|  <=  mean|C[a] - C[b] re-oriented|
+    for every orientation: a pair can only be a rotated match if it is
+    already within the cut here."""
+    n = len(C)
+    G = np.ascontiguousarray(C, dtype=np.float32).reshape(n, 64, 3)
+    S = np.empty_like(G)
+    for idx in _D4_ORBITS:
+        S[:, idx, :] = np.sort(G[:, idx, :], axis=1)
+    return S.reshape(n, 192)
+
+
+def sweep_candidates_oriented(C, cut, skip=None):
+    """Every pair one of the seven re-oriented cross sweeps would return -
+    the same set, from ONE sweep instead of seven.
+
+    The seven sweeps were seven banded n x n grams (81 s of a 3-minute
+    analyze on the reference library), which is why a run with embeddings
+    skipped them and trusted CLIP to nominate rotated copies. CLIP does not:
+    measured on 51 pictures, 24 quarter-turns, 14 half-turns and 7 mirrors
+    were missed with embeddings - 22, 13 and 7 of them under the 0.90
+    neighbour floor, so never looked at - while the run without embeddings
+    found all but 3 of the quarter-turns.
+
+    orbit_sorted_signatures gives a bound that holds for all orientations
+    at once, so one ordinary sweep over it finds every pair that COULD
+    match, and only those are scored against the seven orientations - with
+    the same float32 arithmetic, in the same element order, as the cross
+    sweep, in both directions, so the set is identical (--self-test checks
+    it against the seven sweeps). SKIP holds pairs the caller already has.
+    """
+    n = len(C)
+    C = np.ascontiguousarray(C, dtype=np.float32)
+    S = orbit_sorted_signatures(C)
+    # a hair wider than the cut: S is summed in another order than C, and
+    # the exact test below is the one that decides
+    wide = cut * 1.0001 + 0.001
+    means = S.mean(1)
+    order = np.argsort(means, kind='stable')
+    Ss = np.ascontiguousarray(S[order])
+    los, his = [], []
+    for lo, hh, _d in _sweep_blocks(Ss, means[order], (Ss * Ss).sum(1), order,
+                                    wide, 255.0 * wide * 192 * 1.0001 + 1000.0):
+        if skip:
+            keep = np.fromiter(((a, b) not in skip for a, b in
+                                zip(lo.tolist(), hh.tolist())),
+                               dtype=bool, count=len(lo))
+            lo, hh = lo[keep], hh[keep]
+        if len(lo):
+            los.append(lo)
+            his.append(hh)
+    if not los:
+        return []
+    lo = np.concatenate(los)
+    hi = np.concatenate(his)
+    ok = np.zeros(len(lo), dtype=bool)
+    for k in range(1, 8):
+        rem = np.nonzero(~ok)[0]
+        if not len(rem):
+            break
+        Ck = oriented_signatures(C, k)
+        for s0 in range(0, len(rem), _EXACT_CHUNK):
+            ix = rem[s0:s0 + _EXACT_CHUNK]
+            a, b = lo[ix], hi[ix]
+            t = C[a]
+            np.subtract(t, Ck[b], out=t)
+            np.abs(t, out=t)
+            hit = t.mean(1) <= cut
+            t = C[b]
+            np.subtract(t, Ck[a], out=t)
+            np.abs(t, out=t)
+            ok[ix] = hit | (t.mean(1) <= cut)
+    return list(zip(lo[ok].tolist(), hi[ok].tolist()))
+
+
+def _pil_view(A, mode):
+    """A PIL image over an array's own bytes, no copy. Image.fromarray
+    raw-decodes a copy first (5 s of a 72 s serial analyze on 1,300
+    images, 25k calls) and the resize reads the same pixels either way,
+    so the result is byte-identical. The array must outlive the image."""
+    A = np.ascontiguousarray(A)
+    return Image.frombuffer(mode, (A.shape[1], A.shape[0]), A, 'raw', mode, 0, 1)
+
+
 def same_shape(A, B):
     """The pair at one shape: the LARGER thumbnail brought down to the
     smaller, whichever of the two came first. "Resize the second to the
@@ -645,10 +935,10 @@ def same_shape(A, B):
     if A.shape == B.shape:
         return A, B
     if (A.shape[0] * A.shape[1], A.shape) > (B.shape[0] * B.shape[1], B.shape):
-        A = np.asarray(Image.fromarray(A).resize(
+        A = np.asarray(_pil_view(A, 'RGB').resize(
             (B.shape[1], B.shape[0]), Image.LANCZOS), dtype=np.uint8)
     else:
-        B = np.asarray(Image.fromarray(B).resize(
+        B = np.asarray(_pil_view(B, 'RGB').resize(
             (A.shape[1], A.shape[0]), Image.LANCZOS), dtype=np.uint8)
     return A, B
 
@@ -661,21 +951,202 @@ def mad_pair(TH, i, j):
     return absdiff_mean(A, B)
 
 
-def compute_mads(TH, cand, workers):
-    """mad_pair for every candidate pair, chunked across threads."""
+def _tile_corners(h, w, block):
+    """Top-left corners of BLOCKxBLOCK tiles that cover an h x w image: a
+    regular grid, plus a last row and column aligned to the far edge when
+    the size is not a multiple. A grid cut off at the last whole tile left
+    the bottom 8 rows of a 128x72 thumbnail unlooked at - which is where a
+    watermark goes."""
+    ys = list(range(0, h - block + 1, block))
+    xs = list(range(0, w - block + 1, block))
+    if h % block:
+        ys.append(h - block)
+    if w % block:
+        xs.append(w - block)
+    return np.array(ys), np.array(xs)
+
+
+def _tile_sums(X, ys, xs, block):
+    """Sum of 2-D X over the BLOCKxBLOCK tile at each (y, x) corner."""
+    h, w = X.shape
+    table = np.zeros((h + 1, w + 1), dtype=X.dtype)
+    table[1:, 1:] = X.cumsum(0).cumsum(1)
+    return (table[np.ix_(ys + block, xs + block)] - table[np.ix_(ys, xs + block)]
+            - table[np.ix_(ys + block, xs)] + table[np.ix_(ys, xs)])
+
+
+def tile_mads(A, B, block=16):
+    """mean|A - B| over BLOCKxBLOCK tiles covering a pair at one shape, as
+    a 2-D array - or None when the thumbnails are too small for one tile.
+    Summed as integers, so the numbers do not depend on OpenCV being there."""
+    h, w = A.shape[:2]
+    if h < block or w < block:
+        return None
+    if _cv2 is not None:
+        d = _cv2.absdiff(np.ascontiguousarray(A), np.ascontiguousarray(B))
+    else:
+        d = np.abs(A.astype(np.int16) - B.astype(np.int16))
+    d = d.sum(axis=2, dtype=np.int32)
+    # The regular grid by reshaping - this runs for most candidate pairs,
+    # and a summed-area table for every one of them cost a third of the
+    # pixel pass - then the far-edge row and column (see _tile_corners, in
+    # whose order the tiles are laid out).
+    ny, nx = h // block, w // block
+    ey, ex = int(h % block > 0), int(w % block > 0)
+    out = np.empty((ny + ey, nx + ex), dtype=np.int64)
+    out[:ny, :nx] = d[:ny * block, :nx * block].reshape(
+        ny, block, nx, block).sum(axis=(1, 3))
+    if ex:
+        out[:ny, nx] = d[:ny * block, w - block:].reshape(
+            ny, block, block).sum(axis=(1, 2))
+    if ey:
+        out[ny, :nx] = d[h - block:, :nx * block].reshape(
+            block, nx, block).sum(axis=(0, 2))
+    if ex and ey:
+        out[ny, nx] = d[h - block:, w - block:].sum()
+    return out / float(block * block * 3)
+
+
+def local_edit_max(TH, i, j, block=16):
+    """The worst mean difference over BLOCKxBLOCK tiles of the pair at one
+    shape, in grey levels. Thumbnails too small for one full tile return
+    the plain mean."""
+    A, B = same_shape(TH[i], TH[j])
+    t = tile_mads(A, B, block)
+    return absdiff_mean(A, B) if t is None else float(t.max())
+
+
+def local_edit(A, B, mad, gate, block=16):
+    """Is this pair (at one shape, mean difference MAD) one picture with a
+    LOCAL change - a pasted patch, a watermark, a redaction, a caption?
+
+    Under the gate the mean already says "same picture", and one 8x8 tile
+    over LOCAL_EDIT_FINE, or one at LOCAL_EDIT_SPOT that holds many times
+    the mean, says an edit is hiding in it (see LOCAL_EDIT_MAD).
+
+    Over the gate the edit itself lifted the mean, and the pair used to be
+    dropped: 29 of 51 pictures with a noise patch over 9% of the frame, and
+    6 of 51 with a watermark box, were never shown. It is the same picture
+    when the tiles that carry any detail still agree, LOCAL_EDIT_SAME of
+    them or more, each within the gate. Blank tiles are not counted on
+    either side: two different logos on white, or two pages of text, agree
+    everywhere there is nothing to see. Measured: no pair of different
+    pictures passed among 38,854 candidates between the gate and 24 on a
+    3,000-image corpus of overlapping crops, nor among same-template chat
+    screenshots, invoices and text pages; every pair that passed on the
+    51-picture set was a picture and its own edit."""
+    if mad <= gate:
+        fine = tile_mads(A, B, LOCAL_EDIT_FINE_TILE)
+        if fine is None:
+            return False
+        worst = float(fine.max())
+        return (worst >= LOCAL_EDIT_FINE
+                or (worst >= LOCAL_EDIT_SPOT
+                    and worst >= LOCAL_EDIT_SPOT_RATIO * mad))
+    t = tile_mads(A, B, block)
+    if t is None or float(t.max()) < LOCAL_EDIT_MAD:
+        return False
+    ys, xs = _tile_corners(A.shape[0], A.shape[1], block)
+    count = float(block * block)
+
+    def texture(X):
+        lum = (X @ _LUMA_W).astype(np.float64)
+        mean = _tile_sums(lum, ys, xs, block) / count
+        var = _tile_sums(lum * lum, ys, xs, block) / count - mean * mean
+        return np.sqrt(np.maximum(var, 0.0))
+
+    told = np.maximum(texture(A), texture(B)) >= LOCAL_EDIT_TEXTURE
+    n_told = int(told.sum())
+    if n_told < LOCAL_EDIT_TILES:
+        return False
+    return int(((t <= gate) & told).sum()) >= LOCAL_EDIT_SAME * n_told
+
+
+# Below this many pairs the pixel pass stays on threads (see NCC_MP_MIN_PAIRS
+# for why a floor exists at all).
+MAD_MP_MIN_PAIRS = 40000
+
+
+def compute_mads(TH, cand, workers, luma_mask=None, luma_floor=0.0,
+                 edit_gate=None, procs=None):
+    """mad_pair for every candidate pair, in parallel.
+
+    With LUMA_MASK it returns (mads, lumas): lumas[t] is the luma score of
+    pair t where the mask is set and its mad exceeds LUMA_FLOOR, NaN
+    elsewhere. The luma check used to be a phase of its own that resized
+    every pair a SECOND time - the resize is most of its cost, and on a
+    20,000-image corpus that phase was half the run (898 s of 1,798). Here
+    the score is taken while the pair is already at one shape, from the
+    same arrays through the same function, so it is the same number.
+
+    With EDIT_GATE as well it returns (mads, lumas, edits), asked for the
+    same reason - the pair is at one shape here and nowhere else. edits[t]
+    is 1 when local_edit() says so (any pair up to LOCAL_EDIT_MAD), 2 when
+    the pair is inside the gate and its structure does not agree
+    (DUP_CORR), 0 otherwise.
+
+    Long lists go to worker processes. The loop is a handful of small
+    array calls per pair with Python between them, and on threads that is
+    one interpreter taking turns: measured on 40,000 real pairs, 8 threads
+    ran the mad 1.5x faster than one and the mad-plus-luma exactly 1.0x.
+    The worker IS this function on one thread, so the numbers are the
+    same; any machine that cannot spawn finishes on threads."""
     out = [0.0] * len(cand)
+    lum = None if luma_mask is None else np.full(len(cand), np.nan)
+    edits = None if edit_gate is None else np.zeros(len(cand), dtype=np.int8)
+
+    def result():
+        if lum is None:
+            return out
+        return (out, lum) if edits is None else (out, lum, edits)
+
     if not cand:
-        return out
+        return result()
+    forced = procs is not None
+    if procs is None:
+        procs = _ncc_procs()
+    if (procs and lum is not None
+            and (forced or len(cand) >= MAD_MP_MIN_PAIRS)
+            and getattr(TH, '_recs', None) is not None):
+        try:
+            k = 0
+            for part in _pairs_mp('mad', TH, cand, procs,
+                                  (luma_floor, edit_gate), luma_mask):
+                o = part[0]
+                out[k:k + len(o)] = o
+                lum[k:k + len(o)] = part[1]
+                if edits is not None:
+                    edits[k:k + len(o)] = part[2]
+                k += len(o)
+            return result()
+        except Exception as e:
+            _drop_pool()
+            print('  (process pool unavailable - %s: %.80s; using threads)'
+                  % (type(e).__name__, e))
     step = max(64, (len(cand) + workers - 1) // workers)
 
     def run(k):
         for t in range(k, min(k + step, len(cand))):
             i, j = cand[t]
-            out[t] = mad_pair(TH, i, j)
+            if lum is None:
+                out[t] = mad_pair(TH, i, j)
+                continue
+            A, B = same_shape(TH[i], TH[j])
+            m = absdiff_mean(A, B)
+            out[t] = m
+            if luma_mask[t] and m > luma_floor:
+                lum[t] = luma_of(A, B)
+            if edits is not None and m <= LOCAL_EDIT_MAD:
+                # structure first: inside the gate, two pictures that do
+                # not line up are not "one picture with an edit"
+                if m <= edit_gate and luma_corr_of(A, B) < DUP_CORR:
+                    edits[t] = 2
+                elif local_edit(A, B, m, edit_gate):
+                    edits[t] = 1
 
     with ThreadPoolExecutor(workers) as pool:
         collections.deque(pool.map(run, range(0, len(cand), step)), maxlen=0)
-    return out
+    return result()
 
 
 # The eight ways a picture can be saved without changing what it shows:
@@ -716,16 +1187,81 @@ def oriented_mad(TH, i, j):
     return best, how
 
 
-def compute_oriented_mads(TH, pairs, workers):
+# A rotated copy cannot be held to the plain gate. The plain gate works
+# because two copies of one picture thumbnail through the SAME JPEG block
+# grid, so the thumbnail noise cancels (measured differential: 1.66 at
+# most). Turn the picture and the grid no longer lines up: each thumbnail
+# carries its own noise and the two ADD. Measured on 51 real pictures,
+# lossless half-turns of screenshots scored 4.4 to 7.4 against the 4.0 gate
+# and 10 of 51 were missed - same pixels, nothing to find but the noise.
+#
+# Noise is fine-grained and a real difference is not, so the second look is
+# taken at a quarter of the resolution (4x4 block means), where the noise
+# has averaged out: every pure rotation in that set, up to 7.9 at full
+# size, reads 2.8 or less there, while a rotation with a real edit on top
+# (a crop, a watermark) at the same full-size score reads 3.5 to 7.6. A
+# pair is a rotated copy at or under the gate as before, or up to
+# ORIENT_NOISE_MAD times the gate when its quarter-size score is within
+# ORIENT_LOWPASS_MAD times the gate. Review tier only, as it always was.
+ORIENT_NOISE_MAD = 2.0
+ORIENT_LOWPASS_MAD = 0.75
+
+
+def lowpass_mad(A, B, f=4):
+    """mean|A - B| after averaging both over FxF blocks (uint8 RGB, one
+    shape). Too small for one block: the plain mean."""
+    h, w = (A.shape[0] // f) * f, (A.shape[1] // f) * f
+    if h == 0 or w == 0:
+        return absdiff_mean(A, B)
+    a = A[:h, :w].reshape(h // f, f, w // f, f, 3).astype(np.float32).mean(axis=(1, 3))
+    b = B[:h, :w].reshape(h // f, f, w // f, f, 3).astype(np.float32).mean(axis=(1, 3))
+    return float(np.abs(a - b).mean())
+
+
+def oriented_match(TH, i, j, gate):
+    """(best mad, orientation, is it a rotated copy) - see ORIENT_NOISE_MAD."""
+    best, how = oriented_mad(TH, i, j)
+    if best > gate * ORIENT_NOISE_MAD:
+        return best, how, False
+    A = TH[i]
+    B = np.ascontiguousarray(dict(DIHEDRAL)[how](TH[j]))
+    if best > gate and lowpass_mad(A, B) > gate * ORIENT_LOWPASS_MAD:
+        return best, how, False
+    # Two dark or near-plain pictures are within the gate of each other in
+    # EVERY orientation (DUP_CORR): what little they show has to line up.
+    return best, how, luma_corr_of(A, B) >= DUP_CORR
+
+
+ORIENT_MP_MIN_PAIRS = 100000
+
+
+def compute_oriented_mads(TH, pairs, workers, gate=None, procs=None):
+    """oriented_mad for every pair; with GATE, oriented_match instead.
+    Long lists go to worker processes, as in compute_mads."""
     if not pairs:
         return {}
     out = {}
+    forced = procs is not None
+    if procs is None:
+        procs = _ncc_procs()
+    if (procs and (forced or len(pairs) >= ORIENT_MP_MIN_PAIRS)
+            and getattr(TH, '_recs', None) is not None):
+        try:
+            for d in _pairs_mp('orient', TH, pairs, procs, gate):
+                out.update(d)
+            return out
+        except Exception as e:
+            _drop_pool()
+            out = {}
+            print('  (process pool unavailable - %s: %.80s; using threads)'
+                  % (type(e).__name__, e))
     step = max(16, (len(pairs) + workers - 1) // workers)
 
     def run(k):
         for t in range(k, min(k + step, len(pairs))):
             i, j = pairs[t]
-            out[(i, j)] = oriented_mad(TH, i, j)
+            out[(i, j)] = (oriented_mad(TH, i, j) if gate is None
+                           else oriented_match(TH, i, j, gate))
 
     with ThreadPoolExecutor(workers) as pool:
         collections.deque(pool.map(run, range(0, len(pairs), step)), maxlen=0)
@@ -740,23 +1276,72 @@ def luma(a):
     return (a[:, :, 0] * 0.299 + a[:, :, 1] * 0.587 + a[:, :, 2] * 0.114)
 
 
-def luma_mad_pair(TH, i, j):
-    """mad ignoring colour: catches a grayscale or recoloured copy, which
-    differs hugely in RGB (~30) but barely at all in brightness (~2)."""
-    A, B = same_shape(TH[i], TH[j])
+def luma_of(A, B):
+    """mad ignoring colour, for a pair already at one shape: catches a
+    grayscale or recoloured copy, which differs hugely in RGB (~30) but
+    barely at all in brightness (~2)."""
     # one matmul instead of three multiplies and two adds per channel, and
     # one mean instead of two: (la - la.mean()) - (lb - lb.mean()) is
     # algebraically d - d.mean() for d = la - lb
-    d = (A @ _LUMA_W) - (B @ _LUMA_W)
+    la, lb = A @ _LUMA_W, B @ _LUMA_W
+    d = la - lb
     # normalise out a flat brightness offset - a desaturated copy is often
     # also slightly lifted or darkened, and that is not a different picture
     mad = float(np.abs(d - d.mean()).mean())
     # ...which also removes the whole of a solid swatch (see FLAT_STD). Only
     # a near-zero score can be that, so only then is flatness checked.
-    if mad <= 32.0 and (float((A @ _LUMA_W).std()) < FLAT_STD
-                        or float((B @ _LUMA_W).std()) < FLAT_STD):
-        return 255.0
+    if mad <= 32.0:
+        ca, cb = la - la.mean(), lb - lb.mean()
+        sa = float(np.sqrt((ca * ca).mean()))
+        sb = float(np.sqrt((cb * cb).mean()))
+        if sa < FLAT_STD or sb < FLAT_STD:
+            return 255.0
+        # ...and a small score between two pictures with little in them
+        # (GREY_CORR): the brightness layouts have to line up as well.
+        if float((ca * cb).mean()) < GREY_CORR * sa * sb:
+            return 255.0
     return mad
+
+
+# The luma check needs the two pictures to agree in STRUCTURE as well. Its
+# score is an absolute difference, and a dark or low-contrast picture has
+# almost none to give: measured on 3,000 crops with known windows, 34
+# pairs of different dark screenshots (luma spread 1.3 to 12 grey levels)
+# scored 3.7 to 4.0 against the 4.0 gate. A real black-and-white copy
+# correlates at 0.99; under GREY_CORR the pair is no luma match.
+GREY_CORR = 0.95
+
+
+# ...and so does a pair about to be PRE-MARKED. The Tier A gate is an
+# absolute difference too, and a picture with almost no detail - a dark
+# panel with two divider lines, a plain gradient - is within 4 grey levels
+# of any other such picture. Measured on a 3,000-image corpus of crops with
+# known windows: of the pairs inside the gate that were NOT the same window
+# and not blank, 177 correlated under 0.90, and 8 files
+# were pre-marked X against a keeper showing something else. Every true
+# copy there - re-saved, resized - correlated at 0.976 or better. Under
+# DUP_CORR the pair is shown as weaker evidence, unmarked.
+DUP_CORR = 0.90
+
+
+def luma_corr_of(A, B):
+    """Pearson correlation of the luma planes of a pair at one shape; 0.0
+    when either has no variation to correlate."""
+    la, lb = A @ _LUMA_W, B @ _LUMA_W
+    la = la - la.mean()
+    lb = lb - lb.mean()
+    den = float(np.sqrt((la * la).sum() * (lb * lb).sum()))
+    return float((la * lb).sum() / den) if den > 0 else 0.0
+
+
+def luma_corr(TH, i, j):
+    A, B = same_shape(TH[i], TH[j])
+    return luma_corr_of(A, B)
+
+
+def luma_mad_pair(TH, i, j):
+    A, B = same_shape(TH[i], TH[j])
+    return luma_of(A, B)
 
 
 def compute_luma_mads(TH, pairs, workers):
@@ -878,6 +1463,45 @@ NCC_GATE = 0.90
 # pictures into a single cluster. Below this spread, in grey levels, there
 # is nothing to compare, so neither measure may match on it.
 FLAT_STD = 1.0
+# The Tier A gate is a MEAN over the whole thumbnail, and a mean hides a
+# patch: a 9%-area block of noise pasted onto a picture scores mad 7-11
+# and sometimes under 4, a white watermark box 5-7. Both are edits, not
+# re-encodes, and Tier A then pre-marked one copy of the pair - by file
+# size, so the edited PNG (noise compresses badly) was kept and the
+# original got the X. Re-encodes and resizes differ EVERYWHERE a little:
+# measured on 51 real pictures, the worst 16x16-block mean difference of a
+# JPEG q35, a WebP q80, a 256-colour palette, a 50%% resize or a 1.5x
+# upscale never exceeded 9.3, a radius-2 blur 20.5; a noise patch sat at
+# 73 (median), a watermark at 13 (median) to 146. A pair whose worst block
+# clears this is the same picture with a local change, and goes to review.
+LOCAL_EDIT_MAD = 24.0
+# For a pair INSIDE the gate the look is finer: the worst 8x8 tile, at 20.
+# A watermark strip is a few pixels tall at thumbnail size, and a 16-pixel
+# tile dilutes it: of 21 watermarked copies inside the gate, 11 had a
+# 16-pixel tile at 24 or more and 18 an 8-pixel tile at 20 or more, while
+# no re-encode, resize, palette or upscale of the same 51 pictures went
+# over 14.1 there.
+LOCAL_EDIT_FINE = 20.0
+LOCAL_EDIT_FINE_TILE = 8
+# ...or a smaller spot that is nonetheless where ALL the difference is. On
+# the real library two pictures differing only in a face - a different
+# expression, a retouch, 2% of the frame - scored 0.25 and 1.7 against the
+# gate with their worst 8x8 tile at 17 and 16, and were pre-marked. A
+# re-encode's noise is spread out: over 407 re-encodes, resizes, palette
+# and upscale copies of 51 pictures the worst tile never exceeded 3.8
+# times the mean; those two pairs sat at 68 and 9.4 times. A tile at
+# LOCAL_EDIT_SPOT or more that is LOCAL_EDIT_SPOT_RATIO times the mean is
+# an edit. No such copy on the 51 pictures, nor on 147 planted copies in
+# 3,000 crops, was flagged by it.
+LOCAL_EDIT_SPOT = 12.0
+LOCAL_EDIT_SPOT_RATIO = 5.0
+# ...and the same picture when the edit lifted the mean OVER the gate: see
+# local_edit(). A tile counts when its luma varies by this much (std) in
+# either copy; at least LOCAL_EDIT_TILES such tiles must exist, and
+# LOCAL_EDIT_SAME of them must agree within the gate.
+LOCAL_EDIT_TEXTURE = 4.0
+LOCAL_EDIT_TILES = 8
+LOCAL_EDIT_SAME = 0.75
 # 80% crops keep 84% at the 64 px pass and 97% at 128. Retry only the
 # band that almost cleared the gate, closest first, and never lower a
 # score. Cap stops a 37k-pair crop list from becoming a second full pass.
@@ -976,6 +1600,136 @@ def apply_ncc_confirms(nccs, TH, workers, cap=NCC_CONFIRM_CAP,
     return nccs, len(pairs), gained, skipped
 
 
+# A crop-matcher pass says the smaller picture correlates with one window
+# of the larger. It does not say where the agreement comes from. Two
+# screenshots of one app share their frame, and a frame of flat panels
+# and identical icons correlates at 0.99 whatever sits in the middle; two
+# photographs of one skyline share the buildings under different skies.
+# In both, the tiles that carry detail disagree. At the matched window an
+# 8-px tile is textured when its grey levels spread by WINDOW_TEXTURE in
+# either copy, and it disagrees when the two copies' correlation on it is
+# under WINDOW_TILE_CORR. A pass with WINDOW_DISAGREE such tiles or more,
+# and WINDOW_DISAGREE_SHARE of the textured ones, is weaker evidence.
+# Measured at the 64 px window: 67% of the same-app screenshot pairs a
+# real library admitted this way and 29% of its same-view photographs,
+# against 6% of the 479 planted crops the 3,000-crop corpus admits, 3% of
+# the truth set's 97% crops and 2% of its 90% crops, and none of its
+# brightness, contrast, hue or whole-frame copies. At a 128 px window the
+# crops lose alignment (15% caught) for 78% of the screenshots; at 0.7
+# and 0.8 correlation the crops cost 11% and 21%.
+WINDOW_TILE = 8
+WINDOW_TEXTURE = 4.0
+WINDOW_TILE_CORR = 0.60
+WINDOW_DISAGREE = 4
+WINDOW_DISAGREE_SHARE = 0.25
+
+
+def _scaled_template(small, s):
+    """`small` at scale s as a float32 grayscale, or False when flat."""
+    th, tw = int(small.shape[0] * s), int(small.shape[1] * s)
+    t = np.ascontiguousarray(np.asarray(
+        _pil_view(small.astype('uint8'), 'L').resize(
+            (tw, th), Image.LANCZOS), dtype=np.float32))
+    return False if float(t.std()) < FLAT_STD else t
+
+
+def ncc_window(a, b, target=None, template=None):
+    """The crop matcher's best window for two grayscales: (score, window,
+    template), or (0.0, None, None). Same directions, scales and early
+    exit as compute_nccs, so the window belongs to the score the pair
+    holds; given that score as `target`, the search also stops at the
+    first window that reaches it, which is the one the matcher kept. A
+    score the 128 px retry raised is out of reach at 64 px: the search
+    then runs to the end and returns the 64 px best, which is under the
+    gate, and the caller can tell by the score. `template(which, s,
+    small)` may serve the scaled templates from a cache, `which` being
+    0 for `a` and 1 for `b`."""
+    import cv2
+    stop = C_NCC_GATE if target is None else min(C_NCC_GATE, target - 1e-6)
+    best = (0.0, None, None)
+    for big, small, which in ((a, b, 1), (b, a, 0)):
+        for s in ncc_scale_list(big.shape, small.shape):
+            th, tw = int(small.shape[0] * s), int(small.shape[1] * s)
+            if th < 8 or tw < 8 or th > big.shape[0] or tw > big.shape[1]:
+                continue
+            t = (_scaled_template(small, s) if template is None
+                 else template(which, s, small))
+            if t is False:
+                continue
+            _lo, v, _at, loc = cv2.minMaxLoc(
+                cv2.matchTemplate(big, t, cv2.TM_CCOEFF_NORMED))
+            if v > best[0]:
+                x, y = loc
+                best = (float(v), big[y:y + th, x:x + tw], t)
+            if best[0] >= stop:
+                return best
+    return best
+
+
+def window_disagrees(W, T, block=WINDOW_TILE):
+    """True when the tiles of a matched window that carry detail do not
+    correlate between the two copies (WINDOW_*)."""
+    ys, xs = _tile_corners(W.shape[0], W.shape[1], block)
+    # every tile at once: (n_tiles, block*block) views of both copies
+    yy = (ys[:, None] + np.arange(block)[None, :])          # rows per tile
+    xx = (xs[:, None] + np.arange(block)[None, :])
+    A = W[yy[:, None, :, None], xx[None, :, None, :]].reshape(-1, block * block)
+    B = T[yy[:, None, :, None], xx[None, :, None, :]].reshape(-1, block * block)
+    tex = np.maximum(A.std(1), B.std(1)) >= WINDOW_TEXTURE
+    if not tex.any():
+        return False
+    A = A[tex] - A[tex].mean(1, keepdims=True)
+    B = B[tex] - B[tex].mean(1, keepdims=True)
+    d = np.sqrt((A * A).sum(1) * (B * B).sum(1))
+    bad = int(((d < 1e-6) | ((A * B).sum(1) < WINDOW_TILE_CORR * d)).sum())
+    return bad >= WINDOW_DISAGREE and bad >= WINDOW_DISAGREE_SHARE * int(tex.sum())
+
+
+def frame_only_pairs(TH, pairs, workers, scores=None, max_side=64):
+    """Which of these crop-matcher passes agree only where nothing is
+    drawn: the set of pairs whose matched window window_disagrees().
+    Asked only of the passes headed for review: a few hundred on a real
+    library, about one per image on a corpus of crops. Threads, at the
+    matcher's own per-pair cost (measured 1.4 ms a pass, and the glue
+    between the GIL-free calls means two workers do most of it): 3 s
+    for 215 passes, 4 s for 2,917. `scores` (the pairs' crop scores)
+    lets each search stop at the window the matcher kept."""
+    if not pairs:
+        return set()
+    try:
+        import cv2  # noqa: F401  (no matcher, no passes to check)
+    except Exception:
+        return set()
+    idxs = sorted({x for p in pairs for x in p})
+    grays = {}
+    scores = scores or {}
+    tcache = {}
+    lock = threading.Lock()
+
+    def one(p):
+        def template(which, s, small):
+            key = (p[which], s)
+            t = tcache.get(key)
+            if t is None:
+                t = _scaled_template(small, s)
+                with lock:
+                    tcache[key] = t
+            return t
+        v, W, T = ncc_window(grays[p[0]], grays[p[1]], scores.get(p), template)
+        # A pass the 128 px retry admitted has no window here that
+        # clears the gate: the 64 px best is the alignment the retry
+        # exists to repair, so it is not judged on it. Stays in review.
+        if W is None or v < NCC_GATE:
+            return p, False
+        return p, window_disagrees(W, T)
+
+    with ThreadPoolExecutor(workers) as pool:
+        for x, g in zip(idxs, pool.map(
+                lambda x, cap=max_side: gray_small(TH, x, cap), idxs)):
+            grays[x] = g
+        return {p for p, bad in pool.map(one, pairs) if bad}
+
+
 # Below this many pairs the crop matcher stays on threads: the process
 # spawns plus their imports cost ~6-8 s, and a small pair list is finished
 # before that is paid back.
@@ -1013,6 +1767,75 @@ def _ncc_procs():
     if cpu < 4:
         return 0
     return max(4, min(8, cpu - 2))
+
+
+_POOL = [None, 0]
+
+
+def _proc_pool(procs):
+    """The worker processes, started once and shared by every pass that
+    uses them: each start costs seconds of imports, and the pixel pass, the
+    crop matcher and the orientation check now all want them."""
+    from concurrent.futures import ProcessPoolExecutor
+    if _POOL[0] is None or _POOL[1] != procs:
+        _drop_pool()
+        _POOL[0], _POOL[1] = ProcessPoolExecutor(max_workers=procs), procs
+    return _POOL[0]
+
+
+def _drop_pool():
+    pool, _POOL[0] = _POOL[0], None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+
+
+atexit.register(_drop_pool)
+
+
+class _TbCache:
+    """TH stand-in inside a worker process for the passes that read an
+    image once per PAIR: decoded on first access and kept, since a slice
+    of pairs touches each of its images many times."""
+
+    def __init__(self, tbmap):
+        self._tb = tbmap
+        self._d = {}
+
+    def __getitem__(self, i):
+        a = self._d.get(i)
+        if a is None:
+            a = self._d[i] = imdecode_rgb(base64.b64decode(self._tb[i]))
+        return a
+
+
+def _pair_chunk(args):
+    """Process-pool worker for the pixel pass and the orientation check:
+    the same function the parent would run, single-threaded, over a slice."""
+    kind, chunk, tbmap, extra, per_pair = args
+    view = _TbCache(tbmap)
+    if kind == 'mad':
+        return compute_mads(view, chunk, 1, per_pair, extra[0], extra[1],
+                            procs=0)
+    return compute_oriented_mads(view, chunk, 1, gate=extra, procs=0)
+
+
+def _pairs_mp(kind, TH, pairs, procs, extra, per_pair=None):
+    """PAIRS sliced contiguously across the worker processes; yields each
+    slice's result in order. Thumbnails travel as their stored base64
+    strings, as in _nccs_mp, and for the same measured reason."""
+    recs = TH._recs
+    nchunks = procs * 4
+    step = (len(pairs) + nchunks - 1) // nchunks
+    jobs = []
+    for k in range(0, len(pairs), step):
+        chunk = pairs[k:k + step]
+        idxs = sorted({x for q in chunk for x in q})
+        jobs.append((kind, chunk, {i: recs[i]['tb'] for i in idxs}, extra,
+                     None if per_pair is None else per_pair[k:k + step]))
+    return _proc_pool(procs).map(_pair_chunk, jobs)
 
 
 class _TbView:
@@ -1073,9 +1896,8 @@ def _nccs_mp(TH, pairs, procs, max_side=64):
         idxs = sorted({x for p in chunk for x in p})
         jobs.append((chunk, {i: recs[i]['tb'] for i in idxs}, max_side))
     res = {}
-    with ProcessPoolExecutor(max_workers=procs) as ex:
-        for d in ex.map(_ncc_chunk, jobs):
-            res.update(d)
+    for d in _proc_pool(procs).map(_ncc_chunk, jobs):
+        res.update(d)
     return res
 
 
@@ -1111,6 +1933,7 @@ def compute_nccs(TH, pairs, workers, procs=None, max_side=64):
         try:
             return _nccs_mp(TH, pairs, procs, max_side=max_side)
         except Exception as e:
+            _drop_pool()
             # A machine that cannot spawn (frozen build, exotic runtime)
             # still finishes on threads; say so rather than silently being
             # slower, because "it worked but took twice as long" is the
@@ -1128,7 +1951,7 @@ def compute_nccs(TH, pairs, workers, procs=None, max_side=64):
         if t is None:
             th, tw = int(small.shape[0] * s), int(small.shape[1] * s)
             t = np.ascontiguousarray(np.asarray(
-                Image.fromarray(small.astype('uint8')).resize(
+                _pil_view(small.astype('uint8'), 'L').resize(
                     (tw, th), Image.LANCZOS), dtype=np.float32))
             if float(t.std()) < FLAT_STD:
                 t = False
@@ -1226,12 +2049,16 @@ def media_kind(r):
     colour picture and a greyscale version, each hold something the other
     does not - a Live Photo GIF beside the full-resolution still, say - so
     that choice is left to the person reviewing."""
-    return (bool(r.get('anim')), (r.get('mode') or '') in GRAY_MODES)
+    # ...and a transparent copy against its flattened export, which has
+    # lost the alpha channel the way a greyscale copy lost colour
+    return (bool(r.get('anim')), (r.get('mode') or '') in GRAY_MODES,
+            bool(r.get('alpha')))
 
 
 def quality_key(recs, i):
     """Which copy of a duplicate group to KEEP: most animation frames,
-    then colour over greyscale, then most pixels, then full colour over a
+    then colour over greyscale, then transparency over a flattened copy,
+    then most pixels, then full colour over a
     palette, then a lossless encoding over a lossy one, then largest file,
     then finest JPEG quantisation (a smaller qsum is finer).
 
@@ -1265,13 +2092,17 @@ def quality_key(recs, i):
     # and as not-palette, so they rank exactly as they always did.
     frames = int(r.get('anim') or 1)
     colour = 0 if mode in GRAY_MODES else 1
+    # Collect composites alpha onto white for the thumbnail, so a
+    # transparent PNG and its flattened export were pixel-identical here,
+    # and the flatten - the bigger file - was kept over the original.
+    alpha = 1 if r.get('alpha') else 0
     # Palette ranks below full colour at the same size, ahead of the byte
     # count: a 256-colour PNG is often LARGER than the JPEG it was made
     # from, so dropping only its lossless credit still kept it.
     full = 0 if mode in PALETTE_MODES else 1
     lossless = 1 if ((r.get('fmt') or '').upper() in LOSSLESS_FMTS
                      and mode not in PALETTE_MODES) else 0
-    return (frames, colour, r['w'] * r['h'], full, lossless, r['b'],
+    return (frames, colour, alpha, r['w'] * r['h'], full, lossless, r['b'],
             -r.get('qsum', 10 ** 9))
 
 
@@ -1519,7 +2350,7 @@ def scan_has_output(tier_a, tier_b, info_b=None, tier_c=None):
     return False
 
 
-def build_tier_c(groups, recs, tier_a, tier_b=None):
+def build_tier_c(groups, recs, tier_a, tier_b=None, edges=None):
     """Weaker-evidence groups: shown, all unmarked, no suggested keeper.
 
     Same A-drop standing-in as Tier B, so a relation to a doomed copy is
@@ -1533,18 +2364,9 @@ def build_tier_c(groups, recs, tier_a, tier_b=None):
             keeper_of[d] = k
     out = []
     for members in groups:
-        surv = [i for i in members if i not in a_drops]
-        if len(surv) < 2:
-            stand = list(surv)
-            for i in members:
-                if i in a_drops:
-                    kk = keeper_of.get(i)
-                    if kk is not None and kk not in stand:
-                        stand.append(kk)
-            if len(stand) > 1:
-                out.append(sorted(stand))
-            continue
-        out.append(sorted(surv))
+        surv, _free = stand_in(members, a_drops, keeper_of, edges)
+        if len(surv) > 1:
+            out.append(surv)
     return out
 
 
@@ -1672,16 +2494,32 @@ def confirm_hires_mad(root, ra, rb, max_side=CONFIRM_PX):
     return absdiff_mean(A, B)
 
 
+def originals_present(root, ra, rb):
+    """Whether both files of a pair are on disk right now."""
+    for r in (ra, rb):
+        p = inventory_abspath(root, r.get('p'))
+        if not p or not os.path.isfile(p):
+            return False
+    return True
+
+
 def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
                          cap=CONFIRM_CAP, state=None):
     """Re-score borderline keeper-drop pairs at 512 px.
 
     Only pairs that matched the keeper (so they would be pre-marked X),
     are not byte-identical, and sit in (2, gate] at thumbnail size.
-    Failures are demoted to review. Unreadable originals are left in
-    Tier A: the thumbnail already passed two gates, and the recycler
-    will refuse if the file is gone or has changed. They are counted as
-    unreadable, not as checked, and do not use up the cap.
+    Failures are demoted to review. A pair whose originals are NOT ON
+    DISK (an inventory analysed away from its library, a file moved since
+    the scan) is left in Tier A: the thumbnail already passed two gates,
+    and the recycler refuses a file that is gone or has changed. Those are
+    counted as unreadable, not as checked, and do not use up the cap.
+
+    A pair whose files are both there but will not open in this
+    interpreter (a codec the collector's Python had and this one lacks, a
+    file another program holds) is different: the re-check was possible
+    and did not happen, so the pair goes to review rather than keeping an
+    X nothing confirmed. Counted as 'undecodable'.
 
     state carries the cap, the counts and the results across the rounds of
     settle_tier_a, so no pair is read twice and the cap is one cap.
@@ -1690,6 +2528,7 @@ def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
     """
     if state is None:
         state = {'checked': 0, 'unreadable': 0, 'cache': {}}
+    state.setdefault('undecodable', 0)
     cache = state['cache']
     demoted = []
     capped = 0
@@ -1719,11 +2558,14 @@ def apply_hires_confirms(tier_a, recs, root, mad_of, a_edges, gate,
                     keep_drops.append(d)
                     continue
                 hi = confirm_hires_mad(root, recs[k], recs[d])
-                cache[key] = hi
-                if hi is None:
+                if hi is None and originals_present(root, recs[k], recs[d]):
+                    hi = float('inf')
+                    state['undecodable'] += 1
+                elif hi is None:
                     state['unreadable'] += 1
                 else:
                     state['checked'] += 1
+                cache[key] = hi
             if hi is None or hi <= gate:
                 keep_drops.append(d)
             else:
@@ -1752,7 +2594,8 @@ def build_tier_a(recs, a_edges, order):
     return out
 
 
-def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP):
+def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP,
+                  state=None):
     """Build Tier A, confirm it at 512 px, and rebuild it WITHOUT the pairs
     that failed, until nothing more fails.
 
@@ -1766,8 +2609,12 @@ def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP):
     keeper through the failed pair becomes LINKED, not pre-marked.
 
     Returns (tier_a, demoted_pairs, n_checked, n_capped, n_unreadable).
-    a_edges is left as it was; the caller removes the demoted pairs."""
-    state = {'checked': 0, 'unreadable': 0, 'cache': {}}
+    a_edges is left as it was; the caller removes the demoted pairs. Pass a
+    dict as state to read the other counts ('undecodable') afterwards."""
+    if state is None:
+        state = {}
+    state.update({'checked': 0, 'unreadable': 0, 'undecodable': 0,
+                  'cache': {}})
     live = set(a_edges)
     demoted = []
     while True:
@@ -1826,7 +2673,38 @@ def check_invariants(tier_a, tier_b, tier_c=None):
     return True
 
 
-def build_tier_b(groups, recs, tier_a):
+def stand_in(members, a_drops, keeper_of, edges=None):
+    """A review group with every Tier A drop replaced by its keeper, and
+    the drop's match edges carried over to the keeper.
+
+    The keeper holds the same pixels as the drop (Tier A), so it is a
+    legitimate witness for whatever the drop was matched with. It used to
+    stand in only when fewer than two members were left, and never
+    inherited the edges: the crop then had an empty neighbour list, the
+    recycler refused to trash it with "every copy it was matched with is
+    marked X" although nothing was marked, and with two survivors the
+    picture's keeper was simply absent while files that were never
+    compared were shown as each other's keeper and 'linked'.
+    Returns (sorted members, how many of them were free files)."""
+    surv = [i for i in members if i not in a_drops]
+    n_free = len(surv)
+    for d in members:
+        if d not in a_drops:
+            continue
+        k = keeper_of.get(d)
+        if k is None:
+            continue
+        if k not in surv:
+            surv.append(k)
+        if edges is not None:
+            for x in members:
+                if x != d and x != k and ((d, x) in edges or (x, d) in edges):
+                    edges.add((k, x))
+                    edges.add((x, k))
+    return sorted(surv), n_free
+
+
+def build_tier_b(groups, recs, tier_a, edges=None):
     """Turn raw crop/variant groups into (tier_b, info_b).
 
     tier_b entries suggest deletions; info_b entries are shown for review
@@ -1846,16 +2724,12 @@ def build_tier_b(groups, recs, tier_a):
 
     tier_b, info_b = [], []
     for members in groups:
-        surv = [i for i in members if i not in a_drops]     # already leaving
+        surv, n_free = stand_in(members, a_drops, keeper_of, edges)
         if len(surv) < 2:
-            stand = list(surv)
-            for i in members:
-                if i in a_drops:
-                    kk = keeper_of.get(i)
-                    if kk is not None and kk not in stand:
-                        stand.append(kk)
-            if len(stand) > 1:
-                info_b.append(sorted(stand))
+            continue
+        if n_free < 2:
+            # only stand-ins beside one free file: shown, nothing suggested
+            info_b.append(surv)
             continue
         k = max(surv, key=lambda i: quality_key(recs, i))
         drops = [i for i in surv if i != k and i not in a_keeps and i not in a_drops]
@@ -1955,6 +2829,25 @@ def build_emission_plan(tier_a, tier_b, recs, info_b=None, tier_c=None):
                 home[i] = cl_id
             plan.append((cl_id, key, keeper, editable, refs))
     return plan, home
+
+
+def reference_keepers(plan, tier_b):
+    """cl_id -> the keeper Tier B elected, for the clusters where that file
+    is only a REFERENCE (its editable line is in a Tier A cluster).
+
+    The plan's own keeper has to be an editable member, so for those
+    clusters it re-elected one of the crops: the list called a crop the
+    "suggested keeper", the report drew KEEP on it, every other crop became
+    "linked via another file" and the suggestions Tier B had decided
+    vanished - for any picture that has both a duplicate and a crop. The
+    decision was never wrong, only its labels; callers use this to label
+    and suggest against the keeper that was actually elected."""
+    out = {}
+    b_plan = [p for p in plan if p[1] == 'B'][:len(tier_b)]
+    for (cl_id, _key, _kp, editable, refs), (k, _d, _m) in zip(b_plan, tier_b):
+        if editable and k is not None and k in refs:
+            out[cl_id] = k
+    return out
 
 
 def check_emission(plan, home):
@@ -2380,6 +3273,29 @@ def self_test():
           % ('PASS' if sweep_ok else 'FAIL', 72 * 71 // 2, len(ref)))
     ok = ok and sweep_ok
 
+    # The bounded sweep is the same sweep while the pairs fit, and each
+    # image's nearest partners when they do not: a library of near-identical
+    # pages, where every pair is a candidate, must not be scored pair by
+    # pair. 60 such rows are 1,770 pairs.
+    Cb = np.clip(C[0][None, :] + np.random.default_rng(99).integers(
+        -3, 4, size=(60, 192)), 0, 255).astype(np.float32)
+    all_b = sweep_candidates(Cb, 8.0)
+    same_b, cap_none = sweep_candidates(Cb, 8.0, max_pairs=len(all_b))
+    few_b, cap_b = sweep_candidates(Cb, 8.0, max_pairs=600)
+    dist_b = np.abs(Cb[:, None, :] - Cb[None, :, :]).mean(2)
+    np.fill_diagonal(dist_b, 1e9)
+    nearest_b = {(min(i, int(j)), max(i, int(j)))
+                 for i, j in enumerate(dist_b.argmin(1))}
+    bound_ok = (len(all_b) == 60 * 59 // 2 and same_b == all_b
+                and cap_none is None and cap_b is not None
+                and cap_b[0] == len(all_b) and cap_b[1] == 16
+                and len(few_b) == cap_b[2] <= 60 * 16
+                and set(few_b) <= set(all_b) and nearest_b <= set(few_b))
+    print('  [%s] the bounded sweep keeps every pair that fits, else each '
+          "image's nearest (%d of %d pairs)"
+          % ('PASS' if bound_ok else 'FAIL', len(few_b), len(all_b)))
+    ok = ok and bound_ok
+
     # The cross-sweep now bands by mean too, and its extra hazard is a
     # re-oriented row: same values, different float32 summation order, so
     # the two means of a TRUE pair can differ by rounding. The oracle is
@@ -2405,6 +3321,84 @@ def self_test():
     print('  [%s] banded cross-sweep == brute force (full and rows= subset)'
           % ('PASS' if cross_ok else 'FAIL'))
     ok = ok and cross_ok
+
+    # One sweep over the orbit-sorted signatures has to return exactly what
+    # the seven cross sweeps do. The fixture adds planted rotations of every
+    # kind, a pair that matches only through a rotation at the cut's edge,
+    # and rows that are already plain candidates.
+    Co = C.copy()
+    for k, (src, dst) in enumerate(((20, 21), (22, 23), (24, 25), (26, 27),
+                                    (28, 29), (30, 31), (32, 33)), 1):
+        Co[dst] = oriented_signatures(Co[src:src + 1], k)[0]
+    Co[35] = np.clip(oriented_signatures(Co[34:35], 3)[0] + 7.9, 0, 255)
+    Co[37] = np.clip(oriented_signatures(Co[36:37], 5)[0] + 12.0, 0, 255)
+    want_o = set()
+    for k in range(1, 8):
+        for a_, b_ in sweep_candidates_cross(Co, oriented_signatures(Co, k), 8.0):
+            want_o.add((a_, b_) if a_ < b_ else (b_, a_))
+    got_o = set(sweep_candidates_oriented(Co, 8.0))
+    plain_o = set(sweep_candidates(Co, 8.0))
+    got_skip = set(sweep_candidates_oriented(Co, 8.0, skip=plain_o))
+    So = orbit_sorted_signatures(Co)
+    inv_ok = all(np.array_equal(So, orbit_sorted_signatures(
+        oriented_signatures(Co, k))) for k in range(1, 8))
+    orient_ok = (got_o == want_o and got_skip == want_o - plain_o and inv_ok
+                 and all((a_, a_ + 1) in got_o for a_ in range(20, 35, 2))
+                 and (36, 37) not in got_o)
+    print('  [%s] one orbit-sorted sweep == the seven cross sweeps (%d pairs)'
+          % ('PASS' if orient_ok else 'FAIL', len(want_o)))
+    ok = ok and orient_ok
+
+    # A black-and-white copy is nominated against its colour original and
+    # against nothing else: not another colour picture with the same
+    # brightness layout, not another grey picture.
+    try:
+        rng_g = np.random.default_rng(13)
+        Cg = rng_g.integers(0, 256, size=(40, 192)).astype(np.float32)
+        Gg = Cg.reshape(40, 64, 3)
+        lum_g = Gg @ _LUMA_W
+        Gg[1] = lum_g[0][:, None]                          # grey copy of 0
+        Gg[3] = np.clip(lum_g[2][:, None] + 9.0, 0, 255)   # grey, lifted, of 2
+        Gg[5] = Gg[4][:, ::-1]                             # a recolour: not grey
+        Gg[7] = rng_g.integers(0, 256, (64, 1))            # unrelated grey
+        Gg[9] = Gg[7] + 1.0                                # grey twin of a grey
+        got_g = set(sweep_grey_copies(Cg, 5.0))
+        grey_ok = got_g == {(0, 1), (2, 3)}
+        print('  [%s] the greyscale sweep pairs a black-and-white copy with '
+              'its colour original only' % ('PASS' if grey_ok else 'FAIL'))
+        ok = ok and grey_ok
+    except Exception as exc:
+        print('  [FAIL] greyscale sweep: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A rotated copy whose thumbnails carry independent JPEG noise is still
+    # a rotated copy; a rotation with a real edit on top is not pre-judged.
+    try:
+        yy, xx = np.mgrid[0:96, 0:128]
+        base_o = np.stack([(xx * 2) % 256, (yy * 2 + xx) % 256,
+                           (xx + yy * 3) % 256], axis=2).astype(np.uint8)
+        rng_o = np.random.default_rng(7)
+        def _noisy(a, amp):
+            return np.clip(a.astype(np.int16) + rng_o.integers(
+                -amp, amp + 1, a.shape), 0, 255).astype(np.uint8)
+        half = np.ascontiguousarray(np.rot90(base_o, 2))
+        edited = half.copy()
+        edited[10:60, 20:90] = np.clip(
+            edited[10:60, 20:90].astype(np.int16) + 12, 0, 255)
+        THo = [_noisy(base_o, 9), _noisy(half, 9), half, _noisy(edited, 2)]
+        m_noise = oriented_match(THo, 0, 1, 4.0)
+        m_clean = oriented_match(THo, 2, 0, 4.0)
+        m_edit = oriented_match(THo, 0, 3, 4.0)
+        noise_ok = (4.0 < m_noise[0] <= 8.0 and m_noise[2]
+                    and m_noise[1] == 'rot180'
+                    and not m_edit[2] and m_clean[1] == 'rot180')
+        print('  [%s] a half-turn under independent noise is a rotated copy '
+              '(mad %.1f), one with an edit is not (mad %.1f)'
+              % ('PASS' if noise_ok else 'FAIL', m_noise[0], m_edit[0]))
+        ok = ok and noise_ok
+    except Exception as exc:
+        print('  [FAIL] oriented_match: %s: %s' % (type(exc).__name__, exc))
+        ok = False
 
     # The collector resizes into a new image instead of thumbnailing the
     # open file in place, using its own copy of Pillow's size arithmetic.
@@ -2611,6 +3605,21 @@ def self_test():
         print('  [%s] crop scores from worker processes equal the threaded ones'
               % ('PASS' if same else 'FAIL'))
         ok = ok and same
+        # ...and so must the pixel pass and the orientation check, which
+        # moved to the same workers: mads, luma scores and local-edit
+        # verdicts, and the oriented scores, element for element.
+        mask_m = np.array([True, False, True, True, True])
+        t_m = compute_mads(TH_m, pairs_m, 2, mask_m, 0.0, edit_gate=4.0, procs=0)
+        p_m = compute_mads(TH_m, pairs_m, 2, mask_m, 0.0, edit_gate=4.0, procs=2)
+        t_o = compute_oriented_mads(TH_m, pairs_m, 2, gate=4.0, procs=0)
+        p_o = compute_oriented_mads(TH_m, pairs_m, 2, gate=4.0, procs=2)
+        same2 = (t_m[0] == p_m[0] and np.array_equal(t_m[1], p_m[1], equal_nan=True)
+                 and np.array_equal(t_m[2], p_m[2]) and t_o == p_o
+                 and len(t_o) == len(pairs_m) and bool(np.isnan(t_m[1][1]))
+                 and not np.isnan(t_m[1][0]))
+        print('  [%s] pixel, luma and orientation scores from worker processes '
+              'equal the threaded ones' % ('PASS' if same2 else 'FAIL'))
+        ok = ok and same2
     except Exception as exc:
         print('  [FAIL] could not check: %s: %s' % (type(exc).__name__, exc))
         ok = False
@@ -2891,6 +3900,51 @@ def self_test():
         ok = ok and sizes and raised
     except Exception as exc:
         print('  [FAIL] 128 px crop retry: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # Two "screenshots" of one app: the same dark bars and icons around
+        # a bright pane that shows different low-contrast content in each.
+        # The pane against the dark frame makes them correlate past the
+        # crop gate (0.99); the tiles inside the pane do not, so the pass
+        # is frame-only. A real crop of a textured picture correlates
+        # tile by tile and is not.
+        rng = np.random.default_rng(41)
+        frames = []
+        for _k in range(2):
+            fr = np.full((128, 128, 3), 20, dtype=np.uint8)
+            fr[:8] = 40                       # status bar and toolbar, with
+            fr[120:] = 40                     # the same icons in both copies
+            for x0 in (6, 30, 54, 78, 102):
+                fr[2:6, x0:x0 + 4] = 220
+                fr[122:126, x0 + 10:x0 + 14] = 220
+            fr[16:112, 8:120] = rng.integers(96, 160, (96, 112, 3), dtype=np.uint8)
+            frames.append(fr)
+        coarse = rng.integers(40, 200, (16, 16, 3), dtype=np.uint8)
+        pic = np.asarray(Image.fromarray(coarse).resize((128, 128), Image.BILINEAR))
+        pic = np.clip(pic.astype(np.int16) + rng.integers(-4, 5, pic.shape), 0, 255).astype(np.uint8)
+        pcrop = np.ascontiguousarray(pic[10:118, 12:116])
+        recs_w = []
+        for name, arr in (('frame_a', frames[0]), ('frame_b', frames[1]),
+                          ('pic', pic), ('pic_crop', pcrop)):
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, 'PNG')
+            recs_w.append({'p': name + '.png', 'b': 100, 'sha': name[:2] * 32,
+                           'w': arr.shape[1], 'h': arr.shape[0],
+                           'tw': arr.shape[1], 'th': arr.shape[0],
+                           'tb': base64.b64encode(buf.getvalue()).decode('ascii')})
+        TH_w = ThumbStore(recs_w, workers=2)
+        scores_w = compute_nccs(TH_w, [(0, 1), (2, 3)], 2, procs=0)
+        admitted = all(scores_w.get(p, 0.0) >= NCC_GATE for p in ((0, 1), (2, 3)))
+        flagged = frame_only_pairs(TH_w, [(0, 1), (2, 3)], 2)
+        win_ok = admitted and flagged == {(0, 1)}
+        print('  [%s] a crop match that agrees only on the frame is weaker '
+              'evidence, a real crop is not (scores %.2f / %.2f)'
+              % ('PASS' if win_ok else 'FAIL',
+                 scores_w.get((0, 1), 0.0), scores_w.get((2, 3), 0.0)))
+        ok = ok and win_ok
+    except Exception as exc:
+        print('  [FAIL] frame-only crop match: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
     try:
@@ -3246,6 +4300,102 @@ def self_test():
         print('  [FAIL] keeper rule: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
+    # v4.4.3 accuracy rules: transparency outranks a flatten; a local edit is
+    # a variant; a Tier A drop's keeper stands in with the drop's edges; the
+    # Tier C cap sees pictures, not copies.
+    try:
+        rgba = {'w': 100, 'h': 100, 'b': 900, 'fmt': 'PNG', 'mode': 'RGBA', 'alpha': 1}
+        flat = {'w': 100, 'h': 100, 'b': 2000, 'fmt': 'PNG', 'mode': 'RGB'}
+        al_ok = (max([0, 1], key=lambda i: quality_key([flat, rgba], i)) == 1
+                 and media_kind(rgba) != media_kind(flat))
+        rng_e = np.random.default_rng(5)
+        base = rng_e.integers(0, 256, (96, 128, 3), dtype=np.uint8)
+        patch = base.copy()
+        patch[40:56, 60:76] = 255 - patch[40:56, 60:76]      # one 16x16 tile
+        noisy = np.clip(base.astype(np.int16)
+                        + rng_e.integers(-3, 4, base.shape), 0, 255).astype(np.uint8)
+        TH_e = [base, patch, noisy]
+        ed_ok = (mad_pair(TH_e, 0, 1) <= 4.0
+                 and local_edit_max(TH_e, 0, 1) >= LOCAL_EDIT_MAD
+                 and local_edit_max(TH_e, 0, 2) < LOCAL_EDIT_MAD)
+        # An edit large enough to lift the MEAN over the gate is still the
+        # same picture (most textured tiles agree); two different drawings
+        # on the same blank page are not (only blank tiles agree); and a
+        # pair that differs a little everywhere is not an edit at all.
+        big_patch = base.copy()
+        big_patch[16:64, 32:96] = rng_e.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        page_a = np.full((96, 128, 3), 255, dtype=np.uint8)
+        page_b = page_a.copy()
+        page_a[16:64, 32:96] = rng_e.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        page_b[16:64, 32:96] = rng_e.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+        drift = np.clip(base.astype(np.int16)
+                        + rng_e.integers(-12, 13, base.shape), 0, 255).astype(np.uint8)
+        m_big = absdiff_mean(base, big_patch)
+        m_pg = absdiff_mean(page_a, page_b)
+        ed_ok = (ed_ok and m_big > 4.0 and local_edit(base, big_patch, m_big, 4.0)
+                 and 4.0 < m_pg <= LOCAL_EDIT_MAD
+                 and not local_edit(page_a, page_b, m_pg, 4.0)
+                 and not local_edit(base, drift, absdiff_mean(base, drift), 4.0)
+                 and local_edit(base, patch, mad_pair(TH_e, 0, 1), 4.0)
+                 and not local_edit(base, noisy, mad_pair(TH_e, 0, 2), 4.0))
+        # A small spot that holds all the difference - a changed expression
+        # on a 2800x3250 drawing - against a re-encode's spread-out noise
+        # with a worst tile just as high.
+        spot = base.copy()
+        spot[40:48, 64:72] = np.clip(spot[40:48, 64:72].astype(np.int16) + 16,
+                                     0, 255)
+        spread = base.astype(np.int16) + rng_e.integers(-7, 8, base.shape)
+        spread[40:48, 64:72] += 14
+        spread = np.clip(spread, 0, 255).astype(np.uint8)
+        m_spot, m_spread = absdiff_mean(base, spot), absdiff_mean(base, spread)
+        ed_ok = (ed_ok and m_spot < 1.0 and local_edit(base, spot, m_spot, 4.0)
+                 and m_spread <= 4.0 and 12.0 <= float(tile_mads(base, spread, 8).max())
+                 and not local_edit(base, spread, m_spread, 4.0))
+        # The tiles reach the far edges: a strip along the bottom of a
+        # 128x72 thumbnail lies below the last whole 16-pixel tile.
+        wide = rng_e.integers(0, 256, (72, 128, 3), dtype=np.uint8)
+        strip = wide.copy()
+        strip[66:71, 8:60] = 255 - strip[66:71, 8:60]
+        ed_ok = (ed_ok and tile_mads(wide, strip, 16).shape == (5, 8)
+                 and local_edit(wide, strip, absdiff_mean(wide, strip), 4.0))
+        # ...and is shown without a suggestion, whichever copy is the keeper
+        import shutil as _she
+        import tempfile as _tfe
+        tde = _tfe.mkdtemp()
+        recs_le = [{'p': 'clean.png', 'b': 900, 'sha': 'a' * 64, 'w': 40, 'h': 40},
+                   {'p': 'stamped.png', 'b': 800, 'sha': 'b' * 64, 'w': 40, 'h': 40}]
+        _a = [os.path.join(tde, n_) for n_ in ('l.txt', 'r.py', 'r.bat', 'r.sh')]
+        e_le = {(0, 1), (1, 0)}
+        sug_plain = write_list_and_script(
+            _a[0], _a[1], _a[2], _a[3], recs_le, [], [(0, [1], [0, 1])], tde,
+            [], e_le)[3]
+        sug_edit = write_list_and_script(
+            _a[0], _a[1], _a[2], _a[3], recs_le, [], [(0, [1], [0, 1])], tde,
+            [], e_le, no_suggest=e_le)[3]
+        _she.rmtree(tde, ignore_errors=True)
+        ed_ok = ed_ok and sug_plain == ['stamped.png'] and sug_edit == []
+        recs_s = [{'w': 60 if i == 0 else 40, 'h': 40, 'b': 100, 'qsum': 1}
+                  for i in range(4)]                     # 0 is the best copy
+        e_s = {(1, 2), (2, 1), (1, 3), (3, 1)}            # the DROP matched 2 and 3
+        tb_s, ib_s = build_tier_b([[1, 2, 3]], recs_s, [(0, [1], [0, 1])], edges=e_s)
+        st_ok = (tb_s == [(0, [2, 3], [0, 2, 3])] and ib_s == []
+                 and (0, 2) in e_s and (3, 0) in e_s)
+        big = list(range(17))
+        tc_all = build_tier_c([big], recs_s + [{'w': 1, 'h': 1, 'b': 1}] * 13,
+                              [(0, big[1:16], big[:16])])
+        tc_s, _f, _g = cap_c_groups(tc_all)
+        cap_ok = tc_all == [[0, 16]] and tc_s == [[0, 16]]
+        v443 = al_ok and ed_ok and st_ok and cap_ok
+        print('  [%s] transparency outranks a flatten, a local edit is reviewed, '
+              'a stand-in keeper inherits the edges, the Tier C cap sees pictures'
+              % ('PASS' if v443 else 'FAIL'))
+        if not v443:
+            print('         alpha %s edit %s stand-in %s cap %s' % (al_ok, ed_ok, st_ok, cap_ok))
+        ok = ok and v443
+    except Exception as exc:
+        print('  [FAIL] v4.4.3 rules: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
     # Two thumbnails of different shapes must score the same whichever file
     # comes first: resizing "the second to the first" differed by direction,
     # and the same pair under swapped names could straddle the Tier A gate.
@@ -3346,6 +4496,104 @@ def self_test():
             print('  [FAIL] recycle length limit: %s: %s'
                   % (type(exc).__name__, exc))
             ok = False
+
+    # Two pictures with almost nothing in them are close in every absolute
+    # measure. A pair is pre-marked, a luma match or a rotated copy only
+    # when what little they show lines up.
+    try:
+        dark_a = np.full((64, 96, 3), 28, dtype=np.uint8)
+        dark_b = dark_a.copy()
+        dark_a[10:12, :] = 56
+        dark_a[40:42, :] = 56           # two divider lines
+        dark_b[20:22, :] = 56
+        dark_b[50:52, :] = 56           # two others
+        rng_s = np.random.default_rng(3)
+        photo_s = rng_s.integers(0, 256, (64, 96, 3), dtype=np.uint8)
+        resave_s = np.clip(photo_s.astype(np.int16) + rng_s.integers(
+            -3, 4, photo_s.shape), 0, 255).astype(np.uint8)
+        grey_s = np.repeat((photo_s @ _LUMA_W).round().astype(np.uint8)[:, :, None],
+                           3, axis=2)
+        dark_g = np.repeat((dark_b @ _LUMA_W).round().astype(np.uint8)[:, :, None],
+                           3, axis=2)
+        TH_s = [dark_a, dark_b, photo_s, resave_s, grey_s, dark_g,
+                np.ascontiguousarray(dark_b[::-1, ::-1])]
+        _m, _l, e_s = compute_mads(TH_s, [(0, 1), (2, 3)], 1,
+                                   np.array([True, True]), 0.0,
+                                   edit_gate=4.0, procs=0)
+        st_ok = (_m[0] <= 4.0 and int(e_s[0]) == 2 and int(e_s[1]) == 0
+                 and luma_corr(TH_s, 2, 3) > 0.99
+                 and luma_mad_pair(TH_s, 2, 4) <= 4.0
+                 and luma_mad_pair(TH_s, 0, 5) == 255.0
+                 and oriented_mad(TH_s, 0, 6)[0] <= 4.0
+                 and not oriented_match(TH_s, 0, 6, 4.0)[2])
+        print('  [%s] low-detail pictures that do not line up are not '
+              'duplicates, luma matches or rotated copies'
+              % ('PASS' if st_ok else 'FAIL'))
+        ok = ok and st_ok
+    except Exception as exc:
+        print('  [FAIL] structure checks: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A stored path must name a file below the scanned folder, and the
+    # parts of an inventory are read in the order they were written.
+    try:
+        import shutil as _shp
+        import tempfile as _tfp
+        esc_ok = (all(escapes_root(x) for x in (
+            '../out/a.jpg', 'a/../../b.jpg', '/etc/passwd', '', None))
+            and not any(escapes_root(x) for x in (
+                'a.jpg', 'sub/a..b.jpg', '..hidden/a.jpg', 'a/b/c.png')))
+        if os.name == 'nt':
+            esc_ok = esc_ok and all(escapes_root(x) for x in (
+                'C:\\x\\a.jpg', '..\\out\\a.jpg', 'a\\..\\..\\b.jpg'))
+        tdp = _tfp.mkdtemp()
+        want_p = ['scan.jsonl'] + ['scan.part%d.jsonl' % k for k in range(2, 13)]
+        for nm in want_p + ['scan.partial.jsonl', 'scan.part2x.jsonl']:
+            open(os.path.join(tdp, nm), 'w').close()
+        got_p = [os.path.basename(q) for q in
+                 inventory_parts(os.path.join(tdp, 'scan.part7.jsonl'))]
+        alone = [os.path.basename(q) for q in
+                 inventory_parts(os.path.join(tdp, 'scan.partial.jsonl'))]
+        _shp.rmtree(tdp, ignore_errors=True)
+        parts_ok = got_p == want_p and alone == ['scan.partial.jsonl']
+        print('  [%s] a path outside the folder is refused; inventory parts '
+              'are read in written order' % ('PASS' if esc_ok and parts_ok
+                                             else 'FAIL'))
+        ok = ok and esc_ok and parts_ok
+    except Exception as exc:
+        print('  [FAIL] paths and parts: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    # A Tier B keeper whose editable line is in a Tier A cluster stays the
+    # keeper: labelled on its reference line, and the crops matched with it
+    # are suggested against it rather than relabelled.
+    try:
+        import shutil as _shr
+        import tempfile as _tfr
+        tdr = _tfr.mkdtemp()
+        recs_r = [{'p': 'full.png', 'b': 900, 'sha': 'a' * 64, 'w': 80, 'h': 80},
+                  {'p': 'full_copy.jpg', 'b': 300, 'sha': 'b' * 64, 'w': 80, 'h': 80},
+                  {'p': 'crop_a.png', 'b': 200, 'sha': 'c' * 64, 'w': 60, 'h': 60},
+                  {'p': 'crop_b.png', 'b': 150, 'sha': 'd' * 64, 'w': 50, 'h': 50}]
+        e_r = {(0, 2), (2, 0), (0, 3), (3, 0)}
+        _n, L_r, _at, sug_r, _all = write_list_and_script(
+            os.path.join(tdr, 'l.txt'), os.path.join(tdr, 'R.py'),
+            os.path.join(tdr, 'R.bat'), os.path.join(tdr, 'R.sh'),
+            recs_r, [(0, [1], [0, 1])], [(0, [2, 3], [0, 2, 3])], tdr, [],
+            e_r, {(0, 1), (1, 0)})
+        _shr.rmtree(tdr, ignore_errors=True)
+        ref_line = [x for x in L_r if 'also in cluster' in x and 'full.png' in x]
+        crops = [x for x in L_r if x.startswith('.  crop_')]
+        rk_ok = (len(ref_line) == 1 and 'suggested keeper' in ref_line[0]
+                 and len(crops) == 2
+                 and not any('suggested keeper' in x or 'linked' in x for x in crops)
+                 and sorted(sug_r) == ['crop_a.png', 'crop_b.png'])
+        print('  [%s] a Tier B keeper that is edited in Tier A keeps its label '
+              'and its suggestions' % ('PASS' if rk_ok else 'FAIL'))
+        ok = ok and rk_ok
+    except Exception as exc:
+        print('  [FAIL] reference keeper: %s: %s' % (type(exc).__name__, exc))
+        ok = False
 
     print('')
     # called first, then ANDed - the reverse would short-circuit the whole
@@ -3510,12 +4758,21 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
           'suggested keeper, while a copy it was matched with stays unmarked, so a '
           'picture never loses its last copy. Tier C is weaker evidence: all '
           'unmarked, no suggested keeper, still markable one file at a time.</p>')
+    gaps = ''
+    if stats.get('unreadable'):
+        gaps += ' %d file%s could not be read and %s not compared.' % (
+            stats['unreadable'], '' if stats['unreadable'] == 1 else 's',
+            'was' if stats['unreadable'] == 1 else 'were')
+    if stats.get('partial'):
+        gaps += ' The scan did not finish, so part of the folder is missing.'
     if not tier_a and not tier_b and not (tier_c or []):
         A('<p class="sub" style="color:var(--keep);font-weight:600">'
-          'No duplicates found &mdash; every image in this folder is distinct. '
-          'No selection list or deletion script was generated.</p>')
-    A('<p class="sub">%s images in <code>%s</code>. %s</p>'
-      % (stats['n'], esc(root), esc(stats['headline'])))
+          'No duplicates found &mdash; %s. '
+          'No selection list or deletion script was generated.</p>'
+          % ('among the images that were compared' if gaps
+             else 'every image in this folder is distinct'))
+    A('<p class="sub">%s images in <code>%s</code>. %s%s</p>'
+      % (stats['n'], esc(root), esc(stats['headline']), esc(gaps)))
     A('<p class="sub">Cluster numbers match the selection list exactly &mdash; '
       'search the .txt for <code>cluster 91</code> to find the same group. '
       'Click a number to link straight to it.</p>')
@@ -3523,6 +4780,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     if plan:
         for cl_id, key, keeper, editable, refs in plan:
             plan_by_key.setdefault(key, []).append((cl_id, keeper, editable, refs))
+    refk = reference_keepers(plan, tier_b) if plan else {}
 
     def shown_drops(key, tier):
         """How many files this tier actually offers HERE.
@@ -3541,7 +4799,7 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             return sum(len(ed) for _c, _kp, ed, _r in plan_by_key[key])
         if not plan:
             return sum(len(d) for _, d, _ in tier)
-        return sum(len([m for m in ed if m != kp])
+        return sum(len([m for m in ed if m != kp or _c in refk])
                    for _c, kp, ed, _r in plan_by_key[key])
 
     A('<div class="stats">')
@@ -3612,7 +4870,11 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
             # all, and the whole point of the list is that the choice is
             # yours. Tier C has no suggested keeper at all: every tile is
             # the same weaker-evidence review mark.
-            if key != 'C' and keeper is not None:
+            # the keeper Tier B elected, when it is one of the references:
+            # its tile below says KEEP, and no editable member does
+            rk = refk.get(cl_id)
+            true_k = keeper if rk is None else rk
+            if key != 'C' and keeper is not None and rk is None:
                 krel = recs[keeper]['p']
                 ktog = ''
                 if live and krel in (editable_at or {}):
@@ -3621,11 +4883,12 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 if cl_id is not None:
                     clusters.setdefault(cl_id, []).append(krel)
                 A('<div class="it k"%s%s><img src="data:image/jpeg;base64,%s" alt="">'
-                  '<div class="lb">KEEP</div><div class="fn">%s<br>%s</div>%s</div>'
+                  '<div class="lb">KEEP</div><div class="fn" title="%s">%s<br>%s</div>%s</div>'
                   % ((' data-p="%s"' % esc(krel)) if ktog else '',
                      (' data-cl="%s"' % cl_id) if ktog else '',
-                     small_b64(recs[keeper]), meta(keeper), esc(krel[:44]), ktog))
-            shown_ed = list(editable) if key == 'C' else [
+                     small_b64(recs[keeper]), esc(krel), meta(keeper),
+                     esc(krel[:44]), ktog))
+            shown_ed = list(editable) if (key == 'C' or rk is not None) else [
                 m for m in editable if m != keeper]
             for d in shown_ed:
                 if key == 'C':
@@ -3644,8 +4907,8 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 # so it does not split WEAKER vs LINKED on that axis.
                 if key != 'C':
                     _edges = b_edges if key == 'B' else a_edges
-                    if (_edges is not None and keeper is not None
-                            and (keeper, d) not in _edges):
+                    if (_edges is not None and true_k is not None
+                            and (true_k, d) not in _edges):
                         cls, lab = 'x', 'LINKED'
                         if key == 'A':
                             on = ''          # chained: not pre-marked any more
@@ -3665,11 +4928,11 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 if cl_id is not None:
                     clusters.setdefault(cl_id, []).append(rel)
                 A('<div class="it %s%s"%s%s><img src="data:image/jpeg;base64,%s" alt="">'
-                  '<div class="lb">%s</div><div class="fn">%s<br>%s</div>%s</div>'
+                  '<div class="lb">%s</div><div class="fn" title="%s">%s<br>%s</div>%s</div>'
                   % (cls, on,
                      (' data-p="%s"' % esc(rel)) if tog else '',
                      (' data-cl="%s"' % cl_id) if tog else '',
-                     small_b64(recs[d]), lab, meta(d), esc(rel[:44]), tog))
+                     small_b64(recs[d]), lab, esc(rel), meta(d), esc(rel[:44]), tog))
             for r in refs:
                 # Counted as a member here even though it is edited
                 # elsewhere: the recycler treats an unmarked reference as a
@@ -3678,9 +4941,10 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
                 if cl_id is not None and recs[r]['p'] in (editable_at or {}):
                     clusters.setdefault(cl_id, []).append(recs[r]['p'])
                 A('<div class="it r"><img src="data:image/jpeg;base64,%s" alt="">'
-                  '<div class="lb">IN CLUSTER %s</div><div class="fn">%s<br>%s</div></div>'
-                  % (small_b64(recs[r]), home.get(r, '?') if home else '?',
-                     meta(r), esc(recs[r]['p'][:44])))
+                  '<div class="lb">%sIN CLUSTER %s</div><div class="fn" title="%s">%s<br>%s</div></div>'
+                  % (small_b64(recs[r]), 'KEEP &middot; ' if r == rk else '',
+                     home.get(r, '?') if home else '?',
+                     esc(recs[r]['p']), meta(r), esc(recs[r]['p'][:44])))
             A('</div></div>')
     A('<footer><b>Method.</b> ' + esc(stats['method']) +
       '<br><br><b>Guarantees.</b> Every file appears at most once as a deletion candidate, '
@@ -3787,9 +5051,16 @@ document.addEventListener('keydown',function(e){
   // nothing gets cut, so there is no visible cause. Alt+Left/Right is
   // browser Back/Forward, which preventDefault was cancelling.
   if(e.ctrlKey||e.metaKey||e.altKey)return;
-  if(e.key==='ArrowRight'||e.key==='j'){cur=Math.min(cur+1,tiles.length-1);}
-  else if(e.key==='ArrowLeft'||e.key==='k'){cur=Math.max(cur-1,0);}
-  else if(e.key==='x'||e.key==='X'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'),tiles[cur]);return;}
+  // On a Russian, Greek, Hebrew or Arabic layout the X key types another
+  // letter, so e.key never equals 'x' and the shortcut did nothing, with
+  // no message. The key's POSITION is used there. A Latin layout keeps its
+  // own letters: on Dvorak or AZERTY the printed X is what toggles.
+  var k=e.key||'', c=e.code||'';
+  if(!/^[a-zA-Z]$/.test(k)&&/^Key[A-Z]$/.test(c))k=c.charAt(3);
+  k=k.length===1?k.toLowerCase():k;
+  if(k==='ArrowRight'||k==='j'){cur=Math.min(cur+1,tiles.length-1);}
+  else if(k==='ArrowLeft'||k==='k'){cur=Math.max(cur-1,0);}
+  else if(k==='x'){if(tiles[cur])toggle(tiles[cur].getAttribute('data-p'),tiles[cur]);return;}
   else return;
   paint(); if(tiles[cur])tiles[cur].scrollIntoView({block:'nearest',inline:'center'});
   e.preventDefault();});
@@ -3803,8 +5074,15 @@ paint();
 
 def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                           tier_a, tier_b, root, info_b=None, b_edges=None,
-                          a_edges=None, tier_c=None, c_edges=None):
+                          a_edges=None, tier_c=None, c_edges=None,
+                          no_suggest=None):
     """Writes the list and the three recyclers.
+
+    no_suggest: pairs (both directions) that are a picture and its local
+    edit. A member matched with the keeper through one is shown for review
+    and never suggested, so neither the report's "mark all suggestions"
+    nor the recycler's bulk answer can bin an original to keep its
+    watermarked copy.
 
     Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
     three so the report can offer the same edits in a browser:
@@ -3840,6 +5118,7 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     for _k, _drops, _m in tier_b:
         b_sugg.update(_drops)
     editable_at, suggested_b, tier_b_all = {}, [], []
+    refk = reference_keepers(plan, tier_b)
 
     L = ['# ' + '=' * 74,
          '#  DUPLICATE SELECTION LIST',
@@ -3886,10 +5165,13 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
         if not editable:
             L.append('#  (information only - every member of this cluster is'
                      ' editable in another cluster)')
+        # the keeper Tier B elected, when it is one of the references
+        rk = refk.get(cl_id)
+        true_k = keeper if rk is None else rk
         for i in refs:
             L.append('#  also in cluster %d (edit it there): %s   [%s]'
                      % (home[i], list_safe(recs[i]['p']),
-                        info(i, False, weaker=(key == 'C'))))
+                        info(i, i == rk, weaker=(key == 'C'))))
             if editable:
                 # reference rows exist so the recycler can count them as
                 # witnesses; a reference-only cluster has nothing to delete,
@@ -3899,10 +5181,10 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
                              't': key})
         for i in ([keeper] + [m for m in editable if m != keeper] if editable else []):
             weaker = (key == 'C')
-            is_keeper = (i == keeper) and not weaker
+            is_keeper = (i == keeper) and not weaker and rk is None
             edges = (c_edges if key == 'C' else b_edges if key == 'B' else a_edges)
             linked = (not weaker and not is_keeper and edges is not None
-                      and keeper is not None and (keeper, i) not in edges)
+                      and true_k is not None and (true_k, i) not in edges)
             if list_safe(recs[i]['p']) != recs[i]['p']:
                 # A control character in a filename (a newline above all)
                 # would let the file's own name FORGE mark lines: writing it
@@ -3957,7 +5239,9 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
             # binning the animation itself.
             sd = 1 if (key == 'B' and not is_keeper and not linked
                        and i in b_sugg and recs[i]['p'] in editable_at
-                       and media_kind(recs[i]) == media_kind(recs[keeper])) else 0
+                       and (true_k, i) not in (no_suggest or ())
+                       and media_kind(recs[i]) == media_kind(recs[true_k])
+                       and anim_compatible(recs[i], recs[true_k])) else 0
             if sd:
                 suggested_b.append(recs[i]['p'])
             # Keepers included: "Clear Tier B marks" has to be able to undo
@@ -3983,16 +5267,28 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     # implementations of these rules would drift, and this project has
     # already been bitten by exactly that (see "launcher fleet drift", v3).
     trash_src = _vendored_trash_source()
-    manifest = json.dumps(rows, ensure_ascii=False, indent=1)
-    try:
-        manifest.encode('utf-8')
-    except UnicodeEncodeError:        # a lone surrogate: see list_safe
-        manifest = json.dumps(rows, indent=1)
+    def lit(obj, indent=None):
+        # The text is pasted into a .py file, where it is read as a PYTHON
+        # literal. ASCII-escaped JSON writes an emoji as two \u escapes,
+        # which JSON joins back into one character and Python does not: the
+        # folder name then held two lone surrogates (fatal on Linux and
+        # macOS, where they cannot be encoded for the OS), and a manifest
+        # that fell back to escaping - one lone surrogate anywhere in it -
+        # stopped matching every emoji name in the list. So: real UTF-8
+        # where the text allows it, and json.loads at run time where it
+        # does not.
+        s = json.dumps(obj, ensure_ascii=False, indent=indent)
+        try:
+            s.encode('utf-8')
+            return s
+        except UnicodeEncodeError:    # a lone surrogate: see list_safe
+            return 'json.loads(%r)' % json.dumps(obj, indent=indent)
+
     py = (PY_RECYCLER_TEMPLATE
           .replace('__TRASH_MODULE__', trash_src)
-          .replace('__ROOT_JSON__', json.dumps(root))
-          .replace('__LIST_JSON__', json.dumps(os.path.basename(list_path)))
-          .replace('__MANIFEST_JSON__', manifest))
+          .replace('__ROOT_JSON__', lit(root))
+          .replace('__LIST_JSON__', lit(os.path.basename(list_path)))
+          .replace('__MANIFEST_JSON__', lit(rows, indent=1)))
     with open(py_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(py)
     try:
@@ -4094,42 +5390,80 @@ __TRASH_MODULE__
 
 
 def sha256_of(path):
+    """(hex digest, None) or (None, the OS error): a file that cannot be
+    READ is not a file that changed, and the two used to print the same
+    line. An exclusive lock (an editor, a sync client, an antivirus scan)
+    said "contents changed since the scan - verify by hand"."""
     h = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
             for chunk in iter(lambda: f.read(1 << 20), b''):
                 h.update(chunk)
-    except OSError:
-        return None
-    return h.hexdigest()
+    except OSError as e:
+        return None, e
+    return h.hexdigest(), None
 
 
 def abspath_of(e):
     return os.path.join(ROOT, *e['rel'].split('/'))
 
 
-def entry_ok(e):
-    """Still the file the scan saw: exists, same size, same hash."""
+def outside_root(rel):
+    """A manifest path that is not a file below ROOT: absolute, or climbing
+    out through '..'. Analyze never writes one, and nothing here deletes
+    through one."""
+    norm = rel.replace('\\', '/') if os.name == 'nt' else rel
+    if not rel or norm.startswith('/') or os.path.isabs(rel) \
+            or os.path.splitdrive(rel)[0]:
+        return True
+    return any(part == '..' for part in norm.split('/'))
+
+
+def entry_state(e):
+    """'ok' when the file is still the one the scan saw (exists, same size,
+    same hash), 'missing', 'changed', 'outside', or 'unreadable: <why>'."""
+    if outside_root(e['rel']):
+        return 'outside'
     full = abspath_of(e)
     try:
         if not os.path.isfile(full):
-            return False
+            return 'missing'
         if os.path.getsize(full) != e['size']:
-            return False
-    except OSError:
-        return False
-    return sha256_of(full) == e['sha']
+            return 'changed'
+    except OSError as err:
+        return 'unreadable: %s' % (err.strerror or err)
+    digest, err = sha256_of(full)
+    if err is not None:
+        return 'unreadable: %s' % (err.strerror or err)
+    return 'ok' if digest == e['sha'] else 'changed'
+
+
+def entry_ok(e):
+    return entry_state(e) == 'ok'
 
 
 _VERIFIED = {}
 
 
-def verified(e):
-    """entry_ok, remembered: a surviving copy can be asked about twice."""
+def state_of(e):
+    """entry_state, remembered: a surviving copy can be asked about twice."""
     got = _VERIFIED.get(e['rel'])
     if got is None:
-        got = _VERIFIED[e['rel']] = entry_ok(e)
+        got = _VERIFIED[e['rel']] = entry_state(e)
     return got
+
+
+def verified(e):
+    return state_of(e) == 'ok'
+
+
+def explain(state):
+    if state.startswith('unreadable'):
+        return ('could not be read (%s) - is it open in another program?'
+                % state.split(': ', 1)[1])
+    if state == 'outside':
+        return 'is not inside the scanned folder - never deleted from here'
+    return 'contents changed since the scan - verify by hand'
 
 
 def _file_ids(path, follow):
@@ -4364,6 +5698,7 @@ def main():
         clusters.setdefault(e['cl'], []).append(e)
 
     plan, pending, skipped, total_bytes = [], [], 0, 0
+    gone = 0
     for cl in sorted(clusters):
         members = clusters[cl]
         # Deletable here only if this cluster OWNS the row. A file shared
@@ -4393,11 +5728,16 @@ def main():
             full = abspath_of(e)
             name = os.path.basename(e['rel'])
             if not os.path.lexists(full):
+                # the usual re-run: the previous run trashed it. It used to
+                # be a silent count, and "0 verified, 3 skipped" read as if
+                # three hash checks had failed.
+                print('  [SKIP] %s - already gone (trashed earlier?)' % name)
                 skipped += 1
+                gone += 1
                 continue
             if not verified(e):
                 print('  [SKIP] %s' % name)
-                print('         contents changed since the scan - verify by hand')
+                print('         %s' % explain(state_of(e)))
                 skipped += 1
                 continue
             ok, why = precheck(full)
@@ -4433,7 +5773,7 @@ def main():
     for cl, keeps, good in pending:
         for e, full, name in good:
             nbs = set(e['nb']) if 'nb' in e else None
-            witness = same = None
+            witness = same = unread = None
             direct = False
             for k in keeps:
                 if nbs is not None and k['rel'] not in nbs:
@@ -4445,6 +5785,8 @@ def main():
                 if verified(k):
                     witness = k
                     break
+                if state_of(k).startswith('unreadable'):
+                    unread = unread or k
             if witness is None:
                 print('  [SKIP] %s  (cluster %d)' % (name, cl))
                 if not direct:
@@ -4454,6 +5796,9 @@ def main():
                     print('         its unmarked copy %s is the same file on disk'
                           % os.path.basename(same['rel']))
                     print('         (a symlink, junction or hard link). Re-scan first.')
+                elif unread is not None:
+                    print('         its unmarked copy %s %s'
+                          % (os.path.basename(unread['rel']), explain(state_of(unread))))
                 else:
                     print('         no unmarked copy of it still verifies against the')
                     print('         scan - the survivor would be unproven. Re-scan first.')
@@ -4467,7 +5812,10 @@ def main():
           % (len(plan), skipped, total_bytes / 1048576.0))
     print('')
     if not plan:
-        print('  Nothing survived verification. Done.')
+        if gone and gone == skipped:
+            print('  Nothing left to do: every marked file is already gone.')
+        else:
+            print('  Nothing survived verification. Done.')
         print('')
         return 0
     try:
@@ -4481,13 +5829,19 @@ def main():
         return 0
 
     print('')
-    done = fail = 0
+    done = fail = permanent = 0
     freed = 0
     for p in plan:
         ok, detail = send_to_trash(p['path'])
         if ok:
             done += 1
             freed += p['size']
+            if detail.startswith('deleted permanently'):
+                # Windows asked (the bin is off for that drive, or the file
+                # is bigger than it) and the answer was yes: say so, rather
+                # than "in the trash" and "restore it if you change your mind"
+                print('  [GONE] %s - %s' % (p['name'], detail))
+                permanent += 1
         else:
             print('  [FAIL] %s' % p['name'])
             print('         %s' % detail)
@@ -4495,9 +5849,14 @@ def main():
     print('')
     if fail == 0:
         print('  Done. %d file(s) in the trash, %.1f MB freed.'
-              % (done, freed / 1048576.0))
+              % (done - permanent, freed / 1048576.0))
     else:
-        print('  Finished with %d failure(s). %d moved to the trash.' % (fail, done))
+        print('  Finished with %d failure(s). %d moved to the trash.'
+              % (fail, done - permanent))
+    if permanent:
+        print('  %d file(s) deleted permanently at your confirmation - those cannot'
+              % permanent)
+        print('  be restored.')
     print('  Restore anything from the trash if you change your mind.')
     print('')
     # The count of failures, capped: POSIX keeps 8 bits of an exit code, so
@@ -4531,17 +5890,41 @@ rem ---------------------------------------------------------------
 if not exist "%~dpn0.py" goto :nopy
 
 set "PYCMD="
-if defined IMGDEDUP_PYTHON set PYCMD="%IMGDEDUP_PYTHON:"=%"
-if not defined PYCMD (
-    where py >nul 2>&1
-    if not errorlevel 1 set "PYCMD=py -3"
+rem  The override is probed, as the launchers do since v4.4.2: a Python
+rem  that was uninstalled or moved left this window with nothing but
+rem  "The system cannot find the path specified." and exit code 3.
+if not defined IMGDEDUP_PYTHON goto :pick
+rem  A batch file is not python.exe (pyenv-win's python.bat is the usual
+rem  one): run from here it never returns, and this window closed with
+rem  nothing said.
+set "_OV=%IMGDEDUP_PYTHON:"=%"
+if not defined _OV goto :override_bad
+if /i "%_OV:~-4%"==".bat" goto :override_bad
+if /i "%_OV:~-4%"==".cmd" goto :override_bad
+"%IMGDEDUP_PYTHON:"=%" -c "pass" >nul 2>&1
+if errorlevel 1 goto :override_bad
+if not errorlevel 0 goto :override_bad
+set PYCMD="%IMGDEDUP_PYTHON:"=%"
+goto :run
+:override_bad
+echo [WARN] IMGDEDUP_PYTHON cannot run Python - trying the others:
+echo        "%IMGDEDUP_PYTHON:"=%"
+:pick
+where py >nul 2>&1
+if not errorlevel 1 set "PYCMD=py -3"
+if defined PYCMD goto :run
+set "_EXT="
+set "_SEEN="
+for /f "delims=" %%P in ('where python 2^>nul') do if not defined _SEEN (
+    set "_SEEN=1"
+    set "_EXT=%%~xP"
 )
-if not defined PYCMD (
-    where python >nul 2>&1
-    if not errorlevel 1 set "PYCMD=python"
-)
+if /i "%_EXT%"==".bat" goto :shim
+if /i "%_EXT%"==".cmd" goto :shim
+if defined _SEEN set "PYCMD=python"
 if not defined PYCMD goto :nopython
 
+:run
 %PYCMD% "%~dpn0.py"
 set "_RC=%ERRORLEVEL%"
 echo.
@@ -4550,6 +5933,13 @@ exit /b %_RC%
 
 :nopy
 echo [FAIL] Not found next to this file: "%~n0.py"
+echo.
+pause
+exit /b 1
+
+:shim
+echo [FAIL] "python" on PATH is a batch file, not python.exe, and cannot be
+echo        run from here. Set IMGDEDUP_PYTHON to the real python.exe.
 echo.
 pause
 exit /b 1
@@ -4615,7 +6005,12 @@ def keep_edited_list(lst, rpy):
         return None
     try:
         with open(lst, encoding='utf-8-sig') as fh:
-            lines = fh.read().splitlines()
+            # CR and LF only, as the recycler reads it: splitlines() also
+            # breaks on U+2028, U+2029 and U+0085, which a file name may
+            # hold, and the mark on such a line went unnoticed - so the
+            # edited list was replaced by the next run
+            text = fh.read()
+        lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
     except (OSError, UnicodeDecodeError):
         lines = None
     m0 = None
@@ -4631,15 +6026,21 @@ def keep_edited_list(lst, rpy):
     edited = True
     if lines is not None and m0:
         edited = False
+        seen = set()
         for ln in lines:
             if not re.match(r'^[Xx.]\s', ln):
                 continue
             body = ln[1:]
             exact = body[2:] if body.startswith('  ') else body.lstrip()
             rel = re.sub(r'\s{2,}\[[^\[\]]*\]\s*$', '', exact)
+            seen.add(rel)
             if rel in m0 and m0[rel] != ln[0].upper():
                 edited = True
                 break
+        # a line the run wrote and the user removed is an edit as well:
+        # deleting "X  file" is how some people say "leave this one"
+        if not edited and any(rel not in seen for rel in m0):
+            edited = True
     if not edited:
         return None
     stem, ext = os.path.splitext(lst)
@@ -4671,7 +6072,7 @@ def copied_folder(inv, root, recs, sample=24):
     return here if probe and hits * 2 > len(probe) else None
 
 
-def open_report_if_asked(rep):
+def open_report_if_asked(rep, found=True):
     """Find-Duplicates.bat sets IMGDEDUP_OPEN_REPORT: it cannot know the
     report's name itself, because a second scan of a folder is written to
     image-inventory-2.jsonl and its report is duplicates-2-report.html.
@@ -4679,8 +6080,12 @@ def open_report_if_asked(rep):
     if os.environ.get('IMGDEDUP_OPEN_REPORT') != '1' or not os.path.exists(rep):
         return
     print('')
-    print('Opening the report. Mark files to delete, download the list over the')
-    print('old one, then run the recycler beside it.')
+    if found:
+        print('Opening the report. Mark files to delete, download the list over the')
+        print('old one, then run the recycler beside it.')
+    else:
+        # with nothing found there is no list and no recycler to point at
+        print('Opening the report.')
     try:
         if os.name == 'nt':
             os.startfile(rep)
@@ -4793,6 +6198,17 @@ def main():
     print('Inventory: %s%s' % (os.path.basename(inv),
                                '  (+%d parts)' % (len(parts) - 1) if len(parts) > 1 else ''))
     print('Images: %d   unreadable: %d   root: %s' % (n, len(errs), root))
+    # A verdict covers only what was compared. An interrupted scan, or a
+    # library whose HEIC files all failed for want of a codec, used to end
+    # in "No duplicates found - this folder is already clean."
+    scan_state = inventory_status(inv)
+    if scan_state != 'done':
+        print('')
+        print('[WARN] The scan that wrote this inventory did not finish%s.'
+              % ('' if scan_state == 'aborted' else ' (it has no end marker)'))
+        print('       Files it never reached are not in it and were not compared.')
+        print('       Run Collect again to cover the whole folder.')
+        print('')
     copy_here = copied_folder(inv, root, recs)
     if copy_here:
         print('')
@@ -4836,47 +6252,54 @@ def main():
             print('(--sig-cut raised to %.1f to keep up with --tier-a-mad %.1f)'
                   % (sig_cut, args.tier_a_mad))
     phase('Sweeping all %d pairs ...' % (n * (n - 1) // 2))
-    cand = set(sweep_candidates(C, sig_cut))
+    swept, capped_sweep = sweep_candidates(C, sig_cut, SWEEP_MAX_PAIRS)
+    cand = set(swept)
+    del swept
+    if capped_sweep:
+        # Never let a cap be silent.
+        print('  note: %d pairs of images are within the signature cut - far more'
+              % capped_sweep[0])
+        print('        than fit in memory to score, and the sign of thousands of')
+        print('        near-identical images (scanned pages, frames of one scene).')
+        print('        Each image keeps its %d closest partners (%d pairs); the'
+              % (capped_sweep[1], capped_sweep[2]))
+        print('        rotated-copy and greyscale sweeps are skipped.')
     phase('Signature sweep kept %d pair(s); scanning embeddings ...' % len(cand))
     orient_cand = set()
     # Rotated/mirrored copies have completely different signatures, so on
     # pixels alone they never reach the scorer - DISCOVERY needs a sweep of
-    # the re-oriented signatures. When embeddings cover an image, CLIP has
-    # already nominated its rotated pairs (it is largely orientation-
-    # insensitive: a mirrored save scores ~0.98); the seven extra passes are
-    # only needed for images the embeddings CANNOT vouch for. With no
-    # embeddings that is everyone; with partial coverage it is exactly the
-    # uncovered images - a subtlety that once silently skipped them.
-    uncovered = ([] if vec is None else
-                 [i for i, r in enumerate(recs) if r['sha'] not in vec])
-    if not args.no_orient:
-        if vec is None:
-            orient_rows = None          # sweep every row
-        elif uncovered:
-            orient_rows = uncovered     # only rows CLIP cannot see
-            print('Orientation: %d image(s) lack embeddings; sweeping their '
-                  'rotations on pixels' % len(uncovered))
-        else:
-            orient_rows = []
-            print('Orientation: relying on the embeddings to nominate rotated '
-                  'and mirrored copies')
-            print('             (they are semantically identical, so CLIP '
-                  'already sees them).')
-        if orient_rows is None or orient_rows:
-            # Re-oriented signatures are pure grid permutations (see
-            # oriented_signatures) - approximate for non-square thumbs, so
-            # the full cut is used and every nominated pair is re-scored
-            # exactly downstream.
-            for k in range(1, 8):
-                for (a, b) in sweep_candidates_cross(
-                        C, oriented_signatures(C, k), sig_cut,
-                        rows=orient_rows):
-                    orient_cand.add((a, b) if a < b else (b, a))
-            orient_cand -= cand
-            cand |= orient_cand
-            if orient_cand:
-                print('Orientation sweep: %d extra candidate pair(s) to check '
-                      'for rotated / mirrored saves' % len(orient_cand))
+    # the re-oriented signatures. It runs for every image, embeddings or
+    # not. It used to be skipped for images the embeddings covered, on the
+    # reasoning that CLIP is largely orientation-insensitive; measured, 22
+    # of 51 quarter-turns score under the 0.90 neighbour floor (see
+    # sweep_candidates_oriented), so adding the embed stage LOST rotated
+    # copies the pixel-only run found.
+    if not args.no_orient and not capped_sweep:
+        # Re-oriented signatures are pure grid permutations (see
+        # oriented_signatures) - approximate for non-square thumbs, so
+        # the full cut is used and every nominated pair is re-scored
+        # exactly downstream.
+        orient_cand = set(sweep_candidates_oriented(C, sig_cut, skip=cand))
+        if orient_cand:
+            print('Orientation sweep: %d extra candidate pair(s) to check '
+                  'for rotated / mirrored saves' % len(orient_cand))
+    # Black-and-white copies of colour pictures: see sweep_grey_copies. The
+    # cut is the luma check's own gate - its coarse screen can only read
+    # lower than the full-size score it stands in for - with a quarter on
+    # top for the resampling between the two.
+    grey_cand = set() if capped_sweep else (
+        set(sweep_grey_copies(C, args.tier_a_mad * 1.25)) - cand)
+    if grey_cand:
+        print('Greyscale sweep: %d extra candidate pair(s) to check for '
+              'black-and-white copies' % len(grey_cand))
+    # Pairs here ONLY because a turned or a greyscale signature matched.
+    # Each is judged by the one test it was nominated for, and takes no
+    # part in the rest: not the pixel pass, which would resize and score a
+    # pair already known to be far apart as it stands, and not the crop
+    # matcher, which with no embeddings to object passed a black-and-white
+    # text card as a "crop" of four dark screenshots. A pair CLIP also
+    # nominates is an ordinary candidate, and is taken out again below.
+    side_only = orient_cand | grey_cand
     used_clip = False
     has_vec = None
     dense = np.zeros(n, dtype=bool)
@@ -4918,7 +6341,12 @@ def main():
         # there needed 0.95 and was lost; with --clip-neighbors 1 nearly
         # every image was. A default run on 17 or more images gathers the
         # same columns and gets the same answer as before.
+        # ...and it counts PICTURES, not files: see the density pass after
+        # the pixel scores, which is where copies can be told from
+        # neighbours. Here the nearest neighbours are only written down.
         kg = min(max(kk1, DENSE_K), n - 1)
+        nb_idx = np.zeros((n, kg), dtype=np.int32)
+        nb_ok = np.zeros((n, kg), dtype=bool)
         for a in range(0, n, block):
             b = min(n, a + block)
             Sb = V[a:b] @ V.T
@@ -4926,7 +6354,8 @@ def main():
             Sb[np.arange(b - a), rows] = -1.0        # never its own neighbour
             idxg = np.argpartition(Sb, -kg, axis=1)[:, -kg:]
             valsg = np.take_along_axis(Sb, idxg, axis=1)
-            dense[a:b] = (valsg >= 0.90).sum(axis=1) >= DENSE_K
+            nb_idx[a:b] = idxg
+            nb_ok[a:b] = valsg >= 0.90
             if kg > kk1:
                 sel = np.argpartition(valsg, -kk1, axis=1)[:, -kk1:]
                 idx1 = np.take_along_axis(idxg, sel, axis=1)
@@ -4950,7 +6379,10 @@ def main():
             gj = idx[ri, ci]
             lo = np.minimum(gi, gj)
             hi = np.maximum(gi, gj)
-            cand.update(zip(lo.tolist(), hi.tolist()))
+            found = list(zip(lo.tolist(), hi.tolist()))
+            cand.update(found)
+            if side_only:
+                side_only.difference_update(found)
         used_clip = True
         if capped:
             # Never let a cap be silent - say how many images were limited
@@ -4983,7 +6415,26 @@ def main():
     # score: exact pixel difference for every candidate pair (threaded), then
     # crop-containment only for the pairs whose tier B decision needs it.
     phase('Scoring %d candidate pairs on pixels ...' % len(cand))
-    mads = compute_mads(TH, cand, workers)
+    # The luma check asks its coarse 8x8 question of every pair here, so the
+    # pixel pass can score luma for the ones that may need it while each
+    # pair is resized anyway (see compute_mads). Same signatures, same
+    # formula and same margin as the luma phase below, in chunks because
+    # the candidate list can run to millions.
+    luma_mask = np.zeros(len(cand), dtype=bool)
+    if cand:
+        CLc = C.reshape(len(C), 64, 3) @ np.array([0.299, 0.587, 0.114],
+                                                  dtype=np.float32)
+        CLc = CLc - CLc.mean(1, keepdims=True)
+        ca = np.fromiter((p[0] for p in cand), dtype=np.int64, count=len(cand))
+        cb = np.fromiter((p[1] for p in cand), dtype=np.int64, count=len(cand))
+        for s0 in range(0, len(cand), 200000):
+            s1 = s0 + 200000
+            luma_mask[s0:s1] = (np.abs(CLc[ca[s0:s1]] - CLc[cb[s0:s1]]).mean(1)
+                                <= args.tier_a_mad * 3.0)
+        del CLc, ca, cb
+    mads, lum_pre, edit_pre = compute_mads(TH, cand, workers, luma_mask,
+                                           args.tier_b_mad,
+                                           edit_gate=args.tier_a_mad)
 
     def cos_of(i, j):
         # "no embedding for this image" must read as UNKNOWN (None), not 0.0 -
@@ -4995,6 +6446,45 @@ def main():
         # matrix is no longer materialized (see the blocked scan above)
         return float(V[i] @ V[j])
 
+    if used_clip:
+        # Density counts PICTURES, not files. Byte-identical twins carry
+        # identical vectors, and re-encodes or resizes near-identical ones,
+        # so a picture with 16 copies made itself "dense" on its own
+        # copies: its crops then needed NCC 0.95 instead of 0.90 and were
+        # refused the CLIP shortcut. Copies are byte twins, and pairs that
+        # pass everything Tier A asks - the pixel gate, the CLIP floor, and
+        # a structure that lines up with no local edit - and each group of
+        # them counts once, and never against itself. Nothing looser. The
+        # signature sweep's candidates were tried as the grouping and they
+        # chain (review candidates on a 3,000-image corpus of overlapping
+        # crops: 427 -> 1,488). The pixel gate alone was tried next and it
+        # let the pocket the rule exists for through: on a real library,
+        # screenshots of one video-call app - black frame, small shared
+        # document, the same buttons - sat within 4 grey levels of each
+        # other in numbers, became "one picture", and the pocket stopped
+        # being dense: 220 pairs of different screenshots entered review
+        # that v4.4.2 had kept out. Their CLIP cosines were 0.86 to 0.95;
+        # a copy's is 0.99.
+        pix = UF()
+        for t, (i, j) in enumerate(cand):
+            if mads[t] <= args.tier_a_mad and edit_pre[t] == 0:
+                c_ij = cos_of(i, j)
+                if c_ij is None or c_ij >= args.tier_a_cos:
+                    pix.union(i, j)
+        for members in exact:
+            for i in members[1:]:
+                pix.union(members[0], i)
+        gid = np.arange(n, dtype=np.int64)
+        for i in list(pix.p):
+            gid[i] = pix.find(i)
+        G = np.where(nb_ok, gid[nb_idx], -1)
+        G = np.where(G == gid[:, None], -1, G)
+        G.sort(axis=1)
+        distinct = ((G[:, 0] >= 0).astype(np.int64)
+                    + ((G[:, 1:] != G[:, :-1]) & (G[:, 1:] >= 0)).sum(axis=1))
+        dense = distinct >= DENSE_K
+        del G, nb_idx, nb_ok
+
     need_ncc = []
     for t, (i, j) in enumerate(cand):
         m = mads[t]
@@ -5002,7 +6492,7 @@ def main():
         if (m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos):
             continue
         shortcut = clip_only_admit(m, c, dense[i], dense[j], recs[i], recs[j])
-        if m > args.tier_b_mad and not shortcut \
+        if m > args.tier_b_mad and not shortcut and edit_pre[t] != 1 \
                 and (c is None or c >= args.tier_b_cos):
             need_ncc.append((i, j))
     phase('Crop matching on %d pair(s) ...' % len(need_ncc))
@@ -5024,8 +6514,23 @@ def main():
     a_order = []             # the same pairs, in the order they were found
     tierb_pairs = []
     tierc_pairs = []
+    # Pairs that are one picture and its EDIT. Reviewed, never suggested:
+    # nothing here can tell the original from the edited copy.
+    edit_edges = set()
+    low_pairs = []
     fallback = []
-    dead_zone = oriented = 0
+    fallback_t = []          # each fallback pair's index in cand
+    dead_zone = oriented = local_edits = flat_pairs = motion_pairs = 0
+    low_detail = frame_pairs = 0
+    ncc_b = {}               # tierb index -> pair, the crop matcher's passes
+    flat_of = {}
+
+    def is_flat(x):
+        # asked only of pairs whose pixels already agree, so it stays rare
+        v = flat_of.get(x)
+        if v is None:
+            v = flat_of[x] = bool(float((TH[x] @ _LUMA_W).std()) < FLAT_STD)
+        return v
     rec601 = np.array([0.299, 0.587, 0.114], dtype=np.float32)
     sig_luma = (C.reshape(len(C), 64, 3) @ rec601).mean(1)
     for t, (i, j) in enumerate(cand):
@@ -5033,7 +6538,36 @@ def main():
         c = cos_of(i, j)
         is_dup = ((m <= args.tier_a_mad) and (c is None or c >= args.tier_a_cos)
                   and anim_compatible(recs[i], recs[j]))
-        if is_dup:
+        if (m <= max(args.tier_a_mad, args.tier_b_mad)
+                and recs[i].get('sha') != recs[j].get('sha')
+                and (is_flat(i) or is_flat(j))):
+            # Two blank thumbnails agree about nothing. Alpha is composited
+            # onto white, so white artwork on transparency - icon glyphs,
+            # logo and watermark overlays, stickers - thumbnails as a plain
+            # white square: four DIFFERENT logos scored mad 0, became one
+            # Tier A cluster and three were pre-marked X. Byte-identical
+            # files still cluster (by hash); anything else this blank is
+            # shown as weaker evidence, with nothing marked or suggested.
+            tierc_pairs.append((i, j))
+            flat_pairs += 1
+        elif (edit_pre[t] == 2 and m <= args.tier_a_mad
+              and recs[i].get('sha') != recs[j].get('sha')):
+            # The mean agrees because there is little in either picture to
+            # disagree about; what there is does not line up (DUP_CORR).
+            # Weaker evidence, whatever CLIP says: as a review pair it
+            # linked the dark crops of different pictures into one cluster.
+            # Decided after the orientation check below: a plain picture and
+            # its own rotated copy meet here too, and do line up once turned.
+            low_pairs.append((i, j))
+        elif is_dup and edit_pre[t] == 1:
+            # The mean agrees, one region does not: a pasted patch, a
+            # watermark, a redaction. Same picture, so it is reviewed, but
+            # pre-marking either copy would delete an original to keep its
+            # edit as often as the reverse (LOCAL_EDIT_MAD).
+            tierb_pairs.append((i, j))
+            edit_edges.update(((i, j), (j, i)))
+            local_edits += 1
+        elif is_dup:
             a_order.append((i, j))
             a_edges.add((i, j))
             a_edges.add((j, i))
@@ -5045,14 +6579,47 @@ def main():
             # reads 0.96, under the Tier A floor. CLIP's cosine has a high
             # baseline and is the weaker signal here, so it may ASK for review
             # but must not silently discard. Nothing is pre-marked.
+            #
+            # Unless the difference sits in ONE region and CLIP is under the
+            # review floor, or the pair is in a dense pocket: that is two
+            # screenshots of one app - the same frame and buttons, other
+            # content in the middle - not one picture. On a real library 247
+            # of 281 pairs here were of that shape, and they chained the
+            # screenshots of a video-call app into review clusters of over
+            # twenty files.
+            # Those are weaker evidence, and a genuinely edited copy that
+            # CLIP scores under 0.90 goes there with them.
+            if edit_pre[t] == 1 and c is not None and (
+                    c < args.tier_b_cos or dense[i] or dense[j]):
+                tierc_pairs.append((i, j))
+                frame_pairs += 1
+                continue
             tierb_pairs.append((i, j))
-            dead_zone += 1
+            if edit_pre[t] == 1:
+                edit_edges.update(((i, j), (j, i)))   # an edit: no suggestion
+            # Counted apart from the pairs motion refused: one line used to
+            # report both as "CLIP-vetoed", on runs with no embeddings too.
+            if not anim_compatible(recs[i], recs[j]):
+                motion_pairs += 1
+            elif c is not None and c < args.tier_a_cos:
+                dead_zone += 1
         else:
             # Tier B must stay meaningful: with a shared genre, CLIP cosine has a
             # high baseline (random pairs here average ~0.76), so structural
             # containment alone admits same-prompt re-rolls that are simply
             # different pictures. Require decent semantic agreement too.
-            if clip_only_admit(m, c, dense[i], dense[j], recs[i], recs[j]):
+            if (edit_pre[t] == 1 and (c is None or c >= args.tier_b_cos)
+                    and not (dense[i] or dense[j])):
+                # the edit lifted the mean over the gate: see local_edit().
+                # Held to the review floor and refused in a dense pocket
+                # like everything else here: of 24 such pairs on a real
+                # library 21 were screenshots of one app or another, 13 in
+                # a dense pocket and 7 under CLIP 0.90; the three edited
+                # drawings scored 0.92 and up.
+                tierb_pairs.append((i, j))
+                edit_edges.update(((i, j), (j, i)))
+                local_edits += 1
+            elif clip_only_admit(m, c, dense[i], dense[j], recs[i], recs[j]):
                 tierb_pairs.append((i, j))
             # 0.90, not the old 0.92. Measured with the grid above on 150
             # real images: an 80% crop goes from 84% accepted to 91%, an 85%
@@ -5069,13 +6636,30 @@ def main():
                                    bool(dense[i]), bool(dense[j]),
                                    float(sig_luma[i]), float(sig_luma[j]))
                 if lane == 'B':
+                    ncc_b[len(tierb_pairs)] = (i, j)
                     tierb_pairs.append((i, j))
                 elif lane == 'C':
                     tierc_pairs.append((i, j))
                 else:
                     fallback.append((i, j))
+                    fallback_t.append(t)
             else:
                 fallback.append((i, j))
+                fallback_t.append(t)
+
+    # The crop matcher's review passes: does the agreement come from what
+    # is drawn, or from the frame around it? Decided after the loop so the
+    # windows are searched together; the pairs that stay keep their place.
+    chrome = frame_only_pairs(TH, list(ncc_b.values()), workers, nccs)
+    if chrome:
+        kept = []
+        for t_, p in enumerate(tierb_pairs):
+            if t_ in ncc_b and p in chrome:
+                tierc_pairs.append(p)
+            else:
+                kept.append(p)
+        tierb_pairs[:] = kept
+    frame_only = len(chrome)
 
     # --- only now, and only for what is left, the expensive questions -----
     # A high colour difference with a tiny LUMA difference means the same
@@ -5096,18 +6680,34 @@ def main():
         fb = np.fromiter((p[1] for p in fallback), dtype=np.int64, count=len(fallback))
         coarse = np.abs(CL[fa] - CL[fb]).mean(1)
         keep_l = coarse <= args.tier_a_mad * 3.0
-        luma_pairs = [fallback[t] for t in np.nonzero(keep_l)[0].tolist()]
+        kept_l = np.nonzero(keep_l)[0].tolist()
+        luma_pairs = [fallback[t] for t in kept_l]
+        luma_at = [fallback_t[t] for t in kept_l]
     else:
-        luma_pairs = []
+        luma_pairs, luma_at = [], []
     phase('Luma check on %d of %d pair(s) (coarse prefilter) ...'
           % (len(luma_pairs), len(fallback)))
-    lmads = compute_luma_mads(TH, luma_pairs, workers)
+    # scored in the pixel pass already; anything it did not cover is
+    # computed here exactly as before
+    lmads, todo = {}, []
+    for p, t in zip(luma_pairs, luma_at):
+        v = lum_pre[t]
+        if v == v:
+            lmads[p] = float(v)
+        else:
+            todo.append(p)
+    lmads.update(compute_luma_mads(TH, todo, workers))
     still = []
     for p in fallback:
         if lmads.get(p, 255.0) <= args.tier_a_mad:
             tierb_pairs.append(p)                   # same picture, desaturated
         else:
             still.append(p)
+    # the greyscale sweep's own pairs: the luma check and nothing else
+    grey_side = sorted(grey_cand & side_only)
+    for p, v in compute_luma_mads(TH, grey_side, workers).items():
+        if v <= args.tier_a_mad:
+            tierb_pairs.append(p)
     # Rotated/mirrored saves: eight resamples per pair, the most expensive
     # question asked anywhere, so it gets the same coarse screen first. The
     # 8x8 signature grid can be rotated directly - it is a permutation, no
@@ -5125,16 +6725,34 @@ def main():
         orient_list = [still[t] for t in np.nonzero(keep_o)[0].tolist()]
     else:
         orient_list = []
-    phase('Orientation check on %d of %d pair(s) (coarse prefilter) ...'
-          % (len(orient_list), len(still)))
-    omads = {} if args.no_orient else compute_oriented_mads(TH, orient_list, workers)
+    # ...and the orientation sweep's own pairs, which that sweep already
+    # screened on the same signatures
+    orient_side = sorted(orient_cand & side_only)
+    phase('Orientation check on %d of %d pair(s) (coarse prefilter)%s ...'
+          % (len(orient_list), len(still),
+             ' and %d from the orientation sweep' % len(orient_side)
+             if orient_side else ''))
+    omads = {} if args.no_orient else compute_oriented_mads(
+        TH, orient_list + orient_side + low_pairs, workers,
+        gate=args.tier_a_mad)
     leftover = []
     for p in still:
-        if omads.get(p, (255.0, ''))[0] <= args.tier_a_mad:
+        if omads.get(p, (255.0, '', False))[2]:
             tierb_pairs.append(p)                   # rotated / mirrored save
             oriented += 1
         else:
             leftover.append(p)
+    for p in orient_side:
+        if omads.get(p, (255.0, '', False))[2]:
+            tierb_pairs.append(p)
+            oriented += 1
+    for p in low_pairs:
+        if omads.get(p, (255.0, '', False))[2]:
+            tierb_pairs.append(p)
+            oriented += 1
+        else:
+            tierc_pairs.append(p)
+            low_detail += 1
     # CLIP still says same picture, crop matching did not, luma/orient did
     # not. Bounded by CLIP_TIER_C (0.97), not the 0.90 neighbour floor.
     # The dense/dark flags go in here too: without them a dense crop score
@@ -5147,12 +6765,34 @@ def main():
             tierc_pairs.append((i, j))
 
     if dead_zone:
-        print('Pixel-identical but CLIP-vetoed: %d pair(s) sent to review '
-              '(they used to be dropped)' % dead_zone)
+        print('Pixels agree but CLIP does not: %d pair(s) sent to review, '
+              'none marked' % dead_zone)
+    if motion_pairs:
+        print('Same first frame, different motion (an animation and a still, '
+              'or two animations): %d pair(s) sent to review, none marked'
+              % motion_pairs)
+    if local_edits:
+        print('Same picture with a local edit (a patch, a watermark): %d pair(s) '
+              'sent to review' % local_edits)
+    if flat_pairs:
+        print('Blank thumbnails (nothing to compare): %d pair(s) shown as weaker '
+              'evidence, none marked' % flat_pairs)
+    if low_detail:
+        print('Low-detail pictures whose pixels are close but do not line up: '
+              '%d pair(s) shown as weaker evidence, none marked' % low_detail)
+    if frame_pairs:
+        print('One frame, other content (screenshots of one app, or an edit '
+              'CLIP scores low): %d pair(s) shown as weaker evidence, none '
+              'marked' % frame_pairs)
+    if frame_only:
+        print('Crop matches that agree only where nothing is drawn (one '
+              "app's frame, one skyline under other skies): %d pair(s) "
+              'shown as weaker evidence, none marked' % frame_only)
     if oriented:
         print('Rotated / mirrored copies found: %d pair(s)' % oriented)
     if tierc_pairs:
-        print('Weaker-evidence pairs (Tier C): %d  (dense/dark NCC or CLIP-strong miss)'
+        print('Weaker-evidence pairs (Tier C): %d  (dense/dark NCC, CLIP-strong miss, '
+              'frame-only matches, blank or plain pictures)'
               % len(tierc_pairs))
 
     # Byte-identical files are duplicates by definition - cluster them even
@@ -5175,17 +6815,23 @@ def main():
         return mad_map.get((i, j) if i < j else (j, i))
 
     phase('Confirming borderline Tier A pairs at %d px ...' % CONFIRM_PX)
+    cstate = {}
     tier_a, demoted, n_hires, n_cap, n_unread = settle_tier_a(
-        recs, root, mad_of, a_edges, a_order, args.tier_a_mad)
+        recs, root, mad_of, a_edges, a_order, args.tier_a_mad, state=cstate)
     for i, j in demoted:
         a_edges.discard((i, j))
         a_edges.discard((j, i))
+    n_undec = cstate.get('undecodable', 0)
     if n_hires or n_cap or demoted or n_unread:
         print('  512 px confirm: %d pair(s) checked, %d demoted to review%s%s'
               % (n_hires, len(demoted),
-                 ', %d could not be read (left in Tier A)' % n_unread
-                 if n_unread else '',
+                 ', %d not re-checked: a file is not on this machine (left '
+                 'in Tier A)' % n_unread if n_unread else '',
                  ', %d skipped (cap %d)' % (n_cap, CONFIRM_CAP) if n_cap else ''))
+    if n_undec:
+        print('  %d of the demoted pair(s) could not be opened by this Python '
+              '(a missing codec such as pillow-heif, or a file in use), so '
+              'they were not re-checked and went to review.' % n_undec)
     for p in demoted:
         tierb_pairs.append(p)
 
@@ -5198,13 +6844,12 @@ def main():
     # members match the keeper directly and which arrived through another
     # file.
     uf_b = UF()
-    for i, j in tierb_pairs:
-        uf_b.union(i, j)
-    tier_b, info_b = build_tier_b(uf_b.groups(), recs, tier_a)
     b_edges = set()
     for i, j in tierb_pairs:
+        uf_b.union(i, j)
         b_edges.add((i, j))
         b_edges.add((j, i))
+    tier_b, info_b = build_tier_b(uf_b.groups(), recs, tier_a, edges=b_edges)
     b_seen = set(tierb_pairs)
     b_seen.update((j, i) for i, j in tierb_pairs)
     uf_c = UF()
@@ -5215,11 +6860,15 @@ def main():
         uf_c.union(i, j)
         c_edges.add((i, j))
         c_edges.add((j, i))
-    capped_c, c_omit_files, c_omit_groups = cap_c_groups(uf_c.groups())
+    # Stand-ins first, then the cap: the cap counted raw components, in
+    # which every Tier A copy of a picture is a member, so 16 copies of one
+    # picture plus one weaker match was "a genre hairball" and omitted.
+    # Collapsed onto the keeper it is a pair.
+    tier_c_all = build_tier_c(uf_c.groups(), recs, tier_a, tier_b, edges=c_edges)
+    tier_c, c_omit_files, c_omit_groups = cap_c_groups(tier_c_all)
     if c_omit_groups:
-        kept_ids = set(i for g in capped_c for i in g)
+        kept_ids = set(i for g in tier_c for i in g)
         c_edges = set(e for e in c_edges if e[0] in kept_ids and e[1] in kept_ids)
-    tier_c = build_tier_c(capped_c, recs, tier_a, tier_b)
 
     phase('')
     try:
@@ -5231,7 +6880,11 @@ def main():
         return 3
     print('Invariants: OK')
 
-    pm = premarked(tier_a, a_edges)
+    # Only files the list can actually mark: a name with a control character
+    # gets no editable line and is always kept, and counting it promised a
+    # reclaim the list and the report (which already filter) cannot deliver.
+    pm = [i for i in premarked(tier_a, a_edges)
+          if list_safe(recs[i]['p']) == recs[i]['p']]
     dn = len(pm)
     db = sum(recs[i]['b'] for i in pm)
     tot = sum(r['b'] for r in recs)
@@ -5272,7 +6925,8 @@ def main():
     bat = os.path.join(outdir, rec_name + '.bat')
     sh = os.path.join(outdir, rec_name + '.sh')
     nothing = not scan_has_output(tier_a, tier_b, info_b, tier_c)
-    stats = {'n': n, 'exact': sum(len(v) - 1 for v in exact),
+    stats = {'n': n, 'unreadable': len(errs), 'partial': scan_state != 'done',
+             'exact': sum(len(v) - 1 for v in exact),
              'headline': ('%d exact duplicates, %d visual clusters.'
                           % (sum(len(v) - 1 for v in exact), len(tier_a))),
              'method': ('SHA-256 on every file, then all %d pairs swept on an 8x8 colour '
@@ -5297,7 +6951,17 @@ def main():
         # that silently does nothing, and a stale one from an earlier run is
         # genuinely misleading. So only the report is written here.
         print('')
-        print('No duplicates found - this folder is already clean.')
+        if errs or scan_state != 'done':
+            print('No duplicates found among the %d image%s that could be compared.'
+                  % (n, '' if n == 1 else 's'))
+            if errs:
+                print('%d file%s could not be read and %s not compared.'
+                      % (len(errs), '' if len(errs) == 1 else 's',
+                         'was' if len(errs) == 1 else 'were'))
+            if scan_state != 'done':
+                print('The scan did not finish, so part of the folder is missing.')
+        else:
+            print('No duplicates found - this folder is already clean.')
         print('Wrote just the report:')
         print('   ' + rep)
         stale = [q for q in (lst, rpy, bat, sh) if os.path.exists(q)]
@@ -5317,7 +6981,7 @@ def main():
             for q in stale:
                 print('   ' + q)
         print('')
-        open_report_if_asked(rep)
+        open_report_if_asked(rep, found=False)
         return 0
 
     # The list is written first so the report can carry a copy of it. The
@@ -5333,7 +6997,7 @@ def main():
               ' by hand.')
     nrows, llines, editable_at, suggested_b, tier_b_all = write_list_and_script(
         lst, rpy, bat, sh, recs, tier_a, tier_b, root, info_b, b_edges,
-        a_edges, tier_c, c_edges)
+        a_edges, tier_c, c_edges, no_suggest=edit_edges)
     write_report(rep, recs, tier_a, tier_b, root, stats, plan, home,
                  list_lines=llines, editable_at=editable_at,
                  suggested_b=suggested_b, tier_b_all=tier_b_all,

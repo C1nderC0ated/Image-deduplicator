@@ -410,6 +410,11 @@ try:
             pass
 except Exception:
     o['torch'] = 'ERR'
+try:
+    from transformers.utils import is_torch_available
+    o['tf_torch'] = bool(is_torch_available())
+except Exception:
+    pass
 print('@@' + json.dumps(o))
 '''
 
@@ -443,6 +448,40 @@ def torch_flavour(st):
     if st.get('mps_built') or st.get('mps_ok'):
         return 'mps', 'Apple Metal'
     return 'cpu', 'CPU-only build'
+
+
+def build_name(desc):
+    """'CPU-only build', 'CUDA 12.8 build': the flavour as a noun."""
+    return desc if desc.endswith('build') else desc + ' build'
+
+
+def torch_too_old(st):
+    """Why the installed torch cannot run the Embed stage for its AGE, or ''.
+
+    transformers 5 ignores a torch older than 2.4 and then says PyTorch
+    "was not found": setup printed "Everything the toolkit needs is
+    present" over a torch 2.3 install, and the embedder died in a traceback
+    telling the user to install the package they had."""
+    ver = st.get('torch', 'ERR')
+    if ver in ('ERR', 'EMPTY'):
+        return ''
+    m = re.match(r'(\d+)\.(\d+)', ver)
+    if m and (int(m.group(1)), int(m.group(2))) < MIN_TORCH:
+        return ('torch %s is older than %d.%d, the oldest the Embed stage runs on.'
+                % (ver, MIN_TORCH[0], MIN_TORCH[1]))
+    if st.get('tf_torch') is False:
+        return ('torch %s is too old for the installed transformers %s, which '
+                'refuses to load it.' % (ver, st.get('transformers', '?')))
+    return ''
+
+
+def pip_has(name, exe=None):
+    """Whether pip lists a distribution called NAME for this interpreter."""
+    try:
+        return subprocess.run([exe or sys.executable, '-m', 'pip', 'show', name],
+                              capture_output=True, timeout=120).returncode == 0
+    except Exception:
+        return False
 
 
 def wrong_build(flav, st, vendors):
@@ -728,7 +767,12 @@ def dropped_path(arg, here):
     raw = os.environ.get('IMGDEDUP_RAWCMD')
     if not raw or not IS_WIN:
         return arg
-    low, here_n = raw.lower(), os.path.normcase(os.path.abspath(here))
+    # Lower-cased one character at a time, keeping the length: the offsets
+    # found in LOW are used on RAW, and 'I with a dot' (U+0130, in any
+    # Turkish folder name) lower-cases to TWO characters. Two of them ahead
+    # of the launcher's name cut the first letter off the dropped path.
+    low = ''.join(c.lower() if len(c.lower()) == 1 else c for c in raw)
+    here_n = os.path.normcase(os.path.abspath(here))
     i = low.find('.bat"')
     while i != -1:
         bat = raw[raw.rfind('"', 0, i) + 1:i + 4]
@@ -807,9 +851,9 @@ def pip_base(exe=None, break_system=False):
     return cmd
 
 
-def show_and_run(cmd, assume_yes, what):
+def show_and_run(cmd, assume_yes, what, verb='install'):
     print('')
-    print('  About to install %s with:' % what)
+    print('  About to %s %s with:' % (verb, what))
     print('    ' + ' '.join(('"%s"' % c if ' ' in c else c) for c in cmd))
     if not assume_yes:
         try:
@@ -1066,7 +1110,12 @@ def main():
     why = wrong_build(flav, st, vendors) if 'torch' not in need else ''
     if why:
         print('')
-        print('  torch here is a %s build, %s' % (desc, why))
+        print('  torch here is a %s, %s' % (build_name(desc), why))
+        need.append('torch')
+    old = torch_too_old(st) if 'torch' not in need else ''
+    if old:
+        print('')
+        print('  ' + old)
         need.append('torch')
     if not need:
         print('')
@@ -1147,13 +1196,21 @@ def main():
             return 1
         pick = usable[n - 1]
     print('  -> %s' % pick.label)
-    if flav != 'none':
+    # A torch that is installed but will not import (a half-finished
+    # install, a DLL that no longer loads) reads as "missing" above, and pip
+    # still counts it: "Requirement already satisfied", nothing installed,
+    # and setup printed OK over a torch that was exactly as broken as before.
+    broken = flav == 'none' and pip_has('torch')
+    if flav != 'none' or broken:
         # pip takes "torch" as already satisfied by the build that is there
         # and installs nothing from the new index, so that one goes first
         un = [sys.executable, '-m', 'pip', 'uninstall', '-y', 'torch']
         if breaksys:
             un.append('--break-system-packages')
-        if not show_and_run(un, args.yes, 'the %s torch build' % desc):
+        if not show_and_run(un, args.yes,
+                            'the torch that is installed but does not load'
+                            if broken else 'the %s of torch' % build_name(desc),
+                            verb='remove'):
             return 1
     if not show_and_run(pip_base(break_system=breaksys) + pick.args, args.yes,
                         'torch (%s)' % pick.key):
@@ -1166,6 +1223,13 @@ def main():
     after = installed_state()
     flav2, desc2 = torch_flavour(after)
     print('')
+    if flav2 == 'none':
+        # pip reported success and torch still does not import. Saying
+        # "Now installed: torch not installed" and exiting 0 sent the
+        # launcher on to a stage that could not run.
+        print('  torch was installed but does not load in this Python.')
+        print('  Run Check-Image-Tools.bat (./imgdedup.sh doctor) for the reason.')
+        return 1
     print('  Now installed: torch %s' % desc2)
     if flav2 in ('cuda', 'rocm') and not after.get('cuda_ok'):
         print('  NOTE: the build is right but no GPU is visible yet - that is')

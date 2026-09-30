@@ -28,6 +28,11 @@ rem  The override is held to the same test. Taken on trust, one naming a
 rem  file that does not exist gave the same false "A Python is installed"
 rem  and a setup command that could not start.
 if not defined IMGDEDUP_PYTHON goto :os_launcher
+rem  A batch file is never run as the Python: see _pick-python.bat.
+set "_OS_OV=%IMGDEDUP_PYTHON:"=%"
+if not defined _OS_OV goto :os_launcher
+if /i "%_OS_OV:~-4%"==".bat" goto :os_launcher
+if /i "%_OS_OV:~-4%"==".cmd" goto :os_launcher
 "%IMGDEDUP_PYTHON:"=%" -c "import sys" >nul 2>&1
 if errorlevel 0 if not errorlevel 1 set _OS_PY="%IMGDEDUP_PYTHON:"=%"
 :os_launcher
@@ -35,10 +40,19 @@ if not defined _OS_PY (
     py -3 -c "import sys" >nul 2>&1
     if errorlevel 0 if not errorlevel 1 set "_OS_PY=py -3"
 )
+set "_OS_EXT="
+set "_OS_SEEN="
+for /f "delims=" %%P in ('where python 2^>nul') do if not defined _OS_SEEN (
+    set "_OS_SEEN=1"
+    set "_OS_EXT=%%~xP"
+)
+if /i "%_OS_EXT%"==".bat" goto :os_picked
+if /i "%_OS_EXT%"==".cmd" goto :os_picked
 if not defined _OS_PY (
     python -c "import sys" >nul 2>&1
     if errorlevel 0 if not errorlevel 1 set "_OS_PY=python"
 )
+:os_picked
 
 if not defined _OS_PY (
     rem No Python at all - nothing to install INTO. Show what each said.

@@ -84,8 +84,35 @@ that the signature sweep's prefilter runs through BLAS — its bound is
 deliberately widened and every survivor is re-checked exactly, so the
 candidate set is stable, but verify rather than assume it.
 
+**Built corpora, when no real library is at hand.** v4.4.3 was measured
+on three, all made from 51 real pictures by a script outside the
+repository:
+
+- a truth set: each picture with 25 known variants (copies, re-encodes,
+  resizes, six crops, rotations, a mirror, greyscale, brightness,
+  contrast, hue, blur, a noise patch, a watermark), and a sparse one
+  with 3 variants each. Scored per variant: in a cluster with its
+  original or not, in which tier, and whether any file of another
+  picture was pre-marked.
+- 3,000 and 20,000 crops of the same pictures, each a random window
+  with a fifth of them followed by a planted copy, re-save, resize,
+  crop or rotation. The random draws can be replayed, so every file's
+  window is known and any two files can be called the same window, a
+  crop of one another, overlapping, or different pictures.
+
+They answer "did this rule find what it was built for, and what else
+did it let in". They do not replace a real library: 51 pictures cannot
+show a genre pocket, and the two crop corpora are one dense pocket of
+true crops, which is the opposite case. Treat a result there as
+necessary, not sufficient. v4.4.3 then had its A/B on a real library
+of 35,953 pictures (photos, art, screenshots, memes): both versions on
+one inventory, every pair that changed tier listed, and the changed
+pairs looked at on contact sheets. Three of the rules below were
+changed by what that showed, and the corpora had said nothing about
+any of them.
+
 **Self-tests**: `python analyze-inventory.py --self-test`. It spawns real
-worker processes, holds both signature sweeps against brute-force
+worker processes, holds the signature sweeps against brute-force
 oracles, and exercises the OpenCV-absent fallbacks. It also writes real
 files to a temporary folder and runs the generated recycler on them with
 the trash call stubbed (`_run_recycler`), so a recycler rule can be
@@ -121,24 +148,106 @@ All measured on a real 36,410-image library.
 ## Set by reasoning, not yet measured
 
 These arrived with the v4.4.2 bug fixes. Each has a stated reason, and
-none has had the real-library A/B that the settled defaults above had.
+none has had the real-library A/B that the settled defaults above had:
+the v4.4.3 A/B ran v4.4.2 against v4.4.3, so both sides carried these.
 Measure before building on them:
 
 - `FLAT_STD` **1.0**: a thumbnail whose luma standard deviation is below
   this is flat, and never counts as a crop or luma match.
-- `DENSE_K` **16**: an image is in a dense pocket when 16 or more others
-  reach CLIP 0.90 with it. It equals the default `--clip-neighbors`, so a
-  default run on a folder of 17 or more images gets the answer it
-  always did.
+- `DENSE_K` **16**: an image is in a dense pocket when 16 or more other
+  pictures reach CLIP 0.90 with it. It equals the default
+  `--clip-neighbors`. Since v4.4.3 copies count once: byte twins, and
+  pairs that pass the Tier A test (within the gate, no local edit, CLIP
+  0.99 or better), are one picture. Two wider groupings were tried and
+  refused. The signature sweep's candidates found more planted crops on
+  the 3,000-crop corpus (54 of 75 against 40), but those candidates
+  chain, and a pocket of same-app screenshots - near-identical
+  signatures, different pictures - would stop being dense, which is the
+  case the rule is for. Any pair within the gate, without the edit and
+  CLIP conditions, did the same on the real library: screenshots of one
+  app score within the gate (same frame, a little other content), so
+  they merged into one "picture", their pocket went sparse, and 147
+  review pairs of screenshots appeared. The strict grouping costs
+  planted crops on the crop corpora, 3 of 75 on the 3,000 and 32 of
+  648 on the 20,000 (the window rule below takes 3 more there), where
+  every picture has 59 or 390 windows and so is dense by
+  construction; the loose one had been merging near-solid
+  windows of one wallpaper into a "copy", thinning those pockets by
+  accident.
 - The crop matcher stops early at `C_NCC_GATE` (**0.95**), not the 0.90
   B gate, so a dense or dark pair is not capped below the score it needs.
-- The keeper ranking: frames, colour, area, full colour over palette,
-  lossless, size, `qsum`. It decides which file is proposed for deletion,
+- The keeper ranking: frames, colour, transparency, area, full colour
+  over palette, lossless, size, `qsum`. It decides which file is proposed for deletion,
   and it is a heuristic. Its known blind spot is a large upscale ranking
   over its smaller original.
 - `MIN_TORCH` **(2, 4)** and `LEGACY_CUDA_MAX` **cu126** in `_setup.py`
   follow upstream facts, transformers 5's torch floor and PyTorch's
   Turing cut-off from CUDA 12.8, and move when those do.
+
+## Calibrated on built corpora, checked on one real library
+
+These arrived with v4.4.3. Each was calibrated on the corpora described
+under "How to verify a change", then run against v4.4.2 on the 35,953
+real pictures: the three files v4.4.2 pre-marked there were all
+pictures with a small edit, and none is pre-marked now. All of these
+make Tier A narrower or add to review; none widens Tier A.
+
+- `DUP_CORR` **0.90**: a pair is pre-marked only when the two luma planes
+  correlate this well. On the 3,000-crop corpus true copies measured
+  0.976 and up, and 177 pairs of different windows inside the gate
+  measured under 0.90. The rotated-copy
+  check uses it too. `GREY_CORR` **0.95** is the same idea for the luma
+  check, and `GREY_SIG_CORR` **0.90** for the greyscale sweep's 8x8
+  signatures.
+- `LOCAL_EDIT_FINE` **20** on 8x8 tiles, for a pair inside the gate: no
+  re-encode, resize, palette or upscale of the 51 pictures went over
+  14.1 there, and 18 of 21 watermarked copies inside the gate reached
+  20. `LOCAL_EDIT_SPOT` **12** with `LOCAL_EDIT_SPOT_RATIO` **5**: a
+  smaller tile that still holds all the difference. The real library's
+  three false pre-marks sat at 16-23 on their worst tile with means of
+  0.25 to 1.7 (9 to 68 times the mean); over 407 re-encodes, resizes,
+  palette and upscale copies the worst tile never exceeded 3.8 times
+  the mean. `LOCAL_EDIT_MAD` **24** on 16x16 tiles, with
+  `LOCAL_EDIT_SAME` **0.75**, `LOCAL_EDIT_TILES` **8** and
+  `LOCAL_EDIT_TEXTURE` **4.0**, for a pair over it. A local edit is
+  admitted to review only outside a dense pocket and at CLIP 0.90 or
+  better, whichever side of the gate it is on: on the real library 247
+  of 281 within-gate pairs of that shape, and 21 of 24 over it, were
+  two screenshots of one app.
+- `WINDOW_TILE` **8**, `WINDOW_TEXTURE` **4.0**, `WINDOW_TILE_CORR`
+  **0.60**, `WINDOW_DISAGREE` **4** and `WINDOW_DISAGREE_SHARE` **0.25**:
+  at the crop matcher's 64 px window, a pass whose textured 8x8 tiles
+  (grey levels spread by 4 in either copy) fail to correlate at 0.60 in
+  four tiles and a quarter of them is weaker evidence. Measured on the
+  real library's crop-matcher review passes (67% of the same-app
+  screenshot pairs, 29% of the same-view photographs) against the 479
+  planted crops the 3,000-crop corpus admits (6%), the truth set's 97%
+  and 90% crops (3%, 2%) and its brightness, contrast, hue and
+  whole-frame copies (0%). A 128 px window catches 78% of the
+  screenshots but 15% of the crops, since a resized crop no longer
+  aligns tile by tile there; 0.70 and 0.80 correlation cost 11% and
+  21% of the crops. The check runs only on passes headed for review
+  (215 on the real library, 2,917 on the 3,000-crop corpus, about one
+  per image on the 20,000-crop one) and stops each search at the
+  window the matcher kept: 3 s, 4 s and 30 s. It is threads at the
+  matcher's own per-pair cost, and the glue between the GIL-free calls
+  means two workers do most of the work; a library with tens of
+  thousands of review passes would want the process pool the matcher
+  uses. A pass the 128 px retry admitted is left in review unjudged:
+  its 64 px window is under the gate, the alignment the retry repairs.
+- `ORIENT_NOISE_MAD` **2.0** and `ORIENT_LOWPASS_MAD` **0.75**, both
+  times the Tier A gate: a rotated pair may score up to 8 at full
+  thumbnail size when it scores 3 or less at a quarter of it. Pure
+  rotations measured 2.8 or less there; rotations with an edit on top,
+  3.5 and up at the same full-size score.
+- `ACHROMA` **2.0**: a thumbnail is greyscale when its channels differ by
+  no more than this on average.
+- `RECORD_FIELDS` **2** in the collector: bump it whenever a record
+  gains a field a later stage decides on, or a resumed scan will mix
+  records that have it with records that do not.
+- `SWEEP_MAX_PAIRS` **6,000,000**, `MAD_MP_MIN_PAIRS` **40,000** and
+  `ORIENT_MP_MIN_PAIRS` **100,000** change no decision below the first
+  and none at all for the other two.
 
 ## Measured and refuted — do not retry
 
@@ -153,6 +262,51 @@ files of 36,420 exceed it); skipping PNG EXIF; `os.scandir` (stat is
 0.03%); BGR buffers; cliques for review clusters (splits chains, so one
 picture gets several keepers); worst-frame-only and segment-averaged
 animation fingerprints.
+
+From v4.4.3:
+
+- `cv2.imdecode` for PNG in Collect: 5% faster alone and 22% slower once
+  the pixels are handed back to Pillow, which already uses zlib-ng. An
+  earlier "30% faster" was the harness charging its own copies to
+  Pillow.
+- An upscale test in the keeper rule (upscale the smaller copy to the
+  larger one's size and compare there): it caught 51 of 51 upscales and
+  13 to 20 of 51 genuinely larger originals, because a smooth picture
+  looks the same either way. The blind spot stays documented.
+- A luma sweep over every pair, to nominate recoloured copies: on the
+  3,000-crop corpus, which holds no recoloured copy of any of its
+  files, 231 extra pairs then passed the luma check. The greyscale
+  sweep is limited to a greyscale picture against a colour one, with
+  correlated layouts.
+- Threads for the pixel pass: 8 threads ran the score 1.5 times as fast
+  as one and the score plus luma 1.0 times. It is worker processes now.
+- Comparing embedding vectors as a gate for a decoder change while
+  another process uses the GPU: two runs of the same code differed in
+  930 of 1,272 vectors, at about 2e-6 cosine. Prove the pixels
+  identical instead, or measure on a quiet machine.
+- Three of the four measures tried at the crop matcher's window to
+  tell a crop from the same view on another day, or from one app's
+  frame with other content (the fourth, textured tiles that do not
+  correlate, is the `WINDOW_*` rule above). Taken at the best window,
+  both directions and every scale, on the real library's crop-matcher
+  review edges (36 among 22 sunsets from one window, 94 among
+  same-app screenshots) and on the 479 planted crops of the 3,000-crop
+  corpus that clear the 0.90 gate: the tile-mean residual after an
+  affine brightness fit (a third of the tiles off by 8 levels) marks
+  64% of the sunset edges and 12% of the screenshot edges at 7% of the
+  crops, and at the window's own resolution the screenshots' other
+  content averages out (11% at 8 levels); a stricter gate for a
+  full-frame match does not apply, since 32 of the 36 sunset edges
+  match best on a sub-window; and the window's size does not separate
+  either, the sunset windows being small (median a quarter of the
+  frame) but so are a quarter of the genuine crops. On the pairs
+  within the Tier A gate whose difference sits in one region (a new
+  line in a chat), nothing at all separates a screenshot from a
+  drawing with a retouched detail: the differing area (median 12% of
+  the tiles), its shape, the neighbour count (median 5 against 1-5 for
+  the drawings), CLIP (0.91-0.98 against 0.92-0.998) and flatness (a
+  third of the truth set's pictures are as flat as a screenshot) all
+  overlap. Those stay in review, and the README says so.
 
 **Process pools for the embed stage**: 4x slower, because each process
 reloads transformers. More importantly the premise is wrong — the prep
@@ -296,6 +450,16 @@ from v4.4.2 are worth knowing before testing one:
   its own line above. Start every launcher once with no argument, too:
   every earlier test passed a folder, which is how a double-click crash
   lasted from v4.2f to v4.4.2.
+
+And one from v4.4.3:
+
+- A batch file run from a batch file without `call` never returns. A
+  `python` that is a `.bat` shim, or an override naming one, ended every
+  launcher at its first probe with no output. `call` is not the answer:
+  it parses every argument a second time, so a `%` or `^` in a folder
+  name is lost. The launchers refuse a batch-file Python by name. Test
+  any change to the interpreter search with a `python.bat` first on PATH
+  and nothing else, and with `IMGDEDUP_PYTHON` naming one.
 
 The install paths need a distro-managed Linux: on Arch, Debian 12+,
 Ubuntu 23.04+, Fedora 38+ and Homebrew, pip refuses every install into

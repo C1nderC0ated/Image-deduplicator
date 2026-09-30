@@ -1,7 +1,7 @@
 # Image Inventorization
 
 A three-stage pipeline, plus a recycler, that finds duplicate, re-encoded, resized, rotated,
-mirrored and cropped images in large libraries. Tested from 1,500 to 36,000
+mirrored, cropped, black-and-white and locally edited images in large libraries. Tested from 1,500 to 36,000
 images. Everything runs on your own machine: nothing is uploaded, and there
 is no account to make. Runs on Windows, Linux and macOS.
 
@@ -61,7 +61,7 @@ Generated at run time, next to your images:
 
 | File | Written by | What it is |
 |------|-----------|------------|
-| `image-inventory.jsonl` (+ `.partN` above ~200 MB) | Collect | One JSON line per image: path, size, SHA-256, dimensions, colour mode, EXIF, JPEG quality fingerprint, AI-generation text chunks, 128 px thumbnail |
+| `image-inventory.jsonl` (+ `.partN` above ~200 MB) | Collect | One JSON line per image: path, size, SHA-256, dimensions, colour mode, transparency, EXIF, JPEG quality fingerprint, AI-generation text chunks, 128 px thumbnail |
 | `image-embeddings.jsonl` | Embed | One CLIP vector per unique image, keyed by SHA-256 |
 | `<name>-report.html` | Analyze | Every cluster as pictures, **numbered to match the list** — keeper green, drops red, review amber, **weaker-evidence slate** (Tier C, no suggested keeper), **linked violet-dashed** (in the group via another member, not the keeper), grey = editable in another cluster. Click any tile to mark it, including the keeper. A tile refuses with “last copy” when a marked file would be left with no unmarked copy it was matched with. “Mark all Tier B suggestions” and “Clear Tier B marks” buttons act on the review tier; there is no “Mark all Tier C”. Dark-themed, so the thumbnails stay the brightest thing on screen |
 | `<name>-list.txt` | Analyze | The selection list you edit: first character `X` = delete, `.` = keep. A re-run of Analyze keeps a list you edited as `<name>-list.edited.txt` before writing the new one |
@@ -283,7 +283,7 @@ intended); `collect-image-inventory.py` lists each exclusion and the
 reason for it. Camera RAW is not supported at all, Pillow cannot decode
 it. It writes one JSON line per
 image: relative path, byte size, mtime, **SHA-256**, format, colour mode,
-dimensions, key EXIF fields (timestamp, camera, software, orientation), a
+whether it has transparency, dimensions, key EXIF fields (timestamp, camera, software, orientation), a
 **JPEG quantization fingerprint** (`qsum`, lower means less recompressed),
 any **AI-generation text chunks** found in PNGs (Stable Diffusion /
 ComfyUI `parameters`), and a 128 px thumbnail, rotation-corrected, as JPEG
@@ -300,8 +300,10 @@ long prompt, where the cut used to lose it.
 - **Resume.** Re-running offers to reuse the previous inventory: files with
   unchanged size+mtime are carried over without re-reading, so a re-scan
   after a cleanup takes seconds. Unreadable files are always retried, installing `pillow-heif` and re-running with resume fills in exactly the
-  HEICs. The newest previous inventory wins, records from a different
-  `--thumb` are never reused, and superseded inventory files are listed as
+  HEICs. The newest previous inventory wins. Records are never reused
+  from an inventory made with a different `--thumb` or `--lossless-thumbs`
+  setting, or by a version that recorded less about each file; the run
+  says so and scans every file. Superseded inventory files are listed as
   safe to delete (it will not delete them itself).
 - **Portable output.** Paths are stored with forward slashes, so an
   inventory made on one OS resolves on another.
@@ -323,8 +325,13 @@ long prompt, where the cut used to lose it.
   every later stage understands parts automatically.
 - **Skipped folders:** anything starting with `.`, plus `venv`, `.venv`,
   `__pycache__`, `node_modules`, `$RECYCLE.BIN`, `System Volume
-  Information`, `_inventory`, and the Linux trash/system dirs (`.Trash-*`,
-  `lost+found`, `.cache`, `.thumbnails`).
+  Information`, `_inventory`, the Linux trash/system dirs (`.Trash-*`,
+  `lost+found`, `.cache`, `.thumbnails`) and the NAS ones (`#recycle`,
+  `@Recycle`, `@eaDir`, `#snapshot`), which hold deleted files and
+  generated thumbnails. macOS `._name` companion files are skipped too:
+  they are metadata, not images.
+- **Checked before the scan.** An `--out` folder that does not exist or
+  cannot be written to stops the run at once, not after the walk.
 - Corrupt files are logged as unreadable, counted by extension at the end,
   and never crash the scan. `Ctrl+C` aborts safely; a partial inventory is
   still usable.
@@ -343,8 +350,9 @@ threshold; no pixel method would ever have flagged it.
 
 #### Skipping the embed stage
 
-Everything still runs without it, and exact, re-encoded, resized, rotated
-and mirrored duplicates are all still found — those are pixel work.
+Everything still runs without it, and exact, re-encoded, resized, rotated,
+mirrored and black-and-white duplicates are all still found — those are
+pixel work.
 **Cropped copies are not.** That is not a degradation, it is close to a
 total loss, and the report gives no sign of it: a Tier B section still
 appears, built from whatever crops happened to survive.
@@ -395,9 +403,20 @@ the sweep already keeps 96,255 pairs out of 662 million at 8.0.
   also requires a fresh embeddings file.
 - **Resumable.** Re-running skips every SHA already embedded and appends;
   failed files are retried every run, like the collector. One pathological
-  image cannot kill the run, a failed batch is retried one image at a
-  time and only the offender is logged. If a byte-identical twin of a
-  missing file exists, the twin is read instead. A last line cut short by
+  image cannot kill the run, a failed batch is retried in halves and
+  only the offender is logged. A GPU that runs out of memory gets smaller
+  batches for the rest of the run, and the run names the `--batch` that
+  fits. If a byte-identical twin of a missing file exists, the twin is
+  read instead.
+- **A re-scan does not re-embed.** A second scan writes
+  `image-inventory-2.jsonl`, and its embeddings file starts with every
+  vector an earlier embeddings file in the folder already holds for the
+  same file content, model, preprocessing and precision. Only new and
+  changed files go through the model.
+- **A file edited since the scan is not embedded.** Its vector would be
+  stored under the hash of what it used to be. A different size is
+  recorded as unreadable, with the reason; Collect then Embed picks the
+  new file up. A last line cut short by
   a crash or a full disk is skipped when reading, and new vectors start
   on a line of their own. `--share` copies the file even when there was
   nothing new to embed.
@@ -414,27 +433,33 @@ the sweep already keeps 96,255 pairs out of 662 million at 8.0.
 Sweeps **every possible pair** on an 8×8 colour signature through BLAS with
 a provably lossless bound (`--self-test` asserts set equality against brute
 force), adds each image's nearest CLIP neighbours, re-scores survivors at
-full thumbnail resolution on a thread pool, and sorts findings into three
-tiers. Rotated/mirrored, grayscale/recoloured and cropped copies get their
-own detectors, each applied only to pairs every cheaper test rejected.
+full thumbnail resolution (in worker processes once there are 40,000
+pairs or more), and sorts findings into three tiers. Rotated/mirrored,
+grayscale/recoloured, locally edited and cropped copies get their own
+detectors, each applied only to pairs every cheaper test rejected.
+Rotated and mirrored copies, and black-and-white copies of colour
+pictures, are also nominated on pixels, by sweeps of their own, whether
+or not embeddings exist: on 51 test pictures CLIP alone missed 24 of the
+quarter-turns.
 Images whose SHA-256 is missing from the embeddings file are judged by
 pixels alone, and byte-identical files are always clustered:
 
 | Tier | Meaning | Evidence required | Pre-set |
 |------|---------|-------------------|---------|
-| **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree. Borderline pairs (thumbnail difference above 2, not byte-identical) are re-scored at 512 px from the original files, at most 64 per run, and demoted to review when that disagrees. The cluster is then rebuilt without that pair, so copies that still match each other stay in Tier A under a keeper of their own | `X` |
-| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, inpaints, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or luma/orientation match at duplicate level. An image is in a dense pocket when 16 or more others reach CLIP 0.90 with it, whatever `--clip-neighbors` is set to | `.` always |
-| **C — weaker evidence** | Related according to CLIP, but the pixel match is cheap chrome, near-black noise, or a high cosine with no crop confirm. Components larger than 16 are omitted (weak-edge chaining, not a reviewable set) | containment ≥ 0.95 **in** a dense CLIP pocket or on two near-black thumbs, or CLIP ≥ 0.97 after luma/orientation also missed | `.` always, **no suggested keeper**. You may still mark `X`; as everywhere, a file is deleted only while a copy it was matched with stays |
+| **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree. The pictures' structure must agree too (luma correlation ≥ 0.90), no 8×8 tile may differ by 20 or more, or by 12 or more when that is five times the mean (that is an edit: a changed expression, people erased from a street, a watermark), and neither thumbnail may be blank; a pair that fails one of these is shown for review or as weaker evidence, unmarked. Borderline pairs (thumbnail difference above 2, not byte-identical) are re-scored at 512 px from the original files, at most 64 per run, and demoted to review when that disagrees. The cluster is then rebuilt without that pair, so copies that still match each other stay in Tier A under a keeper of their own | `X` |
+| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, local edits, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or luma/orientation match at duplicate level with the brightness layouts correlated, or a local edit: at least 75% of the detailed 16×16 tiles agree while one differs by 24 or more. A rotated copy may score up to 8 when the difference is thumbnail noise, gone at a quarter of the resolution. An image is in a dense pocket when 16 or more other pictures reach CLIP 0.90 with it, whatever `--clip-neighbors` is set to; copies that pass the Tier A test count as one picture. A local edit is refused in a dense pocket, or under CLIP 0.90: that shape is two screenshots of one app, the same frame with other content, and goes to C | `.` always |
+| **C — weaker evidence** | Related according to CLIP, but the pixel match is cheap chrome, near-black noise, or a high cosine with no crop confirm; or pixels that agree only because there is little in either picture. Components larger than 16 are omitted (weak-edge chaining, not a reviewable set) | containment ≥ 0.95 **in** a dense CLIP pocket or on two near-black thumbs, or CLIP ≥ 0.97 after luma/orientation also missed, or a containment pass where a quarter of the detailed 8×8 tiles at the matched window, four at least, do not correlate (one app's frame around other content, one view under another sky), or a pair inside the Tier A gate that is blank, whose layouts do not correlate, or whose difference sits in one region while CLIP is under 0.90 or the pocket is dense (one frame, other content) | `.` always, **no suggested keeper**. You may still mark `X`; as everywhere, a file is deleted only while a copy it was matched with stays |
 
 Within a cluster the **keeper** is chosen by, in order:
 
 1. most animation frames, so a trimmed copy never outranks the full clip;
 2. colour over greyscale;
-3. highest resolution;
-4. full colour over a 256-colour palette;
-5. a lossless format (PNG, BMP, TIFF) over a lossy one;
-6. largest file;
-7. finest JPEG quantization (`qsum`), the least-recompressed copy.
+3. transparency over a flattened copy;
+4. highest resolution;
+5. full colour over a 256-colour palette;
+6. a lossless format (PNG, BMP, TIFF) over a lossy one;
+7. largest file;
+8. finest JPEG quantization (`qsum`), the least-recompressed copy.
 
 It is only a *suggestion*: every member of every cluster is an editable
 line in the list. The rule is a reasoned heuristic, not a measured one,
@@ -442,20 +467,26 @@ and it has one known blind spot: resolution ranks before encoding, so a
 heavily compressed upscale is kept over its smaller original. Tier B
 suggests deleting only files matched with the keeper directly, never
 ones linked through another member. It also never suggests deleting an
-animation to keep a still of it, or a colour picture to keep a greyscale
-copy; each holds something the other lacks, so those stay unmarked for
-you. Tier C elects no keeper: every file there starts unmarked so you
+animation to keep a still of it, a colour picture to keep a greyscale
+copy, or a transparent picture to keep a flattened one; each holds
+something the other lacks, so those stay unmarked for you. Nor does it
+suggest anything across a local edit, a patch or a watermark: nothing
+here can tell the original from the edited copy. Tier C elects no keeper: every file there starts unmarked so you
 pick, or leave them.
 
 A blank or single-colour image never counts as a crop or luma match of
 anything. A flat picture "matches" everywhere inside any other, so it
-used to chain unrelated images into one cluster. It is still compared
-by plain pixels, so its exact copies are found.
+used to chain unrelated images into one cluster. Two blank thumbnails
+are never pre-marked against each other either, unless the files are
+byte-identical: white artwork on a transparent background thumbnails as
+a white square, whatever it shows. Such pairs appear as weaker evidence.
 
 Numbers you will see in the report:
 
 - **mad**: mean absolute pixel difference, 0–255. 0 is identical; a JPEG
-  re-save lands around 1–3; unrelated images land in the tens.
+  re-save lands around 1–3; unrelated images land in the tens. Two dark
+  or near-plain pictures land low whatever they show, which is why a
+  pair is pre-marked only when its brightness layouts also line up.
 - **cos**: CLIP semantic similarity. Beware its high baseline: in a
   single-genre library *random* pairs average ~0.76 and can exceed 0.98,
   which is why Tier A demands 0.99 *and* pixel agreement, not either alone.
@@ -470,7 +501,9 @@ Numbers you will see in the report:
 
 Long runs print per-stage elapsed times, so you can see where the time
 goes. If the folder is clean, Analyze writes **only the report** (which
-says so), no selection list and no recycler. Stale outputs from earlier
+says so), no selection list and no recycler. The verdict covers what was
+compared: files that could not be read, or a scan that did not finish,
+are named beside it. Stale outputs from earlier
 runs are named for manual removal; it deletes nothing itself.
 
 A list you edited is never overwritten. When a re-run finds marks that
@@ -507,7 +540,8 @@ cluster**, not per line:
    that owns its line, so one `X` can never become two deletions and a
    refusal cannot be bypassed through a reference row;
 6. lines whose path matches nothing in the manifest are warned about and
-   ignored rather than guessed at;
+   ignored rather than guessed at, and a path that leads outside the
+   scanned folder is never deleted through;
 7. on Windows, paths too long to recycle are **refused**. Past 259
    UTF-16 units, where an emoji counts as two, the OS deletes permanently
    while reporting success, so the recycler will not attempt them at all.
@@ -583,7 +617,7 @@ Python scripts offer more:
 |---|---|---|
 | `--thumb N` | 128 | thumbnail max side, px |
 | `--workers N` | auto (2–8) | parallel hash/decode/thumbnail threads |
-| `--lossless-thumbs` | off | also try a lossless WebP thumbnail and keep it when smaller. ~2.2× slower. Across 36,410 images it changed no duplicate decision, which is why it is no longer the default — but a collection that is mostly screenshots, UI captures or pixel art has a far larger share of qualifying thumbnails, and this keeps their pixels exact |
+| `--lossless-thumbs` | off | also try a lossless WebP thumbnail and keep it when smaller. Switching it on or off rescans every file, so one inventory never mixes the two. ~2.2× slower. Across 36,410 images it changed no duplicate decision, which is why it is no longer the default — but a collection that is mostly screenshots, UI captures or pixel art has a far larger share of qualifying thumbnails, and this keeps their pixels exact |
 | `--split-mb N` | 200 | roll output to a new `.partN` past this size |
 | `--resume` / `--no-resume` | ask | reuse previous inventory for unchanged files. With no terminal to ask, a fresh scan |
 | `--out FILE` | `<folder>/image-inventory.jsonl` | output path |
@@ -596,7 +630,7 @@ Python scripts offer more:
 |---|---|---|
 | `--model NAME` | `openai/clip-vit-base-patch32` | HF model id (~600 MB first download) |
 | `--root DIR` | from inventory header | override the image folder |
-| `--batch N` | 64 GPU / 8 CPU | batch size |
+| `--batch N` | 64 GPU / 8 CPU | batch size. Halved automatically when the GPU runs out of memory |
 | `--workers N` | auto (2–8) | decode/preprocess threads feeding the model |
 | `--no-draft` | off | decode JPEGs at full resolution (slower). Recorded in preprocessing provenance; changing it requires a fresh embeddings file |
 | `--fp16` | off | float16 on the GPU (~2.9× faster; Apple Metal needs torch 2.5 or newer). Vectors shift by up to 0.0006 pairwise cosine — enough to move a pair sitting exactly on the Tier A floor into review. Recorded in the header; a resumed file of the other precision is refused |
@@ -614,7 +648,7 @@ Python scripts offer more:
 | `--tier-b-cos N` | 0.90 | CLIP floor before a pair may enter Tier B. Matches the floor that nominates neighbours, so no pair is scored and then discarded on it. Raise to 0.94 for a shorter review list that misses about half of all moderate crops |
 | `--sig-cut N` | 8.0 | signature prefilter ceiling (default auto-raises to 2× `--tier-a-mad`; an explicit value is used verbatim) |
 | `--clip-neighbors N` | 16 | nearest neighbours each image contributes from the embeddings; bounds the candidate set on large libraries (a binding cap is reported). Cannot cost a Tier A candidate — the cut line never approaches the 0.99 that tier needs |
-| `--no-orient` | off | skip rotation/mirror matching — faster, but rotated and mirrored copies are missed |
+| `--no-orient` | off | skip rotation/mirror matching — a little faster, but rotated and mirrored copies are missed |
 | `--no-embeddings` | off | ignore embeddings even if present |
 | `--self-test` | — | run the invariant + sweep-equality tests and exit |
 
@@ -633,7 +667,11 @@ export IMGDEDUP_PYTHON=/usr/bin/python3.12       (Linux/macOS)
 ```
 
 On Windows the quotes keep a path holding `&` or `^` intact. A toolkit
-folder, `.venv` or override path holding `&`, `%` or `^` works too.
+folder, `.venv` or override path holding `&`, `%` or `^` works too. The
+override has to be `python.exe` itself. A batch file, such as the
+`python.bat` shim pyenv-win puts on PATH, is refused with a message: run
+from a launcher it would never return, and the window would close with
+nothing said. With pyenv-win, `pyenv which python` prints the real path.
 
 ---
 
@@ -689,6 +727,10 @@ machine.
   functional, and the doctor reports such corpses as `[EMPTY]`. On
   Windows, if a folder under `Downloads` keeps losing files, check whether
   **Storage Sense** is set to auto-clean Downloads.
+- **A launcher says `python` on PATH is a batch file.** It found a
+  wrapper such as pyenv-win's `python.bat` where it expected
+  `python.exe`. Set `IMGDEDUP_PYTHON` to the real interpreter;
+  `pyenv which python` prints it.
 - **Analyze found 0 duplicates and wrote "only" a report.** Intended on a
   clean folder. If the run lists stale `Recycle-Duplicates.*` / list files
   from an earlier pass, delete them; they no longer describe reality.
@@ -716,9 +758,9 @@ machine.
   images the full default run measured ~19 minutes on an adversarial
   synthetic set, and real libraries are faster. Since v4.3.7 the
   rotation sweep is banded like the main one, so `--no-orient` buys much
-  less than it used to — try it only if the printed orientation stage is
-  actually where your run is spending its time. Embeddings skip that
-  stage outright: CLIP already nominates rotated and mirrored copies.
+  less than it used to, and since v4.4.3 it is one sweep instead of
+  seven — try it only if the printed orientation stage is actually where
+  your run is spending its time.
 - **Two inventories ended up in one folder.** Collect never overwrites: a
   second run writes `image-inventory-2.jsonl`. Embed, Analyze and
   Find-Duplicates pick the newest complete one automatically; the
@@ -728,7 +770,8 @@ machine.
   show a `.`.** One of its members is marked `X` in a different cluster, the same file can appear in two, and the refusal names the file and
   the cluster where it is editable. Unmark it there.
 - **A file I marked `X` was skipped or refused.** Read the printed
-  reason. Its bytes changed since the scan, or every copy it was matched
+  reason. Its bytes changed since the scan, it could not be read (open in
+  another program), it is already gone, or every copy it was matched
   with is marked `X` or has changed. Its unmarked copy may be the same
   file on disk, a symlink, junction or hard link to it. On Windows its
   path may be too long to recycle safely. That is the guard doing its
@@ -760,10 +803,21 @@ pre-set to `.`. Tier C is the same unmarked queue on weaker evidence
 The recycler never bulk-offers it; mark what you want in the list.
 
 What it will miss: crops retaining under about a third of the original,
-and, without the Embed stage, brightness or colour edits, because nothing
-nominates those pairs for scoring in the first place. Against a 20-case
-truth set of known same-picture transformations the pipeline finds
-**20/20 with embeddings and 15/20 without**, so run the semantic stage.
+and, without the Embed stage, most crops and the brightness, contrast
+and hue edits, because nothing nominates those pairs for scoring in the
+first place. Measured on 51 pictures with 25 known variants each, the
+pipeline finds **92% of the variants with embeddings and 78% without**,
+so run the semantic stage. What it still misses with embeddings is
+mostly heavy crops: 32 of 51 crops keeping 55% of the picture, 17 of 51
+keeping 70%. That set is built, not a real library. On a real library
+of 36,000 pictures, photos, art and screenshots, the previous release
+pre-marked three files and every one was a picture with a small edit: a
+changed expression, people erased from a street, a diagram edited. This
+release pre-marks none of them and shows them for review. Review there
+went from 343 files in 88 clusters, the largest 22, to 208 in 70, the
+largest 14. What it still collects: screenshots of one app whose
+difference is small and sits in one region, a new line in a chat, which
+no pixel measure tells from a drawing with a retouched detail.
 
 Animated GIF, WebP and APNG are compared by 25 frames sampled across the
 whole animation rather than by the first one alone. Frame 0 is not enough:
@@ -819,7 +873,11 @@ During development the stages were also run end-to-end on synthetic
 image sets (exact copies, re-encodes, resizes, crops, rotations, mirrors,
 grayscale copies, EXIF rotations, corrupt files, Unicode filenames) and
 the recycler through a Recycle-Bin round-trip and the freedesktop trash
-layout on real files. Those harnesses are not in the repository. What is
+layout on real files. Since v4.4.3 detection is also scored against
+corpora with known answers, described in CONTRIBUTING.md, and each
+release is run beside the previous one on a real library of 36,000
+pictures, with every pair that changed tier looked at. Those
+harnesses are not in the repository. What is
 tracked is `.benchmarks/agent-control/`, a scored benchmark for driving
 the toolkit through an AI agent, with its own README.
 
@@ -827,7 +885,7 @@ the toolkit through an AI agent, with its own README.
 
 ## Version
 
-**v4.4.2** (2026-09-23). Full history, including every bug and what it
+**v4.4.3** (2026-09-30). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change

@@ -10,7 +10,8 @@ decoded and thumbnailed on a thread pool, each read from disk exactly once;
 records still stream out in scan order, so the output is deterministic.
 Resumable: unchanged files (same size+mtime) are carried over from previous
 inventories, newest first - but only from an inventory written in the SAME
-record format (thumbnail size and quality, animation frame-sample count).
+record format (thumbnail size, quality and encoder, animation frame-sample
+count, and the fields a record holds).
 An older format is listed as superseded and re-scanned instead, because
 mixing two formats in one inventory makes the analyzer compare across them.
 Paths are stored with forward slashes, so an inventory travels between
@@ -221,6 +222,9 @@ EXTS = {
 # different answers depending on which of the two you mean.
 SKIP_DIRS = {'.git', '.venv', 'venv', '__pycache__', 'node_modules',
              '$recycle.bin', 'system volume information', '_inventory',
+             # NAS trash and generated-thumbnail folders (Synology, QNAP):
+             # scanned, deleted files and thumbnails came back as duplicates
+             '#recycle', '@recycle', '@eadir', '#snapshot',
              # Linux/macOS equivalents. The trash ones matter: without them a
              # scan walks straight into ~/.local/share/Trash and inventories
              # files the user already deleted, which then come back as
@@ -523,6 +527,68 @@ def truncated(data):
     return False
 
 
+def truncated_file(path, size):
+    """truncated() for a file too large to hold: the same three questions,
+    answered by seeking. The error path used to read the whole file to ask
+    them - a 400 MB file Pillow refuses cost 404 MB and 5.5 s, per worker,
+    which is the allocation ONE_READ_LIMIT exists to prevent."""
+    with open(path, 'rb') as f:
+        head = f.read(12)
+        if len(head) < 12:
+            return False
+        if head[:3] == b'\xff\xd8\xff':     # JPEG: walk the segment headers
+            i = 2
+            while i + 4 <= size:
+                f.seek(i)
+                h = f.read(4)
+                if len(h) < 4 or h[0] != 0xFF:
+                    return False
+                m = h[1]
+                if m == 0xFF:
+                    i += 1
+                    continue
+                if m == 0x01 or 0xD0 <= m <= 0xD8:
+                    i += 2
+                    continue
+                if m == 0xD9:
+                    return False
+                seg = int.from_bytes(h[2:4], 'big')
+                if seg < 2:
+                    return False
+                if m == 0xDA:
+                    # the last FFD9 at or past the scan, searched backwards
+                    # in blocks that overlap by one byte
+                    start = i + 2 + seg
+                    step = 1 << 20
+                    end = size
+                    while end > start:
+                        lo = max(start, end - step)
+                        f.seek(lo)
+                        if f.read(end - lo + 1).rfind(b'\xff\xd9') >= 0:
+                            return False
+                        end = lo
+                    return True
+                i += 2 + seg
+            return True
+        if head[:8] == b'\x89PNG\r\n\x1a\n':
+            i = 8
+            while i + 8 <= size:
+                f.seek(i)
+                h = f.read(8)
+                if len(h) < 8:
+                    return True
+                end = i + 12 + int.from_bytes(h[:4], 'big')
+                if end > size:
+                    return True
+                if h[4:8] == b'IEND':
+                    return False
+                i = end
+            return True
+        if head[:4] == b'RIFF':
+            return size < 8 + int.from_bytes(head[4:8], 'little')
+    return False
+
+
 def make_thumb(im, thumb_px, fast=True):
     """Returns (fmt_flag, tw, th, b64). JPEG at THUMB_QUALITY by default;
     with fast=False (--lossless-thumbs) a lossless WebP is also tried and
@@ -700,6 +766,11 @@ def process_one(full, rel, thumb_px, fast=True):
         # ('P') copy has lost colour the others still have, whatever its
         # format or size. Header-only, like the size below.
         rec['mode'] = im.mode or ''
+        # A copy that still has transparency holds what a flattened export
+        # lost; the keeper rule ranks it above the flatten. A palette PNG
+        # with a tRNS chunk has no 'A' in its mode, hence the second test.
+        if 'A' in (im.mode or '') or 'transparency' in im.info:
+            rec['alpha'] = 1
         rec['w'], rec['h'] = im.size
         # Read from the header - Image.open is lazy, so this costs nothing
         # and is known BEFORE the decode that might run out of memory.
@@ -807,10 +878,15 @@ def work_one(full, rel, thumb_px, fast=True):
             # is not. Only on the error path, so a healthy scan never pays
             # for the extra read.
             try:
-                with open(full, 'rb') as _f:
-                    if truncated(_f.read()):
-                        msg = 'TruncatedFile: incomplete download or copy ' \
-                              '(' + msg + ')'
+                _n = os.path.getsize(full)
+                if _n > ONE_READ_LIMIT:
+                    _cut = truncated_file(full, _n)
+                else:
+                    with open(full, 'rb') as _f:
+                        _cut = truncated(_f.read())
+                if _cut:
+                    msg = 'TruncatedFile: incomplete download or copy ' \
+                          '(' + msg + ')'
             except Exception:
                 pass
             # decoding runs from memory, so PIL names a BytesIO instead of the
@@ -850,6 +926,18 @@ def _header_root(path):
         return r.get('root') if isinstance(r, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def is_junction(path):
+    """A Windows junction (a reparse point that is not a symlink)."""
+    try:
+        return os.path.isjunction(path)                  # Python 3.12+
+    except AttributeError:
+        try:
+            return (bool(os.lstat(path).st_file_attributes & 0x400)
+                    and not os.path.islink(path))
+        except (OSError, AttributeError):
+            return False
 
 
 def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
@@ -930,6 +1018,14 @@ def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
             return False
         return target not in skip_names
 
+    def dir_walked_anyway(target):
+        """True when the walk enters this resolved folder under its own
+        name: inside the tree, below the root, through folders it enters."""
+        if not target.startswith(root_r.rstrip(os.sep) + os.sep):
+            return False
+        return not any(skipped_dir(d) for d in
+                       os.path.relpath(target, root_r).split(os.sep))
+
     seen_dirs.add(root_r)
     # A folder that cannot be listed (permission, I/O error) used to drop
     # out with its whole subtree and no word; the caller is told instead.
@@ -950,6 +1046,18 @@ def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
                                     os.path.realpath(os.path.join(dirpath, d)))
                 continue
             r = resolved(os.path.join(dirpath, d))
+            if is_junction(os.path.join(dirpath, d)) and dir_walked_anyway(r):
+                # A junction is followed (os.walk cannot tell it from a
+                # folder). Met BEFORE its target, it claimed the target: the
+                # real folder was then skipped as "a second route" and every
+                # file was recorded under the junction's name, which stops
+                # resolving the day the junction is removed. The walk
+                # reaches the real folder by its own name, so that is the
+                # one to take.
+                if on_relink is not None:
+                    on_relink(os.path.join(dirpath, d),
+                              os.path.realpath(os.path.join(dirpath, d)))
+                continue
             if r in seen_dirs:
                 # A second path to a directory already walked. Announced
                 # rather than skipped quietly: from the outside this looks
@@ -963,6 +1071,11 @@ def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
         dirnames[:] = keep
         for name in sorted(filenames):
             if os.path.splitext(name)[1].lower() not in EXTS:
+                continue
+            if name.startswith('._'):
+                # macOS AppleDouble companion of a real file on a non-Apple
+                # volume: resource-fork metadata under an image's name, and
+                # each one was reported as a corrupt image
                 continue
             full = os.path.join(dirpath, name)
             if os.path.normcase(os.path.abspath(full)) in skip_names:
@@ -988,7 +1101,10 @@ def walk_images(root, skip_names, on_relink=None, on_outside_link=None,
             yield full
 
 
-def record_format():
+RECORD_FIELDS = 2
+
+
+def record_format(lossless=False):
     """Everything about a stored record that must match before it is reused.
 
     A resumed scan copies old records verbatim, so every one of these has to
@@ -1011,10 +1127,25 @@ def record_format():
     So the guard is now the whole format rather than one field of it, and
     new fields belong here rather than beside it.
     """
-    return {'thumb_q': THUMB_QUALITY, 'frames': FRAME_SAMPLES}
+    # 'fields' counts the revisions of what a record HOLDS. v4.4.2 added
+    # 'mode' and 'txth' and did not say so here, so a resumed scan copied
+    # v4.4.1 records that lacked them: the keeper rule then read a greyscale
+    # PNG as colour, kept it, and marked the colour original X - the very
+    # case the new fields were added to fix. 2 adds 'alpha' as well.
+    fmt = {'thumb_q': THUMB_QUALITY, 'frames': FRAME_SAMPLES,
+           'fields': RECORD_FIELDS}
+    # --lossless-thumbs is part of the format too. Re-running a library with
+    # --resume --lossless-thumbs - the documented way to upgrade a
+    # screenshot or pixel-art library - reused every lossy thumbnail and
+    # said nothing, and a changed file then sat beside them with a lossless
+    # one: two thumbnail encodings in one inventory. Present only when set,
+    # so a default inventory's header is what it always was.
+    if lossless:
+        fmt['lossless'] = 1
+    return fmt
 
 
-def load_previous(root, thumb):
+def load_previous(root, thumb, lossless=False):
     """path -> record from any previous image-inventory*.jsonl in root.
     Read oldest-first so that when several inventories describe the same
     path, the NEWEST file's record wins. A file whose header records a
@@ -1053,7 +1184,7 @@ def load_previous(root, thumb):
                     if r.get('kind') is None \
                             and 'p' in r and 'sha' in r and 'tb' in r:
                         recs[r['p']] = r
-                if file_thumb == thumb and file_fmt == record_format():
+                if file_thumb == thumb and file_fmt == record_format(lossless):
                     prev.update(recs)
         except Exception:
             pass
@@ -1184,7 +1315,8 @@ def main():
 
     prev_files, prev = ([], {})
     if not args.no_resume:
-        prev_files, prev = load_previous(root, args.thumb)
+        prev_files, prev = load_previous(root, args.thumb,
+                                         args.lossless_thumbs)
     use_resume = False
     if prev:
         if args.resume:
@@ -1203,6 +1335,12 @@ def main():
             use_resume = ans in ('', 'y', 'yes')
         else:
             print('Previous inventory found; pass --resume to reuse it. Rescanning fresh.')
+    elif prev_files:
+        # Nothing reusable, and the reason used to go unsaid: a --resume run
+        # after an upgrade took the full scan time with no explanation.
+        print('The inventory already in this folder cannot be reused: it was')
+        print('written by another version of this tool, or with different')
+        print('thumbnail settings (--thumb, --lossless-thumbs). Scanning every file.')
 
     out = args.out or os.path.join(root, 'image-inventory.jsonl')
     # The output file is not opened until the scan is over, so a --out into
@@ -1215,6 +1353,20 @@ def main():
         print('')
         print('Create it first, or give --out a path inside a folder that')
         print('already exists. Nothing was scanned.')
+        sys.exit(2)
+    # ...and that it can be written to. A read-only folder (a mounted
+    # camera card, a share without write rights) ended the same way: the
+    # whole walk, then a traceback.
+    try:
+        probe = os.path.join(out_dir, '.imgdedup-write-test-%d' % os.getpid())
+        with open(probe, 'wb'):
+            pass
+        os.remove(probe)
+    except OSError as e:
+        print('Cannot write the inventory into: ' + out_dir)
+        print('  (%s)' % (e.strerror or e))
+        print('')
+        print('Give --out a path in a folder you can write to. Nothing was scanned.')
         sys.exit(2)
     # Canonicalize FIRST (an --out without .jsonl gets it appended), so the
     # path the collision guard checks is byte-identical to the path
@@ -1316,7 +1468,7 @@ def main():
     unreadable_why = {}          # exception type -> [count, [(path, msg), ..]]
     huge_seen = []               # (path, megapixels) for very large images
     header = {'schema': SCHEMA, 'root': root, 'files': total,
-              'thumb': args.thumb, 'fmt': record_format(),
+              'thumb': args.thumb, 'fmt': record_format(args.lossless_thumbs),
               'started': int(time.time() * 1000)}
     w = PartWriter(out, args.split_mb, header)
     pool = ThreadPoolExecutor(max_workers=workers)

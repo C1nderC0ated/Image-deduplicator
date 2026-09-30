@@ -100,6 +100,13 @@ try:
     except ImportError:
         from transformers import CLIPImageProcessor
     torch.zeros(1) + 1
+    # transformers 5 ignores a torch older than 2.4: the imports above all
+    # succeed and the model then "requires the PyTorch library". Without
+    # this the verdict was USE for a Python the embedder cannot run on.
+    from transformers.utils import is_torch_available
+    if not is_torch_available():
+        raise ImportError('torch %s too old for transformers %s'
+                          % (torch.__version__, __import__('transformers').__version__))
     o['embed_ok'] = True
     o['torchver'] = str(torch.__version__)
     o['cuda'] = bool(torch.cuda.is_available())
@@ -270,7 +277,10 @@ def candidates():
     # is exactly where setup puts every package, so the doctor would report
     # "nothing can load torch + transformers" about a machine whose very next
     # `./imgdedup.sh embed` runs fine.
-    override = os.environ.get('IMGDEDUP_PYTHON')
+    # Quotes and all is how it is often set - set IMGDEDUP_PYTHON="C:\Program
+    # Files\..." - and the launchers strip them. Left on here, the doctor ran
+    # a file whose name begins with a quote and called a working Python DEAD.
+    override = (os.environ.get('IMGDEDUP_PYTHON') or '').strip().strip('"').strip()
     if override:
         add([override], 'IMGDEDUP_PYTHON')
     here = os.path.dirname(os.path.abspath(__file__))
@@ -426,6 +436,8 @@ def main():
         else:
             err = info.get('embed_err', '')
             print('      -> embedder test:   FAIL  ' + err[:60])
+            if 'too old for transformers' in err:
+                print('         Setup replaces that torch, and asks first.')
             tv = mods.get('torchvision', '')
             if tv.startswith('ERR:') and 'ModuleNotFound' not in tv:
                 exe = info.get('exe') or cmd[0]

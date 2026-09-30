@@ -201,6 +201,23 @@ except ImportError as exc:
         print('  "' + sys.executable + '" -m pip uninstall torchvision')
     sys.exit(2)
 
+# transformers 5 ignores a torch older than 2.4, and the first thing that
+# needs it then raises "CLIPModel requires the PyTorch library but it was
+# not found" - about a torch that is installed, in a traceback. Said here
+# instead, with what to do.
+try:
+    from transformers.utils import is_torch_available as _torch_ok
+    if not _torch_ok():
+        print('The installed torch (%s) is too old for the installed transformers:'
+              % torch.__version__)
+        print('transformers refuses to load it, so the model cannot run.')
+        print('Setup replaces it and asks first:')
+        print('  "%s" "%s"' % (sys.executable, os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '_setup.py')))
+        sys.exit(2)
+except ImportError:
+    pass
+
 Image.MAX_IMAGE_PIXELS = 300_000_000
 
 # Pillow refuses a PNG whose compressed text chunk (or colour profile)
@@ -444,20 +461,117 @@ def json_line(obj):
     return line + '\n'
 
 
-def mirror_output(out, root, args):
+def _header_root(path):
+    """The root recorded in an inventory or embeddings file, or None."""
+    try:
+        with open(path, 'rb') as f:
+            r = json.loads(f.readline())
+        return r.get('root') if isinstance(r, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def mirror_output(out, root, args, inv=None):
     """The --share / --mirror-dir copy of the embeddings file."""
     mdir = args.mirror_dir or (MIRROR_DIR if args.share else '')
     if not mdir or not os.path.exists(out):
         return
     try:
         os.makedirs(mdir, exist_ok=True)
-        tag = os.path.basename((root or '').rstrip('\\/')) or 'root'
+        base_tag = os.path.basename((root or '').rstrip('\\/')) or 'root'
+        # The collector names a second library called "Photos" as
+        # "Photos (2) - ...". This copy used the bare folder name, so the
+        # second library's vectors overwrote the first's and sat beside the
+        # wrong inventory. Take the name whose copies belong to THIS root.
+        here = os.path.normcase(os.path.abspath(root or ''))
+        inv_name = os.path.basename(inventory_parts(inv)[0]) if inv else None
+        tag, n_tag = base_tag, 1
+        while n_tag < 1000:
+            others = [_header_root(os.path.join(
+                mdir, tag + ' - ' + os.path.basename(out)))]
+            if inv_name:
+                others.append(_header_root(os.path.join(
+                    mdir, tag + ' - ' + inv_name)))
+            if all(o is None or os.path.normcase(os.path.abspath(o)) == here
+                   for o in others):
+                break
+            n_tag += 1
+            tag = '%s (%d)' % (base_tag, n_tag)
         # mirror under the real output name, so image-embeddings-2.jsonl
         # does not overwrite the mirror of image-embeddings.jsonl
         shutil.copy2(out, os.path.join(mdir, tag + ' - ' + os.path.basename(out)))
         print('Copied to the shared folder for your AI assistant: ' + mdir)
     except Exception as e:
         print('(shared copy skipped: ' + str(e)[:120] + ')')
+
+
+def carry_over(out, recs, model, pre_tag, prec, root=None):
+    """Start OUT with the vectors an earlier embeddings file in the same
+    folder already holds for these exact files.
+
+    A re-scan writes image-inventory-2.jsonl, the embeddings are named
+    after it, and every image was embedded again - the slowest stage of
+    the three, repeated in full because three files had changed. A vector
+    belongs to a file's CONTENT (its hash), the model, the preprocessing
+    and the precision; when all four match it is the number this run would
+    compute. Anything else - another model, fp16 against fp32, another
+    preprocessing tag, a file with no header - is left alone.
+
+    Returns (shas carried, dim) - (set(), None) when nothing qualified."""
+    want = {}
+    for r in recs:
+        want.setdefault(r['sha'], r['p'])
+    d = os.path.dirname(out)
+    best = None
+    for p in set(glob.glob(os.path.join(glob.escape(d), '*-embeddings*.jsonl'))):
+        try:
+            if os.path.abspath(p) == os.path.abspath(out):
+                continue
+            with open(p, 'rb') as f:
+                h = json.loads(f.readline())
+            if not (isinstance(h, dict) and h.get('schema') == 'img-emb/1'
+                    and h.get('model') == model and h.get('pre') == pre_tag
+                    and (h.get('prec') or 'fp32') == prec
+                    and isinstance(h.get('dim'), int)):
+                continue
+            mt = os.path.getmtime(p)
+            if best is None or (mt, p) > best[:2]:
+                best = (mt, p, h)
+        except (OSError, ValueError):
+            continue
+    if best is None:
+        return set(), None
+    _mt, src, h = best
+    done = set()
+    tmp = out + '.tmp'
+    try:
+        with open(src, 'rb') as f, open(tmp, 'w', encoding='utf-8') as g:
+            g.write(json.dumps({'schema': 'img-emb/1', 'model': model,
+                                'dim': h['dim'], 'root': root,
+                                'pre': pre_tag, 'prec': prec,
+                                'started': int(time.time() * 1000)}) + '\n')
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                sha = r.get('sha') if isinstance(r, dict) else None
+                if sha in want and sha not in done and isinstance(r.get('v'), str):
+                    g.write(json_line({'sha': sha, 'p': want[sha], 'v': r['v']}))
+                    done.add(sha)
+        if not done:
+            os.remove(tmp)
+            return set(), None
+        os.replace(tmp, out)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return set(), None
+    print('Reused %d vector(s) from %s' % (len(done), os.path.basename(src)))
+    print('  (the same files by hash, the same model and settings).')
+    return done, h['dim']
 
 
 def find_inventory(arg):
@@ -480,10 +594,30 @@ def inventory_parts(path):
     if not b.lower().endswith('.jsonl'):
         return [path]
     b = b[:-len('.jsonl')]
-    if '.part' in b:                     # basename only: a folder named
-        b = b.split('.part')[0]          # 'archive.part' must not truncate
+
+    def part_no(tail):
+        """N for a '.partN' tail, else None."""
+        t = tail.lower()
+        return int(t[5:]) if t.startswith('.part') and t[5:].isdigit() else None
+
+    # A part was named: its run is the name without the '.partN'. Only a
+    # real part suffix counts - splitting at the first '.part' made
+    # 'holiday.partial.jsonl' the inventory 'holiday', and read a
+    # 'holiday.jsonl' beside it as the same scan.
+    dot = b.lower().rfind('.part')
+    if dot > 0 and part_no(b[dot:]) is not None:
+        b = b[:dot]
     stem = os.path.join(glob.escape(d), glob.escape(b)) if d else glob.escape(b)
-    return sorted(set(glob.glob(stem + '.jsonl') + glob.glob(stem + '.part*.jsonl')))
+    # In the order they were WRITTEN. Sorted as text, part10 came before
+    # part2, so an inventory split ten ways or more was read out of scan
+    # order and the same folder gave differently numbered clusters split
+    # and unsplit.
+    parts = []
+    for p in set(glob.glob(stem + '.part*.jsonl')):
+        n = part_no(os.path.basename(p)[len(b):-len('.jsonl')])
+        if n is not None:
+            parts.append((n, p))
+    return sorted(glob.glob(stem + '.jsonl')) + [p for _n, p in sorted(parts)]
 
 
 def same_run(paths, lines_of):
@@ -878,12 +1012,11 @@ def main():
 
     # Name the output after the inventory, so several inventories can share a
     # folder (the _inventory mirror does exactly that) without overwriting.
-    base = os.path.basename(inv)
+    # parts[0] is the inventory's own file, whichever part was named
+    base = os.path.basename(parts[0] if parts else inv)
     for suffix in ('.jsonl',):
         if base.endswith(suffix):
             base = base[:-len(suffix)]
-    if '.part' in base:
-        base = base.split('.part')[0]
     stem = base.replace('image-inventory', 'image-embeddings')
     if stem == base:
         stem = base + '-embeddings'
@@ -920,7 +1053,14 @@ def main():
     prev_err = {}                     # sha -> last recorded error message
     prev_model = prev_dim = prev_pre = prev_prec = None
     has_header = False
-    if os.path.exists(out):
+    if not os.path.exists(out):
+        done, _dim = carry_over(out, recs, args.model, pre_tag,
+                                'fp16' if use_half else 'fp32', root)
+        if done:
+            has_header = True
+            prev_model, prev_dim, prev_pre = args.model, _dim, pre_tag
+            prev_prec = 'fp16' if use_half else 'fp32'
+    elif os.path.exists(out):
         with open(out, 'rb') as f:           # bytes: see load_inventory
             for line in f:
                 try:
@@ -1055,7 +1195,7 @@ def main():
     if not todo:
         print('Nothing new to embed. Done.')
         # the copy was skipped along with the work, so --share did nothing
-        mirror_output(out, root, args)
+        mirror_output(out, root, args, inv)
         return
 
     if _TV_BROKEN is not None:
@@ -1071,6 +1211,22 @@ def main():
         print('         This tool never needs it. (Reinstalling the pair from the')
         print('         CUDA index, the old advice, swapped a ROCm or Intel torch.)')
         print('')
+
+    if not HEIF_OK:
+        # Each stage picks its own Python, and the one with torch is often
+        # not the one Collect ran under. Without the decoder here every
+        # .heic ended as "cannot identify image file", one line per file,
+        # with nothing naming the cause.
+        n_heif = sum(1 for r in todo
+                     if r['p'].lower().endswith(('.heic', '.heif', '.hif')))
+        if n_heif:
+            print('')
+            print('  [NOTE] %d HEIC/HEIF file(s) cannot be embedded: pillow-heif is'
+                  % n_heif)
+            print('         not installed for this Python. They are compared on')
+            print('         pixels only until it is:')
+            print('           ' + _hint('pillow-heif'))
+            print('')
 
     batch = args.batch or (8 if device == 'cpu' else 64)
     workers = args.workers if args.workers > 0 else default_workers()
@@ -1159,6 +1315,15 @@ def main():
             # inventories store '/' so they travel between OSes
             full = os.path.join(root, *rel.split('/'))
             try:
+                # The vector is stored under the hash the SCAN took. A file
+                # edited in place since then was embedded as it is now and
+                # filed under what it was: the analyzer then compared the
+                # old thumbnail with the new picture's vector. A different
+                # size is proof enough; it is recorded as unreadable, and
+                # the next Collect + Embed picks the new file up.
+                if isinstance(r.get('b'), int) and os.path.getsize(full) != r['b']:
+                    raise ValueError('changed since the scan (its size is '
+                                     'different) - run Collect again')
                 with Image.open(full) as im:
                     # Inventory metadata can be absent or stale. Ask the
                     # opened file too, so a legacy animated GIF/WebP cannot
@@ -1339,18 +1504,30 @@ def main():
             # differ from record['p'] when a byte-identical twin supplied
             # the pixels, and the file we name must be the file we read.
             nonlocal ok, err, header_written, flushed_batches, consec_fail
+            nonlocal batch
             if metas:
+                failure = None
                 try:
                     v16 = infer(tensors)
                     consec_fail = 0
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
+                    failure = str(e)
+                if failure is not None:
                     # One pathological image must not kill (and, via resume,
-                    # permanently wedge) the whole run: retry one by one so
-                    # only the offender is recorded as an error.
+                    # permanently wedge) the whole run: retry in smaller
+                    # pieces so only the offender is recorded as an error.
+                    #
+                    # OUTSIDE the handler, deliberately. Inside it the
+                    # exception is still alive, and its traceback holds the
+                    # failed batch's tensors: on a GPU short of memory the
+                    # retries then failed for the same reason, every image
+                    # of the batch was written down as an error, and the run
+                    # stopped as "systemic" - with a batch size the card
+                    # could not hold, and images it could.
                     if len(metas) == 1:
-                        msg = str(e)[:200]
+                        msg = failure[:200]
                         r0, used0 = metas[0]
                         if prev_err.get(r0['sha']) != msg:
                             f.write(json_line({'sha': r0['sha'],
@@ -1373,10 +1550,29 @@ def main():
                             f.flush()
                             sys.exit(1)
                         return
-                    print('  (batch of %d failed: %s - retrying one by one)'
-                          % (len(metas), str(e)[:80]))
-                    for r1, t1 in zip(metas, tensors):
-                        flush_batch([r1], [t1], False)
+                    if 'out of memory' in failure.lower():
+                        try:
+                            if device == 'cuda':
+                                torch.cuda.empty_cache()
+                            elif device == 'mps':
+                                torch.mps.empty_cache()
+                            elif device == 'xpu':
+                                torch.xpu.empty_cache()
+                        except Exception:
+                            pass
+                        # and stop asking for what did not fit: every later
+                        # batch would fail and be retried the same way
+                        if batch > 1 and len(metas) <= batch:
+                            batch = max(1, len(metas) // 2)
+                            print('  (out of memory at a batch of %d - continuing '
+                                  'with batches of %d; pass --batch %d to start there)'
+                                  % (len(metas), batch, batch))
+                    else:
+                        print('  (batch of %d failed: %s - retrying in halves)'
+                              % (len(metas), failure[:80]))
+                    mid = len(metas) // 2
+                    flush_batch(metas[:mid], tensors[:mid], False)
+                    flush_batch(metas[mid:], tensors[mid:], False)
                     return
                 real_dim = int(v16.shape[1])
                 if not header_written:
@@ -1443,7 +1639,7 @@ def main():
     print('Done: %d embedded, %d unreadable, %.1f min.' % (ok, err, (time.time() - t0) / 60))
     print('Output: ' + out)
 
-    mirror_output(out, root, args)
+    mirror_output(out, root, args, inv)
     print('')
     print('Next: run Analyze-Inventory.bat - it picks these embeddings up')
     print('automatically. Local by default; --share is the opt-in handoff to')
