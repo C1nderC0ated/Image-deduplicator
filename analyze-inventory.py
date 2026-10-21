@@ -1521,6 +1521,61 @@ CLIP_TIER_C = 0.97
 # Dense/dark NCC at 0.90 is screenshot chrome. A real crop in that pocket
 # still clears 0.95; chrome often does not.
 C_NCC_GATE = 0.95
+# A crop CLIP scores under its 0.90 floor is never nominated: the sweep
+# cannot see a crop (the 8x8 signature moves with the framing), and CLIP
+# was the only other way in. On the truth set 27 of 51 crops keeping 70%
+# of the picture sat under the floor, 25 of them between 0.80 and 0.90,
+# and 12 of those score 0.95 or better on containment. So each image's
+# CROP_BAND_K nearest neighbours from CROP_BAND_COS up are asked that one
+# question, and held to the stricter gate: among 3,000 unrelated pairs in
+# that band 2 reached 0.95 (9 reached 0.90), the window rule still applies,
+# and a dense pocket sends the pass to weaker evidence. A pair of one
+# aspect ratio (within CROP_BAND_ASPECT) whose pixel counts are within
+# CROP_BAND_AREA of each other is one framing twice, not a crop, and is
+# not asked: on a real library the band's passes of that shape were the
+# same view from one or two cameras and screenshots of one app, and its
+# passes between files of two shapes or sizes were crops. A 90% crop
+# that keeps the aspect is 1.23x in area and still asked. Two per image
+# is 19,770 extra matcher pairs on a 29k library, 26 s in the matcher;
+# one per image saves 4 s of that and loses 3 of the truth set's 70%
+# crops, so two it stays.
+CROP_BAND_COS = 0.80
+CROP_BAND_K = 2
+CROP_BAND_NCC = C_NCC_GATE
+CROP_BAND_ASPECT = 0.02
+CROP_BAND_AREA = 1.2
+
+
+def same_framing(ra, rb, tol=CROP_BAND_ASPECT, area=CROP_BAND_AREA):
+    """True when two records have one aspect ratio (either way up, within
+    tol) and pixel counts within a factor `area` of each other: the same
+    framing, not a crop of it."""
+    wa, ha, wb, hb = ra['w'], ra['h'], rb['w'], rb['h']
+    if not (wa and ha and wb and hb):
+        return False
+    aa, ab = wa / float(ha), wb / float(hb)
+    same = (abs(aa - ab) <= tol * max(aa, ab)
+            or abs(aa - 1.0 / ab) <= tol * max(aa, 1.0 / ab))
+    big, small = max(wa * ha, wb * hb), min(wa * ha, wb * hb)
+    return same and big < area * small
+
+
+def crop_band_pairs(vals, idx, rows, lo=CROP_BAND_COS, k=CROP_BAND_K):
+    """The crop band of a block of rows: for each row its k nearest
+    neighbours with cosine in [lo, 0.90), as (low, high) index pairs.
+    `vals` and `idx` are the row block's nearest-neighbour cosines and
+    indices (any order), `rows` the row indices."""
+    inb = (vals >= lo) & (vals < 0.90)
+    if not inb.any():
+        return []
+    order = np.argsort(-vals, axis=1)
+    inb_s = np.take_along_axis(inb, order, axis=1)
+    take = inb_s & (np.cumsum(inb_s, axis=1) <= k)
+    bri, bci = np.nonzero(take)
+    bj = np.take_along_axis(idx, order, axis=1)[bri, bci]
+    bi = np.asarray(rows)[bri]
+    return list(zip(np.minimum(bi, bj).tolist(), np.maximum(bi, bj).tolist()))
+
 # Bounded 512 px re-score of borderline Tier A keeper-drop pairs. SHA twins
 # and obvious re-saves (MAD <= 2, the JPEG-thumb noise band) skip it. Cap
 # stops a 9k-drop library from becoming a second Collect.
@@ -1575,26 +1630,27 @@ def needs_ncc_confirm(ncc, lo=NCC_NEAR, hi=NCC_GATE):
     return lo <= v < hi
 
 
-def ncc_confirm_queue(nccs, cap=NCC_CONFIRM_CAP):
+def ncc_confirm_queue(nccs, cap=NCC_CONFIRM_CAP, lo=NCC_NEAR, hi=NCC_GATE):
     """Near-misses closest to the gate first. Returns (pairs, n_skipped)."""
-    near = [(p, v) for p, v in nccs.items() if needs_ncc_confirm(v)]
+    near = [(p, v) for p, v in nccs.items() if needs_ncc_confirm(v, lo, hi)]
     near.sort(key=lambda kv: (-kv[1], kv[0]))
     return [p for p, _ in near[:cap]], max(0, len(near) - cap)
 
 
 def apply_ncc_confirms(nccs, TH, workers, cap=NCC_CONFIRM_CAP,
-                       max_side=NCC_CONFIRM_PX):
-    """Re-score 64 px near-misses at 128 px. Only raises a score."""
-    pairs, skipped = ncc_confirm_queue(nccs, cap)
+                       max_side=NCC_CONFIRM_PX, lo=NCC_NEAR, hi=NCC_GATE):
+    """Re-score 64 px near-misses at 128 px. Only raises a score. The
+    window [lo, hi) is the band just under the gate the pairs need."""
+    pairs, skipped = ncc_confirm_queue(nccs, cap, lo, hi)
     if not pairs:
         return nccs, 0, 0, skipped
-    hi = compute_nccs(TH, pairs, workers, max_side=max_side)
+    hi_scores = compute_nccs(TH, pairs, workers, max_side=max_side)
     gained = 0
     for p in pairs:
-        v1 = hi.get(p, 0.0)
+        v1 = hi_scores.get(p, 0.0)
         v0 = nccs.get(p, 0.0)
         if v1 > v0:
-            if v0 < NCC_GATE <= v1:
+            if v0 < hi <= v1:
                 gained += 1
             nccs[p] = v1
     return nccs, len(pairs), gained, skipped
@@ -2106,6 +2162,206 @@ def quality_key(recs, i):
             -r.get('qsum', 10 ** 9))
 
 
+# The keeper rule ranks area first, so an UPSCALE of a picture outranks
+# the picture it was made from. Whether the larger copy holds more detail
+# than the smaller one can supply is measurable at the larger copy's own
+# resolution: resize the smaller up to it and compare, tile by tile, how
+# much pixel-scale detail (|X - box3(X)|) each has. A plain resample has
+# none of its own - the ratio sits at 1.0 to 1.15 whatever the scale,
+# filter or encoding - where a genuine original has more in every tile
+# that holds texture. The margin depends on the scale: at 2x the genuine
+# originals of 51 pictures measured 1.46 and up at the tenth percentile
+# against 1.29 at most for an upscale; at 1.5x 1.21 against 1.27; at
+# 1.33x they overlap. So the test is asked only of pairs UPSCALE_SCALE
+# (1.8x, linear) apart, decided only with UPSCALE_TILES textured tiles
+# in hand (a flat picture loses nothing in a smaller copy and the ratio
+# says nothing about it), and at UPSCALE_RATIO: 34 of 51 2x upscales
+# caught, 17 undecidable, none of 102 genuine originals miscalled. Four
+# 512 px windows at native resolution bound the arithmetic to about
+# 1 Mpx a pair; the decode is the cost, so UPSCALE_CAP pairs a run.
+# An upscaler that invents detail (an AI model, a sharpening pass) is
+# not caught: its copy really does hold more pixel-scale detail.
+UPSCALE_SCALE = 1.8
+UPSCALE_WIN = 512
+UPSCALE_TILE = 16
+UPSCALE_TEXTURE = 6.0
+UPSCALE_FINE_MIN = 0.5
+UPSCALE_TILES = 400
+UPSCALE_RATIO = 1.20
+UPSCALE_CAP = 64
+
+
+def _box3(a):
+    """3x3 box mean of a 2-D float array, edges repeated."""
+    p = np.pad(a, 1, mode='edge')
+    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:]
+            + p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:]
+            + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
+
+
+def _upscale_windows(w, h, win=UPSCALE_WIN):
+    """Up to four win x win boxes, one at the centre of each quadrant, or
+    the whole image when it fits; a box that repeats one already taken
+    (a side under win) is dropped, so no tile counts twice."""
+    if w <= win and h <= win:
+        return [(0, 0, w, h)]
+    ww, hh = min(win, w), min(win, h)
+    out = []
+    for fx, fy in ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)):
+        x0 = int(max(0, min(w - ww, fx * w - ww / 2.0)))
+        y0 = int(max(0, min(h - hh, fy * h - hh / 2.0)))
+        box = (x0, y0, x0 + ww, y0 + hh)
+        if box not in out:
+            out.append(box)
+    return out
+
+
+def _luma_full(path):
+    """An original as an 8-bit luma image at full size, flattened as
+    Collect flattens (alpha onto white, 16-bit rescaled), or None."""
+    arr = load_rgb_capped(path, max_side=10 ** 9)
+    if arr is None:
+        return None
+    return Image.fromarray(arr).convert('L')
+
+
+def upscale_stats(path_big, path_small):
+    """(textured tiles, 75th-percentile detail ratio) of the larger file
+    against the smaller one resized up; the ratio is None with under four
+    textured tiles. None altogether when a file will not open or the two
+    are not UPSCALE_SCALE apart in both dimensions."""
+    L = _luma_full(path_big)
+    S = _luma_full(path_small)
+    if L is None or S is None:
+        return None
+    if (L.size[0] < UPSCALE_SCALE * S.size[0]
+            or L.size[1] < UPSCALE_SCALE * S.size[1]):
+        return None
+    sx = S.size[0] / float(L.size[0])
+    sy = S.size[1] / float(L.size[1])
+    fl_all, fu_all, std_all = [], [], []
+    b = UPSCALE_TILE
+    for (x0, y0, x1, y1) in _upscale_windows(*L.size):
+        Lw = np.asarray(L.crop((x0, y0, x1, y1)), dtype=np.float32)
+        # the matching region of the smaller file, with a margin for the
+        # resampling kernel, brought up to the larger file's scale
+        sx0, sy0 = max(0, int(x0 * sx) - 2), max(0, int(y0 * sy) - 2)
+        sx1 = min(S.size[0], int(np.ceil(x1 * sx)) + 2)
+        sy1 = min(S.size[1], int(np.ceil(y1 * sy)) + 2)
+        tw = max(1, int(round((sx1 - sx0) / sx)))
+        th = max(1, int(round((sy1 - sy0) / sy)))
+        Uw = np.asarray(S.crop((sx0, sy0, sx1, sy1)).resize((tw, th), Image.LANCZOS),
+                        dtype=np.float32)
+        ox, oy = max(0, int(round(x0 - sx0 / sx))), max(0, int(round(y0 - sy0 / sy)))
+        Uw = Uw[oy:oy + Lw.shape[0], ox:ox + Lw.shape[1]]
+        hh, ww = min(Uw.shape[0], Lw.shape[0]), min(Uw.shape[1], Lw.shape[1])
+        H, W = hh // b, ww // b
+        if not (H and W):
+            continue
+        Lw, Uw = Lw[:H * b, :W * b], Uw[:H * b, :W * b]
+        bl, bu = _box3(Lw), _box3(Uw)
+        fl = np.abs(Lw - bl).reshape(H, b, W, b).mean(axis=(1, 3))
+        fu = np.abs(Uw - bu).reshape(H, b, W, b).mean(axis=(1, 3))
+        st = bl.reshape(H, b, W, b).std(axis=(1, 3))
+        fl_all.append(fl.ravel())
+        fu_all.append(fu.ravel())
+        std_all.append(st.ravel())
+    if not fl_all:
+        return 0, None
+    fl, fu, st = (np.concatenate(fl_all), np.concatenate(fu_all),
+                  np.concatenate(std_all))
+    tex = (st >= UPSCALE_TEXTURE) & (fu >= UPSCALE_FINE_MIN)
+    n_tex = int(tex.sum())
+    if n_tex < 4:
+        return n_tex, None
+    return n_tex, float(np.percentile(fl[tex] / fu[tex], 75))
+
+
+def upscale_of(path_big, path_small):
+    """True when the larger file is a plain upscale of the smaller, False
+    when it holds more detail than the smaller can supply, None when the
+    question cannot be put (unreadable, not UPSCALE_SCALE apart, or under
+    UPSCALE_TILES textured tiles to judge by)."""
+    st = upscale_stats(path_big, path_small)
+    if st is None or st[1] is None or st[0] < UPSCALE_TILES:
+        return None
+    return st[1] < UPSCALE_RATIO
+
+
+def demote_upscales(clusters, recs, root, state, cap=UPSCALE_CAP, protect=(),
+                    edges=None):
+    """Re-elect the keeper of each (keeper, drops, members) cluster whose
+    keeper is a plain upscale of a member it matched directly and that is
+    UPSCALE_SCALE smaller in both dimensions. The best such member
+    (quality_key) is the one compared; the keeper then goes to the best
+    of the OTHER members matched with it directly - not to the one
+    compared, since an upscale of a 50% copy is also an upscale of the
+    full-size original beside it, and that is the file to keep - so the
+    demoted keeper always has a direct match with the new one and is
+    pre-marked through it. `edges` is that match set (None: every member
+    counts as direct). Members in `protect` (Tier A keepers and drops,
+    for the Tier B call) are never proposed for deletion, as build_tier_b
+    never proposes them; a cluster whose demotion would leave nothing to
+    propose is not asked. The cap is spent on the smallest size ratios
+    first: a resample is 2-4x, a thumbnail 5x and more. `state` persists
+    across calls and rounds: 'checked' (decodes charged to the cap),
+    'unreadable' (not charged), 'cache' (verdict per pair of paths),
+    'skipped' (pairs left unasked past the cap). Returns (clusters, the
+    number of keepers replaced in this call)."""
+    for key, init in (('checked', 0), ('unreadable', 0), ('cache', {}),
+                      ('skipped', set())):
+        state.setdefault(key, init)
+    protect = set(protect)
+
+    def direct(a, b):
+        return edges is None or (a, b) in edges or (b, a) in edges
+    work = []
+    for idx, (k, drops, members) in enumerate(clusters):
+        rk = recs[k]
+        if rk.get('anim'):
+            continue
+        smaller = [m for m in drops
+                   if direct(k, m) and not recs[m].get('anim')
+                   and rk['w'] >= UPSCALE_SCALE * recs[m]['w']
+                   and rk['h'] >= UPSCALE_SCALE * recs[m]['h']]
+        if not smaller:
+            continue
+        m = max(smaller, key=lambda i: quality_key(recs, i))
+        others = [i for i in members if i != k and direct(k, i)]
+        new_k = max(others, key=lambda i: quality_key(recs, i))
+        new_drops = [i for i in members if i != new_k and i not in protect]
+        if not new_drops:
+            continue
+        ratio = max(rk['w'] / float(recs[m]['w']), rk['h'] / float(recs[m]['h']))
+        work.append((ratio, idx, k, m, new_k, new_drops))
+    swap = {}
+    for ratio, idx, k, m, new_k, new_drops in sorted(work, key=lambda w: (w[0], w[1])):
+        key = (recs[k]['p'], recs[m]['p'])
+        if key not in state['cache']:
+            if state['checked'] >= cap:
+                state['skipped'].add(key)
+                continue
+            st = upscale_stats(inventory_abspath(root, recs[k]['p']),
+                               inventory_abspath(root, recs[m]['p']))
+            if st is None:
+                state['unreadable'] += 1
+                state['cache'][key] = False
+            else:
+                state['checked'] += 1
+                state['cache'][key] = (st[1] is not None and st[0] >= UPSCALE_TILES
+                                       and st[1] < UPSCALE_RATIO)
+        if state['cache'][key]:
+            swap[idx] = (new_k, new_drops)
+    out = []
+    for idx, (k, drops, members) in enumerate(clusters):
+        if idx in swap:
+            new_k, new_drops = swap[idx]
+            out.append((new_k, new_drops, members))
+        else:
+            out.append((k, drops, members))
+    return out, len(swap)
+
+
 def anim_compatible(ra, rb):
     """False when two records cannot be the same picture BECAUSE of motion.
 
@@ -2595,7 +2851,7 @@ def build_tier_a(recs, a_edges, order):
 
 
 def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP,
-                  state=None):
+                  state=None, upscale_state=None):
     """Build Tier A, confirm it at 512 px, and rebuild it WITHOUT the pairs
     that failed, until nothing more fails.
 
@@ -2610,7 +2866,9 @@ def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP,
 
     Returns (tier_a, demoted_pairs, n_checked, n_capped, n_unreadable).
     a_edges is left as it was; the caller removes the demoted pairs. Pass a
-    dict as state to read the other counts ('undecodable') afterwards."""
+    dict as state to read the other counts ('undecodable') afterwards.
+    Pass a dict as upscale_state to run demote_upscales on each round's
+    clusters before the confirm (see there)."""
     if state is None:
         state = {}
     state.update({'checked': 0, 'unreadable': 0, 'undecodable': 0,
@@ -2619,6 +2877,13 @@ def settle_tier_a(recs, root, mad_of, a_edges, order, gate, cap=CONFIRM_CAP,
     demoted = []
     while True:
         tier_a = build_tier_a(recs, live, order)
+        if upscale_state is not None:
+            # Before the confirm, so the confirm sees the final keeper: a
+            # member the confirm cut from the old keeper must not be
+            # pre-marked through an unconfirmed match with the new one.
+            tier_a, n_up = demote_upscales(tier_a, recs, root, upscale_state,
+                                           edges=live)
+            upscale_state['demoted_a'] = n_up
         _new_a, dem, _n, capped = apply_hires_confirms(
             tier_a, recs, root, mad_of, live, gate, cap=cap, state=state)
         if not dem:
@@ -3945,6 +4210,135 @@ def self_test():
         ok = ok and win_ok
     except Exception as exc:
         print('  [FAIL] frame-only crop match: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # The crop band picks each row's two nearest neighbours under the
+        # floor and over 0.80, whatever order the columns come in, and
+        # never a pair the floor already admits.
+        vals_b = np.array([[0.95, 0.85, 0.83, 0.81, 0.79],
+                           [0.60, 0.89, 0.70, 0.88, 0.87],
+                           [0.99, 0.98, 0.97, 0.96, 0.95]], dtype=np.float32)
+        idx_b = np.array([[1, 2, 3, 4, 5],
+                          [6, 7, 8, 9, 10],
+                          [11, 12, 13, 14, 15]], dtype=np.int32)
+        got_b = sorted(crop_band_pairs(vals_b, idx_b, np.array([0, 20, 40])))
+        # ...and never asks a pair that is one framing twice: one aspect
+        # (either way up) and pixel counts within 1.2x; a 90% crop that
+        # keeps the aspect (1.23x) and a crop of another shape are asked.
+        fr = lambda w, h: {'w': w, 'h': h}
+        frame_ok = (same_framing(fr(4000, 3000), fr(3840, 2880))
+                    and same_framing(fr(4000, 3000), fr(2880, 3840))
+                    and same_framing(fr(1080, 2388), fr(1080, 2388))
+                    and not same_framing(fr(4000, 3000), fr(3600, 2700))
+                    and not same_framing(fr(1080, 2388), fr(1080, 923))
+                    and not same_framing(fr(0, 0), fr(10, 10)))
+        # ...and its 128 px retry has a window of its own, [0.90, 0.95):
+        # a band pair at 0.92 is retried there and nowhere else, an
+        # ordinary near-miss at 0.87 the other way round
+        q_band = ncc_confirm_queue({(1, 2): 0.92, (3, 4): 0.87}, lo=NCC_GATE, hi=CROP_BAND_NCC)[0]
+        q_main = ncc_confirm_queue({(1, 2): 0.92, (3, 4): 0.87})[0]
+        retry_ok = q_band == [(1, 2)] and q_main == [(3, 4)]
+        band_ok = got_b == [(0, 2), (0, 3), (7, 20), (9, 20)] and frame_ok and retry_ok
+        print('  [%s] the crop band is each row'"'"'s two nearest under the floor '
+              '(%s)' % ('PASS' if band_ok else 'FAIL', got_b))
+        ok = ok and band_ok
+    except Exception as exc:
+        print('  [FAIL] crop band: %s: %s' % (type(exc).__name__, exc))
+        ok = False
+
+    try:
+        # An upscale is told from a genuine larger original by the detail
+        # the larger file holds beyond what the smaller can supply: a 2x
+        # LANCZOS resample of a textured picture has none, the picture it
+        # was made from (against its own half-size copy) has plenty, and a
+        # flat picture cannot be judged either way.
+        import tempfile as _tfu
+        rng = np.random.default_rng(23)
+        coarse = rng.integers(30, 220, (64, 64, 3), dtype=np.uint8)
+        fine = rng.integers(-18, 19, (512, 512, 3))
+        pic = np.clip(np.asarray(Image.fromarray(coarse).resize((512, 512), Image.BILINEAR)).astype(np.int16) + fine, 0, 255).astype(np.uint8)
+        with _tfu.TemporaryDirectory() as td:
+            p_orig = os.path.join(td, 'orig.png')
+            p_half = os.path.join(td, 'half.png')
+            p_up = os.path.join(td, 'up.jpg')
+            p_flat = os.path.join(td, 'flat.png')
+            p_flat_up = os.path.join(td, 'flat_up.png')
+            im = Image.fromarray(pic)
+            im.save(p_orig)
+            half = im.resize((256, 256), Image.LANCZOS)
+            half.save(p_half)
+            half.resize((512, 512), Image.LANCZOS).save(p_up, quality=85)
+            flat = Image.fromarray(np.full((256, 256, 3), 90, dtype=np.uint8))
+            flat.save(p_flat)
+            flat.resize((512, 512), Image.LANCZOS).save(p_flat_up)
+            up_ok = (upscale_of(p_up, p_half) is True
+                     and upscale_of(p_orig, p_half) is False
+                     and upscale_of(p_flat_up, p_flat) is None
+                     and upscale_of(p_half, p_orig) is None)
+            recs_u = [{'p': 'up.jpg', 'w': 512, 'h': 512, 'b': 1, 'sha': 'u' * 64},
+                      {'p': 'half.png', 'w': 256, 'h': 256, 'b': 1, 'sha': 'h' * 64}]
+            st_u = {}
+            fixed, n_fixed = demote_upscales([(0, [1], [0, 1])], recs_u, td, st_u)
+            recs_g = [{'p': 'orig.png', 'w': 512, 'h': 512, 'b': 1, 'sha': 'o' * 64},
+                      {'p': 'half.png', 'w': 256, 'h': 256, 'b': 1, 'sha': 'h' * 64}]
+            kept, n_kept = demote_upscales([(0, [1], [0, 1])], recs_g, td, st_u)
+            # asked again, with or without room under the cap, the same
+            # pair is answered from the cache and read once
+            capped_u, _n = demote_upscales([(0, [1], [0, 1])], recs_u, td, st_u, cap=2)
+            again, n_again = demote_upscales([(0, [1], [0, 1])], recs_u, td, st_u)
+            # a file that will not open is not charged to the cap
+            missing = [{'p': 'gone.jpg', 'w': 512, 'h': 512, 'b': 1, 'sha': 'g' * 64},
+                       {'p': 'half.png', 'w': 256, 'h': 256, 'b': 1, 'sha': 'h' * 64}]
+            unread, _n = demote_upscales([(0, [1], [0, 1])], missing, td, st_u)
+            # Three copies: a 4x upscale of the half-size copy, a 1.25x
+            # resample of the original, and the original itself. The
+            # upscale outranks both on area and is compared with the
+            # original (2x apart); the keeper then goes to the best of the
+            # others - the 1.25x copy, which the test could not be asked
+            # about - and never simply to the copy compared.
+            p_up4 = os.path.join(td, 'up4.jpg')
+            p_mid = os.path.join(td, 'mid.png')
+            half.resize((1024, 1024), Image.LANCZOS).save(p_up4, quality=85)
+            im.resize((640, 640), Image.LANCZOS).save(p_mid)
+            recs_3 = [{'p': 'up4.jpg', 'w': 1024, 'h': 1024, 'b': 1, 'sha': 'a' * 64},
+                      {'p': 'mid.png', 'w': 640, 'h': 640, 'b': 1, 'sha': 'b' * 64},
+                      {'p': 'orig.png', 'w': 512, 'h': 512, 'b': 1, 'sha': 'c' * 64}]
+            st_3 = {}
+            three, n_three = demote_upscales([(0, [1, 2], [0, 1, 2])], recs_3, td, st_3)
+            # with the others protected (Tier A files, in the Tier B call)
+            # only the demoted upscale itself can be proposed
+            guarded, _n = demote_upscales([(0, [1, 2], [0, 1, 2])], recs_3, td, {}, protect={1, 2})
+            # with matches known, only a member matched DIRECTLY with the
+            # keeper is compared or elected: here the original is, the
+            # 1.25x copy is not
+            edged, _n = demote_upscales([(0, [1, 2], [0, 1, 2])], recs_3, td, {},
+                                        edges={(0, 2), (2, 1)})
+            # the cap is spent on the smallest ratio first: with one slot,
+            # the 2x pair is asked and the 4x pair is skipped
+            recs_c = [{'p': 'up4.jpg', 'w': 1024, 'h': 1024, 'b': 1, 'sha': 'a' * 64},
+                      {'p': 'half.png', 'w': 256, 'h': 256, 'b': 1, 'sha': 'h' * 64},
+                      {'p': 'up.jpg', 'w': 512, 'h': 512, 'b': 1, 'sha': 'u' * 64},
+                      {'p': 'half.png', 'w': 256, 'h': 256, 'b': 1, 'sha': 'h' * 64}]
+            st_c = {}
+            ordered, n_ord = demote_upscales([(0, [1], [0, 1]), (2, [3], [2, 3])],
+                                             recs_c, td, st_c, cap=1)
+        keep_ok = (fixed == [(1, [0], [0, 1])] and n_fixed == 1
+                   and kept == [(0, [1], [0, 1])] and n_kept == 0
+                   and capped_u == fixed and again == fixed and n_again == 1
+                   and st_u.get('checked') == 2 and len(st_u.get('skipped', ())) == 0
+                   and unread == [(0, [1], [0, 1])] and st_u.get('unreadable') == 1
+                   and three == [(1, [0, 2], [0, 1, 2])] and n_three == 1
+                   and guarded == [(1, [0], [0, 1, 2])]
+                   and edged == [(2, [0, 1], [0, 1, 2])]
+                   and ordered == [(0, [1], [0, 1]), (3, [2], [2, 3])]
+                   and n_ord == 1 and len(st_c['skipped']) == 1)
+        print('  [%s] an upscaled keeper yields to the copy it was made from; a '
+              'genuine original and a flat picture do not'
+              % ('PASS' if up_ok and keep_ok else 'FAIL'))
+        ok = ok and up_ok and keep_ok
+    except Exception as exc:
+        print('  [FAIL] upscale keeper: %s: %s' % (type(exc).__name__, exc))
         ok = False
 
     try:
@@ -6162,7 +6556,9 @@ def main():
                          'candidate set on large libraries, where a flat '
                          'cosine floor admits a fifth of all pairs. Cannot '
                          'cost a Tier A candidate; may trim review '
-                         'candidates inside dense clusters')
+                         'candidates inside dense clusters. The crop band '
+                         '(CLIP 0.80-0.90, containment only) is read within '
+                         'these neighbours too')
     ap.add_argument('--no-embeddings', action='store_true')
     ap.add_argument('--self-test', action='store_true')
     args = ap.parse_args()
@@ -6300,6 +6696,7 @@ def main():
     # text card as a "crop" of four dark screenshots. A pair CLIP also
     # nominates is an ordinary candidate, and is taken out again below.
     side_only = orient_cand | grey_cand
+    band_cand = set()
     used_clip = False
     has_vec = None
     dense = np.zeros(n, dtype=bool)
@@ -6371,6 +6768,10 @@ def main():
                 vals = vals1[keepm].reshape(b - a, kk)
             else:
                 idx, vals = idx1, vals1
+            # The crop band: this row's CROP_BAND_K nearest neighbours
+            # under the floor, from CROP_BAND_COS up. Kept apart from the
+            # candidates - they are asked the containment question only.
+            band_cand.update(crop_band_pairs(vals, idx, rows))
             mask = vals >= 0.90
             ri, ci = np.nonzero(mask)
             if not len(ri):
@@ -6394,6 +6795,17 @@ def main():
     else:
         V = None
     cand = sorted(cand)
+    # A crop is smaller than the picture it was cut from, or shaped
+    # differently. Two files of one aspect and much the same pixel count
+    # are one framing twice, and on a real library the band's passes of
+    # that shape were the pairs review already knew too well: photographs
+    # of one view from one or two cameras, screenshots of one app. Its
+    # passes between files of two shapes or two sizes were the crops it
+    # exists for: a screenshot and the piece cut from it, a drawing and
+    # its gallery crop, a post and the picture inside it. So the band
+    # keeps only those (same_framing).
+    band = sorted(p for p in band_cand.difference(cand)
+                  if not same_framing(recs[p[0]], recs[p[1]]))
     print('Candidate pairs: %d%s' % (len(cand), '' if used_clip else '  (no embeddings)'))
     if not used_clip:
         # Saying "no embeddings" understates it. Crops move the 8x8
@@ -6495,8 +6907,14 @@ def main():
         if m > args.tier_b_mad and not shortcut and edit_pre[t] != 1 \
                 and (c is None or c >= args.tier_b_cos):
             need_ncc.append((i, j))
-    phase('Crop matching on %d pair(s) ...' % len(need_ncc))
-    nccs = compute_nccs(TH, need_ncc, workers)
+    phase('Crop matching on %d pair(s) ...' % (len(need_ncc) + len(band)))
+    nccs = compute_nccs(TH, need_ncc + band, workers)
+    # The band's scores are kept apart: its retry has a window of its
+    # own, [0.90, 0.95), since a band pair needs CROP_BAND_NCC, and a
+    # cap of its own, so it never spends the ordinary near-misses'
+    # budget - which binds on a real library - and changes a pair it
+    # never touched.
+    band_nccs = {p: nccs.pop(p) for p in band if p in nccs}
     if nccs and _HAVE_CV2:
         nccs, n_retry, n_gain, n_skip = apply_ncc_confirms(nccs, TH, workers)
         if n_retry or n_skip or n_gain:
@@ -6504,6 +6922,16 @@ def main():
                   % (n_retry, n_gain,
                      ', %d skipped (cap %d)' % (n_skip, NCC_CONFIRM_CAP)
                      if n_skip else ''))
+    if band_nccs and _HAVE_CV2:
+        band_nccs, b_retry, b_gain, b_skip = apply_ncc_confirms(
+            band_nccs, TH, workers, lo=NCC_GATE, hi=CROP_BAND_NCC)
+        if b_retry or b_skip or b_gain:
+            print('  128 px crop confirm, crop band: %d pair(s) retried, %d '
+                  'crossed %.2f%s'
+                  % (b_retry, b_gain, CROP_BAND_NCC,
+                     ', %d skipped (cap %d)' % (b_skip, NCC_CONFIRM_CAP)
+                     if b_skip else ''))
+    nccs.update(band_nccs)
 
     # The colour and orientation questions are expensive per pair (a resample
     # each, eight for orientation), so they are asked ONLY of pairs that
@@ -6647,6 +7075,25 @@ def main():
                 fallback.append((i, j))
                 fallback_t.append(t)
 
+    # The crop band: pairs CLIP scored under its floor, asked the
+    # containment question alone and held to the stricter gate
+    # (CROP_BAND_NCC). A pass in a dense or dark pocket is weaker
+    # evidence, as any 0.95 pass there is.
+    band_pairs = band_weak = 0
+    for i, j in band:
+        v = nccs.get((i, j), 0.0)
+        if v < CROP_BAND_NCC:
+            continue
+        lane = review_lane(v, None, bool(dense[i]), bool(dense[j]),
+                           float(sig_luma[i]), float(sig_luma[j]))
+        if lane == 'B':
+            ncc_b[len(tierb_pairs)] = (i, j)
+            tierb_pairs.append((i, j))
+            band_pairs += 1
+        elif lane == 'C':
+            tierc_pairs.append((i, j))
+            band_weak += 1
+
     # The crop matcher's review passes: does the agreement come from what
     # is drawn, or from the frame around it? Decided after the loop so the
     # windows are searched together; the pairs that stay keep their place.
@@ -6784,6 +7231,10 @@ def main():
         print('One frame, other content (screenshots of one app, or an edit '
               'CLIP scores low): %d pair(s) shown as weaker evidence, none '
               'marked' % frame_pairs)
+    if band_pairs or band_weak:
+        print('Crops CLIP scored low: %d pair(s) sent to review on containment '
+              'alone (%.2f or better), %d shown as weaker evidence (a dense or '
+              'dark pocket), none marked' % (band_pairs, CROP_BAND_NCC, band_weak))
     if frame_only:
         print('Crop matches that agree only where nothing is drawn (one '
               "app's frame, one skyline under other skies): %d pair(s) "
@@ -6816,8 +7267,10 @@ def main():
 
     phase('Confirming borderline Tier A pairs at %d px ...' % CONFIRM_PX)
     cstate = {}
+    ustate = {}
     tier_a, demoted, n_hires, n_cap, n_unread = settle_tier_a(
-        recs, root, mad_of, a_edges, a_order, args.tier_a_mad, state=cstate)
+        recs, root, mad_of, a_edges, a_order, args.tier_a_mad, state=cstate,
+        upscale_state=ustate)
     for i, j in demoted:
         a_edges.discard((i, j))
         a_edges.discard((j, i))
@@ -6850,6 +7303,19 @@ def main():
         b_edges.add((i, j))
         b_edges.add((j, i))
     tier_b, info_b = build_tier_b(uf_b.groups(), recs, tier_a, edges=b_edges)
+    tier_b, n_up_b = demote_upscales(
+        tier_b, recs, root, ustate, edges=b_edges,
+        protect=set(k for k, _d, _m in tier_a).union(
+            i for _k, d, _m in tier_a for i in d))
+    n_up = ustate.get('demoted_a', 0) + n_up_b
+    if ustate.get('checked') or ustate.get('unreadable') or ustate.get('skipped'):
+        print('  upscale check: %d keeper(s) compared with a smaller copy they '
+              'outrank, %d replaced by the best other member%s%s'
+              % (ustate.get('checked', 0), n_up,
+                 ', %d not compared: a file would not open' % ustate['unreadable']
+                 if ustate.get('unreadable') else '',
+                 ', %d skipped (cap %d)' % (len(ustate['skipped']), UPSCALE_CAP)
+                 if ustate.get('skipped') else ''))
     b_seen = set(tierb_pairs)
     b_seen.update((j, i) for i, j in tierb_pairs)
     uf_c = UF()

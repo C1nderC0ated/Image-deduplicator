@@ -178,8 +178,9 @@ Measure before building on them:
   B gate, so a dense or dark pair is not capped below the score it needs.
 - The keeper ranking: frames, colour, transparency, area, full colour
   over palette, lossless, size, `qsum`. It decides which file is proposed for deletion,
-  and it is a heuristic. Its known blind spot is a large upscale ranking
-  over its smaller original.
+  and it is a heuristic. Its blind spot, a large upscale ranking over
+  its smaller original, is covered from 1.8x up by the `UPSCALE_*` test
+  below and stays open under that.
 - `MIN_TORCH` **(2, 4)** and `LEGACY_CUDA_MAX` **cu126** in `_setup.py`
   follow upstream facts, transformers 5's torch floor and PyTorch's
   Turing cut-off from CUDA 12.8, and move when those do.
@@ -235,6 +236,60 @@ make Tier A narrower or add to review; none widens Tier A.
   thousands of review passes would want the process pool the matcher
   uses. A pass the 128 px retry admitted is left in review unjudged:
   its 64 px window is under the gate, the alignment the retry repairs.
+- `CROP_BAND_COS` **0.80**, `CROP_BAND_K` **2** and `CROP_BAND_NCC`
+  **0.95** (= `C_NCC_GATE`): among each image's `--clip-neighbors`
+  nearest, its two nearest CLIP neighbours under the 0.90 floor and
+  from 0.80 up are scored by the crop matcher
+  alone, retried at 128 px in a window of their own ([0.90, 0.95), with
+  a queue and cap of their own so they never spend the ordinary
+  near-misses' retry budget, which binds on the crop corpora), and
+  admitted to review at 0.95, to weaker evidence in a dense or dark
+  pocket, and through the window rule like any pass - unless
+  the pair is one framing twice: one aspect ratio within
+  `CROP_BAND_ASPECT` **0.02** (either way up) and pixel counts within
+  `CROP_BAND_AREA` **1.2** of each other. That test came from the real
+  library: of the band's passes there, those of one aspect and much
+  the same size were photographs of one view from one or two cameras
+  and screenshots of one app, the two kinds of pair review knows too
+  well, and those between files of two shapes or sizes were crops - a
+  screenshot and the piece cut from it, a drawing and its gallery
+  crop, a post and the picture inside it. A 90% aspect-locked crop is
+  1.23x in area and still asked. On the
+  truth set 27 of 51 crops keeping 70% sat under the floor, 25 of them
+  in the band, 12 of those at 0.95; crops keeping 55% mostly do not
+  reach 0.90 at all. Among 3,000 unrelated truth-set pairs in the band
+  2 reached 0.95 and 9 reached 0.90. On the 29k library the band is
+  19,770 extra matcher pairs and admits 38 passes to review and 2 to
+  weaker evidence, some 35 of the 40 review pairs being genuine crops
+  (contact sheets in the harness findings); its first form, without the
+  framing test, admitted 61, and the 21 extra were photographs of one
+  view from two cameras and screenshots of one app. It costs 26 s in
+  the crop matcher there (177 s -> 206 s for the run), and the cost is
+  per image touched rather than per pair: `CROP_BAND_K` 1 saves 4 s and
+  loses 3 of the truth set's 70% crops and 2 of its 55% crops.
+- `UPSCALE_SCALE` **1.8**, `UPSCALE_WIN` **512**, `UPSCALE_TILE` **16**,
+  `UPSCALE_TEXTURE` **6.0**, `UPSCALE_FINE_MIN` **0.5**, `UPSCALE_TILES`
+  **400**, `UPSCALE_RATIO` **1.20**, `UPSCALE_CAP` **64**: a keeper at
+  least `UPSCALE_SCALE` times a directly matched member's width and
+  height is compared with it on up to four 512 px windows at its own
+  resolution,
+  tile by tile: the 75th percentile, over tiles whose 3x3-blurred luma
+  spreads by 6 or more and where the resized smaller copy carries 0.5
+  of pixel-scale detail, of the larger copy's detail over the smaller
+  copy's resized up. Under 1.20 with 400 such tiles in hand it is an
+  upscale and the best of the other directly matched members keeps.
+  Measured on 51 pictures at 2x: 34 of 51 LANCZOS upscales caught, the
+  other 17 undecidable (under 400 textured tiles; every decidable
+  upscale measured 1.17 or less), 0 of 102 genuine originals miscalled
+  (the 66 decidable ones measured 1.32 and up; the two smooth seeds an
+  unguarded test miscalls have 118-225 textured tiles). The cap is
+  spent on the smallest size ratios first, a resample being 2-4x and
+  a thumbnail 5x and more; a file that will not open is not charged to
+  it. On the
+  3,000-crop corpus 6 of 21 Tier A keepers 2x over a member were
+  demoted, every one a window the corpus had itself upscaled 2.2x to
+  3.2x, and none of the 7 genuine ones. 1.5x and 1.33x: see the
+  refuted list.
 - `ORIENT_NOISE_MAD` **2.0** and `ORIENT_LOWPASS_MAD` **0.75**, both
   times the Tier A gate: a rotated pair may score up to 8 at full
   thumbnail size when it scores 3 or less at a quarter of it. Pure
@@ -269,10 +324,18 @@ From v4.4.3:
   the pixels are handed back to Pillow, which already uses zlib-ng. An
   earlier "30% faster" was the harness charging its own copies to
   Pillow.
-- An upscale test in the keeper rule (upscale the smaller copy to the
-  larger one's size and compare there): it caught 51 of 51 upscales and
-  13 to 20 of 51 genuinely larger originals, because a smooth picture
-  looks the same either way. The blind spot stays documented.
+- An upscale test in the keeper rule that upscales the smaller copy to
+  the larger one's size and compares there: it caught 51 of 51 upscales
+  and 13 to 20 of 51 genuinely larger originals, because a smooth
+  picture looks the same either way. The v4.4.4 test compares
+  pixel-scale detail tile by tile instead (`UPSCALE_*` above), and only
+  at 1.8x or more: at 1.5x the genuine originals' 75th-percentile ratio
+  starts at 1.21 against 1.27 at most for an upscale, so the safest
+  cut (1.12, 400 textured tiles) still miscalls 1 of 66 originals -
+  a textured one, not a smooth one - for 91 of 153 upscales caught;
+  at 1.33x the two overlap outright (0.92 to 2.05 against 1.04 to
+  1.28). Grain in flat tiles, which an upscale cannot have, does not
+  separate either: both sides are re-encoded, and JPEG grain is grain.
 - A luma sweep over every pair, to nominate recoloured copies: on the
   3,000-crop corpus, which holds no recoloured copy of any of its
   files, 231 extra pairs then passed the luma check. The greyscale

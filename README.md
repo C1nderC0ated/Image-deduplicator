@@ -462,9 +462,17 @@ Within a cluster the **keeper** is chosen by, in order:
 8. finest JPEG quantization (`qsum`), the least-recompressed copy.
 
 It is only a *suggestion*: every member of every cluster is an editable
-line in the list. The rule is a reasoned heuristic, not a measured one,
-and it has one known blind spot: resolution ranks before encoding, so a
-heavily compressed upscale is kept over its smaller original. Tier B
+line in the list. The rule is a reasoned heuristic, not a measured one.
+Its blind spot was that resolution ranks before everything else, so an
+upscale was kept over the picture it was made from. Since v4.4.4 a
+keeper at least 1.8x a member's width and 1.8x its height, matched with
+it directly, is compared with it at its own resolution: a plain resample holds no
+pixel-scale detail beyond what the smaller copy supplies, a genuine
+original does, and a keeper found to be an upscale yields to the best
+of the other members. The test is asked only when the pair has enough
+textured tiles to decide (a flat picture is left alone), of at most 64
+pairs a run, and never at 1.5x or less, where the margin is too thin to
+trust; an upscaler that invents detail passes as an original. Tier B
 suggests deleting only files matched with the keeper directly, never
 ones linked through another member. It also never suggests deleting an
 animation to keep a still of it, a colour picture to keep a greyscale
@@ -806,10 +814,15 @@ What it will miss: crops retaining under about a third of the original,
 and, without the Embed stage, most crops and the brightness, contrast
 and hue edits, because nothing nominates those pairs for scoring in the
 first place. Measured on 51 pictures with 25 known variants each, the
-pipeline finds **92% of the variants with embeddings and 78% without**,
+pipeline finds **93% of the variants with embeddings and 78% without**,
 so run the semantic stage. What it still misses with embeddings is
-mostly heavy crops: 32 of 51 crops keeping 55% of the picture, 17 of 51
-keeping 70%. That set is built, not a real library. On a real library
+mostly heavy crops: 30 of 51 crops keeping 55% of the picture, 13 of 51
+keeping 70%. A crop CLIP scores under its floor is reached by the crop
+band since v4.4.4: among each image's `--clip-neighbors` nearest, its
+two nearest between 0.80 and 0.90 that are not the same framing (one
+aspect ratio and much the same pixel count) are asked the containment
+question alone, and admitted at 0.95. That set is built, not a real
+library. On a real library
 of 36,000 pictures, photos, art and screenshots, the previous release
 pre-marked three files and every one was a picture with a small edit: a
 changed expression, people erased from a street, a diagram edited. This
@@ -885,7 +898,7 @@ the toolkit through an AI agent, with its own README.
 
 ## Version
 
-**v4.4.3** (2026-09-30). Full history, including every bug and what it
+**v4.4.4** (2026-10-21). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change

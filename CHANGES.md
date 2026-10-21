@@ -3,7 +3,107 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.4.3 — 2026-09-30 (current)
+## v4.4.4 — 2026-10-21 (current)
+
+**Two detection gaps closed, each measured first.** The heavy crops
+that v4.4.3 still missed, and the keeper rule's blind spot for
+upscales, the one it had carried since the rule was written.
+
+| | v4.4.3 | v4.4.4 |
+|---|---:|---:|
+| Truth set, variants found with embeddings | 91.8% | 92.9% |
+| Truth set, crops keeping 55% / 70% / 80% / 90% found | 19 / 34 / 42 / 47 of 51 | 22 / 39 / 45 / 48 of 51 |
+| 3,000 crops: crop relations in review / `X` against another window | 783 / 2 of 284 | 817 / 2 of 284 |
+| 3,000 crops: Tier A keepers that were 2x upscales of a member, replaced | 0 of 14 | 6 of 14 (0 of 7 genuine originals touched) |
+| 20,000 crops: planted crops found / `X` against another window | 108 of 648 / 86 of 1,200 | 116 of 648 / 86 of 1,200 |
+| Analyze time, 3,000 / 20,000 crops, both measured again today | 45 s / 688 s | 53 s / 690 s |
+| Real library, 29,044 pictures: crop-band passes to review / to weaker evidence / keepers replaced | - | 38 / 2 / 0 |
+| Self-test checks / mutations caught | 85 / 16 | 87 / 21 |
+| Real library: analyze time, both measured again today | 177 s | 206 s |
+
+Missed duplicates:
+
+- **A crop CLIP scored under its floor was never looked at.** The
+  signature sweep cannot see a crop, since the 8x8 signature moves with
+  the framing, and CLIP's 0.90 neighbour floor was the only other way
+  in: on the truth set 27 of the 51 crops keeping 70% of the picture
+  sat under it, 25 of them between 0.80 and 0.90, ranked sixth to
+  eleventh among their original's neighbours, and 12 of those score
+  0.95 or better on containment. Among each image's `--clip-neighbors`
+  nearest, its two nearest in that band are now asked the containment
+  question alone, with a 128 px retry of their own for a score between
+  0.90 and 0.95, and admitted
+  to review at 0.95, the gate dense pockets already need; in a dense or
+  dark pocket the pass is weaker evidence, and the window rule applies
+  as to any pass. On the truth set the crops keeping 70% missed go from
+  17 to 12, those keeping 80% from 9 to 6. Not asked: a pair that is one framing twice, one
+  aspect ratio and pixel counts within 20% of each other. That test
+  came from the real library, where the band's passes of that shape
+  were the pairs review knows too well (photographs of one view from
+  one or two cameras, screenshots of one app) and its passes between
+  files of two shapes or sizes were crops: a screenshot and the piece
+  cut from it, a drawing and its gallery crop, a post and the picture
+  inside it. Among 3,000 unrelated truth-set pairs in the band 2
+  reached 0.95. Crops keeping 55% mostly do not reach 0.90 on
+  containment at all and stay missed. On the 29k library the band is
+  19,770 extra matcher pairs (26 s in the crop matcher) and admits 38 passes to
+  review and 2 to weaker evidence: 40 review pairs, looked at one by
+  one, of which some 35 are the crops it exists for - Android's
+  cropped screenshots beside the screenshot they were cut from, drawings
+  beside their gallery crops, posts beside the picture they hold, a photo
+  beside the piece cut from it - and the rest two shots of one room and
+  two app screens. The band's first form, without the framing test,
+  admitted 61: the extra 21 were the sunsets from one window and the
+  screenshots of one app, and the one-size pairs among them were all of
+  that kind.
+
+Could pre-mark the wrong file:
+
+- **An upscale was the copy kept.** The keeper rule ranks area first,
+  so a resample of a picture to twice its size outranked the picture
+  it was made from, and the original was the copy marked `X`. Whether
+  the larger copy holds detail the smaller cannot supply is measurable
+  at the larger copy's own resolution: resize the smaller up to it and
+  compare, tile by tile, how much pixel-scale detail each has. A plain
+  resample has none of its own (its ratio sits at 1.0 to 1.15 whatever
+  the scale, filter or encoding); a genuine original has more wherever
+  there is texture. The margin depends on the scale, so the test is
+  asked only of pairs 1.8x apart in both dimensions that matched each
+  other directly, inside the 512 px confirm so the confirm sees the
+  final keeper, decided only with 400 textured tiles in hand, and at
+  most 64 pairs a run, smallest ratios first; a keeper found to be an
+  upscale yields to the best of the other directly matched members,
+  not to the copy it was compared with (an upscale of a 50% copy is
+  also an upscale of the full-size original beside it). Measured on
+  51 pictures at 2x: 34 of 51 upscales caught and the other 17
+  undecidable for want of textured tiles (every decidable upscale
+  measured 1.17 or less against a 1.20 cut, every decidable genuine
+  original 1.32 or more); on the 3,000-crop corpus the six
+  keepers it replaced were all windows the corpus had itself upscaled
+  2.2x to 3.2x, and none of the seven genuine originals 2x over a
+  member was touched. On the real library, which holds no Tier A
+  cluster, two review keepers were compared and neither replaced. The 1.5x case
+  stays open: there the safest cut still miscalls 1 of 66 genuine
+  originals (a textured one), and at 1.33x the two cannot be told
+  apart; CONTRIBUTING has the numbers. An upscaler that invents detail
+  passes as an original.
+
+What the two cost: on the 3,000-crop corpus 45 s became 53 s, most of
+it the upscale check reading 63 clusters' originals (every picture
+there has a half-size copy); on the 20,000-crop corpus 688 s became
+690 s; on the real library 177 s became 206 s, nearly all of it in
+the crop matcher. That cost is per image the band touches, not per
+pair: one neighbour per image instead of two saves 4 s there and loses
+3 of the 70% crops and 2 of the 55% crops on the truth set, so two it
+stays.
+
+Measured and refused: the crop band at 0.90 containment (9 of 3,000
+unrelated pairs reach it) and over every in-band neighbour (130,000
+extra matcher pairs on the library for the same crops); the upscale
+test at 1.5x and 1.33x (above); grain in flat tiles as the upscale
+signal (both copies are re-encoded, and JPEG grain is grain).
+
+## v4.4.3 — 2026-09-30
 
 **A second bug audit, and the first detection and speed pass scored
 against known answers.** Five areas were reviewed to the end (tiers and
