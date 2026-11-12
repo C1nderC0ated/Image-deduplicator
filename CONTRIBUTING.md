@@ -30,6 +30,14 @@ library**. Run the stage before and after and compare the files:
 - analyze → all five outputs: the list, the report, and the three
   recycler scripts
 
+Run both sides on one set of libraries. Pillow 13.0 resamples tall,
+narrow pictures in a different order from 12.3: on the truth set 102 of
+1,326 thumbnails differ, the candidate count moves from 12,530 to 12,525
+and one review entry goes, with no change to the toolkit. Python 3.9 with
+Pillow 10.0.0, numpy 1.24.0 and OpenCV 4.8.0 gives the same bytes as
+Python 3.14 with Pillow 12.3.0, numpy 2.5.1 and OpenCV 5.0.0, and Python
+3.15 the same as 3.14.
+
 This is a much stronger condition than "the decisions did not change",
 and that is the point. It is free to check, it has no false negatives,
 and it catches the failure you did not think to test for. A change that
@@ -181,9 +189,12 @@ Measure before building on them:
   and it is a heuristic. Its blind spot, a large upscale ranking over
   its smaller original, is covered from 1.8x up by the `UPSCALE_*` test
   below and stays open under that.
-- `MIN_TORCH` **(2, 4)** and `LEGACY_CUDA_MAX` **cu126** in `_setup.py`
-  follow upstream facts, transformers 5's torch floor and PyTorch's
-  Turing cut-off from CUDA 12.8, and move when those do.
+- `MIN_TORCH` **(2, 6)** and `LEGACY_CUDA_MAX` **cu126** in `_setup.py`
+  follow upstream facts, the current transformers' torch floor (2.4 in
+  5.10, 2.5 in 5.17, 2.6 in 5.22) and PyTorch's Turing cut-off from CUDA
+  12.8, and move when those do. `SAFE_FLOOR` **pillow 13.0.0** is the
+  same kind of number: the first Pillow with none of the decoder
+  vulnerabilities the OSV database listed on 2026-11-12.
 
 ## Calibrated on built corpora, checked on one real library
 

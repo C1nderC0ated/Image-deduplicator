@@ -41,8 +41,8 @@ rem
 rem  The embedding stage is OPTIONAL and this says so rather than failing:
 rem  without PyTorch the scan still finds duplicates by pixels, it just
 rem  loses the semantic tier that catches recoloured and heavily cropped
-rem  copies. So a machine with only Pillow gets a working tool, and is told
-rem  what it is missing instead of being stopped by it.
+rem  copies. So a machine with only Pillow and numpy gets a working tool,
+rem  and is told what it is missing instead of being stopped by it.
 rem
 rem  Nothing is ever deleted here. The last stage writes a list and a
 rem  separate recycler, and that recycler asks before it touches anything.

@@ -3,7 +3,128 @@
 Honest history, bugs included: each fix names what actually went wrong,
 because half of these guards only exist since something broke for real.
 
-## v4.4.4 — 2026-10-21 (current)
+## v4.4.4f — 2026-11-12 (current)
+
+**Brought up to date with upstream. Detection is unchanged.** Python
+3.15, Pillow 13, PyTorch 2.15 and a new torch floor in transformers had
+arrived, the first two before v4.4.4 shipped, and the toolkit had
+followed none of them. On the truth set, with and
+without embeddings, v4.4.4 and this release give the same inventory, the
+same clusters and the same marks. The list and the report differ only in
+the two texts named under "Stale statements".
+
+| Upstream, read on 2026-11-12 | v4.4.4 | v4.4.4f |
+|---|---|---|
+| Python 3.15.0 (2026-10-09) | launchers ask for 3.14 down to 3.9 by name | 3.15 first |
+| Pillow 13.0.0 (2026-10-16) closed 41 advisories open against 12.3.0 | setup never upgraded an installed package | setup offers the upgrade, the doctor marks `[OLD]` |
+| transformers 5.22 refuses a torch older than 2.6 | `MIN_TORCH` 2.4 | `MIN_TORCH` 2.6 |
+| PyTorch 2.15.0 (2026-10-28) needs Python 3.11, builds no CUDA 12, moved ROCm to 7.14 and 10.0 | said 3.10, printed `rocm7.2` | says 3.11, prints `rocm10.0` |
+| PyYAML has no Python 3.15 wheel, and transformers needs it | setup on 3.15 installed nothing | installs Pillow, numpy and OpenCV, then says what Embed needs |
+| AMD publishes Windows builds of PyTorch for more Pythons than 3.12 | said AMD ships for 3.12 only | says setup installs the 3.12 set only |
+
+An old decoder kept in use:
+
+- **Setup never upgraded a package it found installed, and Pillow
+  13.0.0 closed 41 published vulnerabilities.** The count is the OSV
+  database's against 12.3.0; five are rated critical, a heap overflow in
+  the JPEG decoder among them, and none was backported. Every picture in
+  a scanned folder goes through those decoders. Setup now reports a
+  Pillow below 13.0.0 and offers `pip install --upgrade pillow`, shown
+  and asked like every other step. The doctor marks it `[OLD]` and names
+  the command for the Python the scan would use. Pillow 13 needs Python
+  3.11: on 3.9 and 3.10 both say so. On a system-managed Python both
+  point at the system's package manager. `requirements.txt` asks for
+  13.0.0 from Python 3.11 and 11.3.0 below it, OpenCV 4.8.1.78 (the
+  first build without the libwebp bug CVE-2023-4863) and transformers
+  5.10.0 from Python 3.10.
+- **Pillow 13 resamples tall, narrow pictures in a different order, so
+  their thumbnails change.** Measured on the truth set, same toolkit,
+  Pillow 12.3.0 against 13.0.0: 102 of 1,326 thumbnails differ, all of
+  pictures more than twice as tall as wide, by 0.67 of 255 on average
+  after the JPEG encode. Without embeddings the candidate pairs went from
+  12,530 to 12,525 and one review entry, a watermarked variant, was no
+  longer found; no mark changed. Plain `resize` is what changed, so the
+  toolkit cannot pin it. An inventory resumed across the upgrade holds
+  both kinds, and a scan with `--no-resume` makes it uniform.
+
+Python 3.15:
+
+- **The launchers did not ask for it.** `_pick-python.bat` tried `py
+  -3.14` down to `py -3.9` and reached 3.15 only through `py -3`, after
+  all six had failed, so a machine with 3.14 and 3.15 ran 3.14.
+  `imgdedup.sh` and the doctor had the same list. All three now start at
+  3.15. Collect and Analyze give the same bytes on 3.15.0rc1 as on 3.14
+  with the same libraries.
+- **On a machine with only Python 3.15, setup installed nothing.**
+  transformers needs PyYAML, whose newest release (6.0.3, 2025-09) has no
+  3.15 wheel, and building it needs a C compiler. Setup installed Pillow,
+  numpy, OpenCV and transformers in one pip command, and pip installs all
+  of a command or none, so Collect was left without Pillow. transformers
+  now has a command of its own, before torch: when it fails the other
+  three are already in, the torch download is not started, and setup says
+  that Embed needs Python 3.11 to 3.14 until PyYAML has a 3.15 build.
+- **The doctor's fallback decoder asked Python for its preferred
+  encoding**, which on 3.15 is UTF-8 whatever the code page, for bytes
+  that had just failed as UTF-8. It asks for the locale's encoding.
+
+PyTorch and transformers:
+
+- **transformers has moved its torch floor**: 2.4 in 5.10 to 5.14, 2.5
+  in 5.17 and 5.18, 2.6 in 5.22. `MIN_TORCH` follows, so
+  setup no longer takes an index whose newest wheel for this Python is
+  2.4 or 2.5 and offers to replace such a torch. The embedder was run on
+  transformers 5.22.2 with torch 2.15.0 beside 5.14.1 with 2.11.0, on the
+  CPU: 1,272 of 1,272 vectors identical.
+- **PyTorch 2.15 needs Python 3.11**, and setup's note for a Python with
+  no build still said 3.10. It builds no CUDA 12, so `cu126`, where setup
+  sends cards older than Turing, ends at 2.14.1: it still installs and
+  runs, and it is now the last. It moved AMD on Linux from ROCm 7.2 to
+  7.14 and 10.0 and dropped the kernels for Vega and Radeon VII: the
+  README and `requirements.txt` print `rocm10.0`, and `rocm7.2` for those
+  two. Setup's offline fallback stays `rocm7.2`, which has a wheel for
+  every Python from 3.10 to 3.15. `cu134`, the README's example of an
+  index with nothing usable in it, now carries PyTorch 2.15.
+- **AMD on Windows is no longer Python 3.12 only.** From ROCm 7.13 AMD
+  publishes Windows builds for more Pythons through an index of its own.
+  Setup still installs the ROCm 7.2.1 set on Python 3.12 and nothing
+  else, and now says that instead of saying AMD ships nothing else. The
+  newer builds were not tried: there is no AMD card here.
+
+Stale statements, each checked against the code:
+
+- **"Never a permanent delete"** stood in the analyzer's header, the
+  generated recycler's header and twice in the README. On Windows, where
+  the Recycle Bin cannot take a file, the shell asks, and a yes deletes
+  it for good; the recycler counts and reports those. All four say so.
+- **The list's header said Tier A pre-sets "the rest to X".** A member
+  that reached its cluster through another file is left on `.` and has
+  been since v4.3.6. The header says so, in two more comment lines. The
+  report's Tier A text now lists transparency in the keeper order and the
+  upscale exception.
+- README: the Tier B row and `--tier-b-cos` now mention the crop band;
+  the launcher runs `py -3.14`, not `py -V:3.14`.
+- Launchers: `Embed-Images.bat` promised "the reinstall command" for "an
+  Nvidia GPU", and the embedder prints the setup command for any GPU;
+  `Find-Duplicates.bat` said a machine with only Pillow gets a working
+  tool, and Analyze needs numpy; `Collect-Image-Inventory.bat` named one
+  output file where a second scan and a split write others;
+  `_offer-setup.bat` counted three launchers and four call it.
+- Comments: `quality_key` still called the upscale blind spot uncaught;
+  `media_kind` and `write_list_and_script` described fewer values than
+  they return; `shown_dims` named a function that does not exist; the
+  dense-pocket constant counted files where the code counts pictures.
+
+Checks: the self-test's 87 on Python 3.9 (Pillow 10.0.0 and 11.3.0,
+numpy 1.24.0, OpenCV 4.8.0 and 4.8.1), 3.14 and 3.15.0rc1 (Pillow
+13.0.0, numpy 2.5, OpenCV 5.0), deprecation warnings as errors; 21 of 21
+mutations caught; Python 3.9 with the oldest libraries gives the same
+bytes as 3.14 with Pillow 12.3.0. Setup's new paths were run for real:
+the Pillow upgrade on Python 3.14, a new Python 3.15 where transformers
+fails, and Python 3.9 where the upgrade cannot be offered. The five
+edited launchers pass the windows-shell-dev analyzer in strict mode, the
+menu scan and the line-ending report. Not run on Linux or macOS.
+
+## v4.4.4 — 2026-10-21
 
 **Two detection gaps closed, each measured first.** The heavy crops
 that v4.4.3 still missed, and the keeper rule's blind spot for

@@ -125,13 +125,13 @@ pick() {
     fi
     if [ -z "$PYCMD" ]; then
         # Newest-first, each probed functionally, then the unversioned names.
-        # The explicit list has an expiry date - 3.15 is not in it - but
+        # The explicit list has an expiry date - 3.16 is not in it - but
         # unlike the Windows side that is harmless here: python3 almost
         # always points at the newest installed interpreter, so a future
         # version is still reached by the last two entries. It just loses
         # its place in the ordering, not its chance.
-        for c in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 \
-                 python3 python; do
+        for c in python3.15 python3.14 python3.13 python3.12 python3.11 \
+                 python3.10 python3.9 python3 python; do
             try_py "$c" && break
         done
     fi

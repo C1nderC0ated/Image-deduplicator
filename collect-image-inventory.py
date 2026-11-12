@@ -6,7 +6,8 @@ Walks a folder tree and, for every image it finds, writes one JSON line to
 image-inventory.jsonl:  path, size, mtime, SHA-256, format, dimensions,
 key EXIF fields, JPEG quality fingerprint, AI-generation text chunks (PNG),
 and a small base64 thumbnail (EXIF-rotation corrected). Files are hashed,
-decoded and thumbnailed on a thread pool, each read from disk exactly once;
+decoded and thumbnailed on a thread pool, each read from disk once (a file
+over 32 MB is streamed for the hash and read again to decode);
 records still stream out in scan order, so the output is deterministic.
 Resumable: unchanged files (same size+mtime) are carried over from previous
 inventories, newest first - but only from an inventory written in the SAME
@@ -29,7 +30,7 @@ Options:
     --out FILE        output path (default: <scanned folder>\\image-inventory.jsonl)
     --thumb N         thumbnail max side, px            (default 128)
     --workers N       parallel worker threads           (default: auto,
-                      min(CPU cores, 8); each file is read once and
+                      CPU cores, held to 2..8; each file is read once and
                       hashed + decoded + thumbnailed off the main thread)
     --split-mb N      start a new .partN file when the current one
                       exceeds N megabytes               (default 200)

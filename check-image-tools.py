@@ -59,6 +59,23 @@ def _hint(pkg, exe=None, info=None):
         return '"%s" -m pip install %s' % (exe or sys.executable, pkg)
 
 
+def _stale(info):
+    """What the interpreter this probe result describes holds below
+    _setup.SAFE_FLOOR, as [(key, installed, fixed_in, why_not)]. Asked of
+    that interpreter's own Python version, not the doctor's. Empty when
+    _setup.py is not beside this file."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        from _setup import outdated_packages
+        pv = tuple(int(x) for x in info.get('v', '0.0').split('.')[:2])
+        return outdated_packages(
+            {'pillow': (info.get('mods') or {}).get('PIL', '')}, pv)
+    except Exception:
+        return []
+
+
 def _installable(info):
     """Can pip install into the interpreter this probe result describes?
     A venv always owns itself; otherwise a PEP 668 marker means no."""
@@ -100,8 +117,8 @@ try:
     except ImportError:
         from transformers import CLIPImageProcessor
     torch.zeros(1) + 1
-    # transformers 5 ignores a torch older than 2.4: the imports above all
-    # succeed and the model then "requires the PyTorch library". Without
+    # transformers ignores a torch older than its floor (2.6 in 5.22): the
+    # imports above all succeed and the model then "requires PyTorch". Without
     # this the verdict was USE for a Python the embedder cannot run on.
     from transformers.utils import is_torch_available
     if not is_torch_available():
@@ -204,8 +221,13 @@ def _decode(b):
         return b.decode('utf-8')
     except UnicodeDecodeError:
         import locale
-        return b.decode(locale.getpreferredencoding(False) or 'utf-8',
-                        'replace')
+        # getencoding (3.11+) names the ANSI code page whatever Python's own
+        # default is. getpreferredencoding answers 'utf-8' on Python 3.15,
+        # where UTF-8 became the default, and these bytes just failed as
+        # UTF-8.
+        ansi = getattr(locale, 'getencoding',
+                       lambda: locale.getpreferredencoding(False))()
+        return b.decode(ansi or 'utf-8', 'replace')
 
 
 def _setup_line(exe):
@@ -299,7 +321,7 @@ def candidates():
         # No `py` launcher off Windows. Interpreters live on PATH under
         # versioned names, and pyenv / deadsnakes / Homebrew installs are
         # only reachable that way, so ask for each one by name.
-        for minor in range(14, 8, -1):
+        for minor in range(15, 8, -1):
             exe = 'python3.%d' % minor
             rc, out = run([exe, '-c', 'import sys;print(sys.executable)'], timeout=30)
             if rc == 0 and out.strip():
@@ -400,6 +422,7 @@ def main():
             print('      [MISS ] %-13s not installed, and venv is missing too'
                   % 'pip')
         mods = info.get('mods', {})
+        old_pil = _stale(info)
         for name in SHOW:
             val = mods.get(name, 'ERR:not probed')
             if val == 'EMPTY':
@@ -418,6 +441,9 @@ def main():
                         print('      [BROKEN] %-12s %s' % (name, val[4:][:66]))
                 else:
                     print('      [MISS ] %-13s %s' % (name, val[4:][:66]))
+            elif name == 'PIL' and old_pil:
+                print('      [OLD  ] %-13s %s  (%s fixes published decoder '
+                      'vulnerabilities)' % (name, val[:40], old_pil[0][2]))
             else:
                 note = '  (not needed by this toolkit)' if name == 'torchvision' else ''
                 print('      [ok   ] %-13s %s%s' % (name, val[:70], note))
@@ -508,8 +534,8 @@ def main():
                 if IS_WIN and gpu_v == {'AMD'} and not v.startswith('3.12'):
                     # nothing to switch TO: removing torch to reinstall the
                     # same CPU build was all the old advice could achieve
-                    print('       AMD ships its Windows GPU builds for Python 3.12 only;')
-                    print('       see "AMD GPUs" in the README.')
+                    print("       Setup installs AMD's Windows GPU build for Python 3.12")
+                    print('       only; see "AMD GPUs" in the README.')
                 else:
                     print('       A CPU-only wheel (%s) can never use it. Setup replaces'
                           % tv)
@@ -584,6 +610,28 @@ def main():
             print('  If this is under your Downloads folder, check whether Windows')
             print('  Storage Sense is set to auto-delete files there.')
     print('')
+
+    # The Pillow the launchers will use, when it is below the safe floor.
+    # Said once, about that interpreter, with the one command that fixes it.
+    stale = _stale(best_collect[2]) if best_collect else []
+    if stale:
+        _key, have, fixed, why_not = stale[0]
+        binfo = best_collect[2]
+        print('  ' + '=' * 64)
+        print('  Pillow %s is what the scan would use. %s fixes published' % (have, fixed))
+        print('  vulnerabilities in the image decoders, and every scanned picture')
+        print('  goes through them.')
+        if why_not:
+            print('  ' + why_not[0].upper() + why_not[1:])
+        elif not binfo.get('pip'):
+            print('  That Python has no pip, so nothing upgrades it as it is.')
+        elif not _installable(binfo):
+            print('  That Python is managed by the system: upgrade Pillow with the')
+            print("  system's package manager.")
+        else:
+            print('  Setup upgrades it, and asks first:')
+            print('    ' + _setup_line(binfo.get('exe') or best_collect[0][0]))
+        print('')
 
     # Offer to fix what the report just found. The doctor itself stays
     # read-only: it never installs, it only hands off to _setup.py, which

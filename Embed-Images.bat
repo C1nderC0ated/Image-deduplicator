@@ -78,8 +78,8 @@ goto :run
 call "%%TOOLDIR%%_pick-python.bat" "%PROBE%"
 if not defined PYTHON_CMD goto :no_python
 echo NOTE: no Python with a GPU-capable torch was found - embedding will
-echo       run on the CPU. The embedder prints the exact reason and, if an
-echo       Nvidia GPU is present, the reinstall command that fixes it.
+echo       run on the CPU. The embedder prints the exact reason and, if a
+echo       GPU is present, the setup command that installs the right build.
 echo.
 echo Using %PYTHON_CMD%
 echo.

@@ -4,8 +4,9 @@ embed-images.py  -  optional semantic tier for the image inventory.
 
 Reads an image-inventory*.jsonl produced by collect-image-inventory.py,
 opens each ORIGINAL image, and computes a CLIP embedding. Output is
-image-embeddings.jsonl next to the inventory: one line per image,
-keyed by the file's SHA-256 so renames/moves don't matter.
+image-embeddings.jsonl next to the inventory, named after it
+(image-inventory-2.jsonl gives image-embeddings-2.jsonl): one line per
+image, keyed by the file's SHA-256 so renames/moves don't matter.
 
 The analyzer uses these to find semantic matches that pixel comparison
 misses: aggressive crops, filtered/recolored edits, mirrored saves,
@@ -201,10 +202,10 @@ except ImportError as exc:
         print('  "' + sys.executable + '" -m pip uninstall torchvision')
     sys.exit(2)
 
-# transformers 5 ignores a torch older than 2.4, and the first thing that
-# needs it then raises "CLIPModel requires the PyTorch library but it was
-# not found" - about a torch that is installed, in a traceback. Said here
-# instead, with what to do.
+# transformers ignores a torch older than its own floor (2.6 in 5.22, and
+# the line moves with transformers), and the first thing that needs it then
+# raises "CLIPModel requires PyTorch" - about a torch that is installed, in
+# a traceback. Said here instead, with what to do.
 try:
     from transformers.utils import is_torch_available as _torch_ok
     if not _torch_ok():

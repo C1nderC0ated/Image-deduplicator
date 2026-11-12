@@ -12,8 +12,9 @@ groups images into duplicate clusters, and writes next to the inventory:
 
 READ-ONLY with respect to your images. This script never deletes anything;
 the generated recycler does, and only after you edit the list and confirm.
-Deletions go to the OS trash (Recycle Bin / freedesktop Trash / ~/.Trash),
-never a permanent delete.
+Deletions go to the OS trash (Recycle Bin / freedesktop Trash / ~/.Trash).
+The one way to a permanent delete is Windows asking first, where its
+Recycle Bin cannot take a file, and you answering yes.
 
     python analyze-inventory.py <inventory.jsonl | folder>
 
@@ -1164,7 +1165,8 @@ DIHEDRAL = (
 
 
 def oriented_mad(TH, i, j):
-    """Smallest mad over the eight orientations of j. A rotated or mirrored
+    """Smallest mad over the seven turned or mirrored orientations of j
+    (the comparison as it stands is made elsewhere). A rotated or mirrored
     save is the same picture, but every pixel lands somewhere else, so the
     plain comparison scores it like an unrelated image (~55 on a 0-255
     scale). Returns (best_mad, label)."""
@@ -2100,11 +2102,12 @@ GRAY_MODES = ('1', 'L', 'LA', 'La', 'I', 'I;16', 'I;16B', 'I;16L', 'I;16N',
 
 
 def media_kind(r):
-    """(animated, greyscale). Tier B never suggests deleting a copy of one
-    kind to keep a copy of another: an animation and a still of it, or a
-    colour picture and a greyscale version, each hold something the other
-    does not - a Live Photo GIF beside the full-resolution still, say - so
-    that choice is left to the person reviewing."""
+    """(animated, greyscale, transparent). Tier B never suggests deleting a
+    copy of one kind to keep a copy of another: an animation and a still of
+    it, a colour picture and a greyscale version, or a transparent picture
+    and its flattened export, each hold something the other does not - a
+    Live Photo GIF beside the full-resolution still, say - so that choice
+    is left to the person reviewing."""
     # ...and a transparent copy against its flattened export, which has
     # lost the alpha channel the way a greyscale copy lost colour
     return (bool(r.get('anim')), (r.get('mode') or '') in GRAY_MODES,
@@ -2125,20 +2128,23 @@ def quality_key(recs, i):
     one encoding; across two it is not one at all.
 
     This decides which file gets proposed for deletion, which makes it the
-    most consequential rule here - and unlike the thresholds around it, it
-    has never been validated against anything. It is a plausible heuristic,
-    written down as one so the next person does not mistake it for a
-    measured result.
+    most consequential rule here - and unlike the thresholds around it, the
+    ORDER has never been validated against anything. It is a plausible
+    heuristic, written down as one so the next person does not mistake it
+    for a measured result.
 
-    The blind spot it cannot see: area wins first, so a heavily-compressed
-    UPSCALE beats a pristine original. A 4000x3000 upscale of a 2000x1500
-    photo is kept and the original is the copy marked X. Nothing downstream
-    catches that, because both files are genuinely the same picture and the
-    tiers are only asked whether they match, not which is better.
+    Area wins early, so an UPSCALE of a picture outranks the picture it was
+    made from: a 4000x3000 upscale of a 2000x1500 photo was kept and the
+    original was the copy marked X. Since v4.4.4 that case is looked at
+    afterwards (demote_upscales, measured: see UPSCALE_* below): a keeper
+    at least UPSCALE_SCALE times a directly matched member in both
+    dimensions yields when it holds no detail the smaller copy does not
+    supply. Still not caught: an upscale under that ratio, and an upscaler
+    that invents detail.
 
-    Testing it properly needs a judgement about real files - "did this pick
-    the worse copy" is not answerable from the inventory alone - which is
-    why it is still unmeasured rather than quietly assumed fine.
+    Testing the order properly needs a judgement about real files - "did
+    this pick the worse copy" is not answerable from the inventory alone -
+    which is why it is still unmeasured rather than quietly assumed fine.
     """
     r = recs[i]
     mode = r.get('mode') or ''
@@ -2486,7 +2492,7 @@ def shown_dims(r):
     Orientations 5-8 are the ones that transpose (6 and 8 are the quarter
     turns, 5 and 7 those plus a mirror). Fixed here rather than in the
     collector so existing inventories keep working: 'ori' has been recorded
-    all along, it was simply never read. Note keeper_key above is unaffected
+    all along, it was simply never read. Note quality_key above is unaffected
     either way, since it ranks on w*h, which does not care about rotation.
     """
     w, h = r['w'], r['h']
@@ -2553,8 +2559,8 @@ DARK_LUMA = 12.0
 # equally-unreviewable chunks.
 C_CLUSTER_MAX = 16
 # An image is in a dense CLIP pocket - a screenshot genre, say - when at
-# least this many others clear the 0.90 neighbour floor: the default K, at
-# which the neighbour cap binds.
+# least this many other PICTURES clear the 0.90 neighbour floor (copies of
+# one picture count once): the default K, at which the neighbour cap binds.
 DENSE_K = 16
 
 
@@ -5210,9 +5216,10 @@ def write_report(path, recs, tier_a, tier_b, root, stats, plan=None, home=None,
     for tier, key, colour, bg, title, lead in (
             (tier_a, 'A', '#3ddc97', '#12281e', 'DUPLICATE',
              'Same picture, re-encoded or resized. Keeper has the most animation '
-             'frames, then colour over greyscale, the highest resolution, full colour '
-             'over a palette, a lossless format, the largest file, and the finest JPEG '
-             'quantization. '
+             'frames, then colour over greyscale, transparency over a flattened '
+             'copy, the highest resolution, full colour over a palette, a lossless '
+             'format, the largest file, and the finest JPEG quantization; a plain '
+             'upscale of a smaller copy yields to that copy. '
              '<b style="color:var(--drop)">DROP</b> matched the keeper directly and is '
              'pre-set to <code>X</code>; '
              '<b style="color:#b3a0d4">LINKED</b> (dashed) reached this cluster through '
@@ -5478,14 +5485,16 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
     nor the recycler's bulk answer can bin an original to keep its
     watermarked copy.
 
-    Returns (n_manifest_rows, lines, editable_at, suggested_b), the last
-    three so the report can offer the same edits in a browser:
+    Returns (n_manifest_rows, lines, editable_at, suggested_b, tier_b_all),
+    the last four so the report can offer the same edits in a browser:
       lines         the list exactly as written, so the page rebuilds the
                     file by flipping one character rather than re-deriving
                     a format that would then be free to drift from this one
       editable_at   relative path -> index into `lines` of its mark line
       suggested_b   Tier B paths this scan would have marked, had Tier B
                     been the sort of match that may be acted on unreviewed
+      tier_b_all    every Tier B path with a mark line, keepers included,
+                    so "Clear Tier B marks" can undo a mark on any of them
     """
     def info(i, keeper, linked=False, weaker=False):
         r = recs[i]
@@ -5533,7 +5542,9 @@ def write_list_and_script(list_path, py_path, bat_path, sh_path, recs,
          '#  ONE of them; the other shows it as a "also in cluster N" comment,',
          '#  so two lines can never disagree about the same file.',
          '#',
-         '#  TIER A: suggested keeper pre-set to ".", the rest to X.',
+         '#  TIER A: suggested keeper pre-set to ".", each copy that matched it',
+         '#          directly to X. A copy that only reached the cluster through',
+         '#          another file stays "." (LINKED in the report).',
          '#  TIER B: everything pre-set to "." - review in the HTML report first.',
          '#  TIER C: weaker evidence. Everything pre-set to "." - no suggested',
          '#          keeper. You may still mark X; the rule above applies.',
@@ -5759,7 +5770,9 @@ PY_RECYCLER_TEMPLATE = r'''#!/usr/bin/env python3
 #   - every file to be deleted must itself still match its scan-time size
 #     and SHA-256.
 # Anything failing a check is skipped, loudly. Files go to the OS trash
-# (Recycle Bin / freedesktop Trash / ~/.Trash), never a permanent delete.
+# (Recycle Bin / freedesktop Trash / ~/.Trash). Where the Recycle Bin cannot
+# take one, Windows asks before deleting it for good, and a file that went
+# that way is counted and reported as such.
 #
 # Runs on Windows, Linux and macOS with nothing but a Python 3 install.
 import hashlib

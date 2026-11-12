@@ -24,17 +24,26 @@
 #
 #   Check both, per interpreter:   ./imgdedup.sh doctor
 #
-# Minimal (Collect only):
-pillow>=10.0.0
+# Minimal (Collect only). Every picture in a scanned folder goes through
+# Pillow's decoders, and Pillow 13.0.0 closed 41 advisories that the OSV
+# database had open against 12.3.0 on 2026-11-12, a heap overflow in the
+# JPEG decoder among them. Nothing was backported and 13 needs Python 3.11,
+# so Python 3.9 and 3.10 (both end-of-life) get the newest Pillow they can
+# install, which has those open. The toolkit itself runs on 10.0.0 and newer.
+pillow>=13.0.0; python_version >= "3.11"
+pillow>=11.3.0; python_version < "3.11"
 
 # Analyze stage:
 numpy>=1.24.0
-# Crop-containment detection in Analyze (the "ncc" tier). Recommended:
-opencv-python-headless>=4.8.0
+# Crop-containment detection in Analyze (the "ncc" tier). Recommended.
+# 4.8.1.78 is the first build without the libwebp bug CVE-2023-4863:
+opencv-python-headless>=4.8.1.78
 
 # Optional - HEIC/HEIF phone photos in Collect (AVIF works natively on
-# Pillow 11.2+). The setup helper does not install this one; add it by hand:
-# pillow-heif>=1.0.0
+# Pillow 11.2+). The setup helper does not install this one; add it by hand.
+# 1.3.0 is the first release with no published vulnerability open, and it
+# needs Python 3.10:
+# pillow-heif>=1.3.0
 
 # Semantic stage (Embed) - transformers from PyPI, torch installed SEPARATELY
 # because the right build depends on your hardware. Pick ONE:
@@ -44,22 +53,30 @@ opencv-python-headless>=4.8.0
 #   NVIDIA GPU (CUDA):
 #     pip install torch --index-url https://download.pytorch.org/whl/cu132
 #   NVIDIA before Turing (GTX 9xx/10xx, Titan X/Xp/V, Quadro M/P) - CUDA
-#   12.8 and newer builds carry no kernels for these cards:
+#   12.8 and newer builds carry no kernels for these cards. cu126 ends at
+#   PyTorch 2.14.1, the last release built for them:
 #     pip install torch --index-url https://download.pytorch.org/whl/cu126
 #   AMD GPU on LINUX (ROCm):
+#     pip install torch --index-url https://download.pytorch.org/whl/rocm10.0
+#   AMD Vega and Radeon VII on LINUX - PyTorch 2.15 dropped their kernels.
+#   rocm7.2 ends at 2.14.1, the last release built for them:
 #     pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
 #   Intel GPU (XPU):
 #     pip install torch --index-url https://download.pytorch.org/whl/xpu
 #
-#   These version suffixes MOVE - cu128 became cu132, rocm6.4 became rocm7.2.
-#   The setup helper reads the current list from download.pytorch.org instead
-#   of trusting a number written here, so prefer it over copying these lines.
+#   These version suffixes MOVE - cu128 became cu132, and rocm7.2 became
+#   rocm7.14 and rocm10.0. The setup helper reads the current list from
+#   download.pytorch.org instead of trusting a number written here, so
+#   prefer it over copying these lines. Current PyTorch (2.15) needs Python
+#   3.11 or newer; for Python 3.10, cu132, cu126 and rocm7.2 hold 2.14.1.
 #
-#   AMD GPU on WINDOWS: not from PyPI. AMD publishes ROCm wheels directly at
-#   repo.radeon.com, and ONLY for Python 3.12 (they are full-ABI cp312 wheels,
-#   so 3.13/3.14 cannot load them - this is AMD's build matrix, not a setting).
-#   Install Python 3.12 alongside, run setup with it, and point just the Embed
-#   stage at it via IMGDEDUP_PYTHON. See README, "AMD GPUs".
+#   AMD GPU on WINDOWS: not from PyPI. The wheels setup installs are AMD's
+#   ROCm 7.2.1 set at repo.radeon.com, ONLY for Python 3.12 (they are
+#   full-ABI cp312 wheels, so no other Python can load them - this is AMD's
+#   build matrix, not a setting). Install Python 3.12 alongside, run setup
+#   with it, and point just the Embed stage at it via IMGDEDUP_PYTHON.
+#   AMD's newer builds, for more Pythons and from an index of AMD's own,
+#   are not installed by setup. See README, "AMD GPUs".
 #
 #   torchvision is NOT needed by anything here, and a stale one breaks
 #   transformers - do not install it "just in case".
@@ -68,4 +85,8 @@ opencv-python-headless>=4.8.0
 #     pip uninstall torch
 #   then install from the right index - a +cpu wheel can never use a GPU.
 #
-transformers>=4.43.0
+# 5.10.0 is the first release with no published vulnerability open. It
+# needs Python 3.10; on 3.9 the newest transformers is 4.57.6. The current
+# release (5.22) accepts torch 2.6 and newer.
+transformers>=5.10.0; python_version >= "3.10"
+transformers>=4.43.0; python_version < "3.10"

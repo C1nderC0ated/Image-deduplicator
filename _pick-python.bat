@@ -11,7 +11,7 @@ rem           PICK_ERR     1 when nothing matched, 0 otherwise
 rem
 rem  Order, most trusted first:
 rem     1. %IMGDEDUP_PYTHON%      explicit override, always wins
-rem     2. py -3.14 .. -3.9       the launcher, newest first
+rem     2. py -3.15 .. -3.9       the launcher, newest first
 rem     3. .venv beside this file - what setup builds when it has to make
 rem        one. Uncommon on Windows (that is mainly the PEP 668 route, and
 rem        Windows ships no marker) but reachable: setup offers the venv
@@ -81,16 +81,17 @@ goto :pp_launcher
 :pp_launcher
 where py >nul 2>&1
 if errorlevel 1 goto :pp_venv
-for %%V in (3.14 3.13 3.12 3.11 3.10 3.9) do call :pp_try_ver %%V
+for %%V in (3.15 3.14 3.13 3.12 3.11 3.10 3.9) do call :pp_try_ver %%V
 if defined PYTHON_CMD goto :pp_done
 
 rem  That list has an expiry date, so ask `py` for its own default before
-rem  giving up on the launcher. When 3.15 ships, `py -3.15` is not tried by
+rem  giving up on the launcher. When 3.16 ships, `py -3.16` is not tried by
 rem  the loop above and this file would fall through to .venv and then bare
 rem  `python` - which on Windows is often a Store stub or missing entirely,
-rem  so a machine whose only Python was 3.15 could be told there is none
-rem  while `py -3.15` sat there working. `py -3` means "newest Python 3
-rem  this launcher knows about" and needs no editing ever.
+rem  so a machine whose only Python was 3.16 could be told there is none
+rem  while `py -3.16` sat there working. `py -3` means "newest Python 3
+rem  this launcher knows about" and needs no editing ever. It is how 3.15
+rem  was reached from its release until the list above gained it.
 rem
 rem  It stays BELOW the explicit list rather than replacing it: the list is
 rem  ordered newest-first on purpose and each entry is probed functionally,

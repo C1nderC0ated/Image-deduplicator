@@ -75,11 +75,18 @@ Generated at run time, next to your images:
   drag folders onto; elsewhere use `./imgdedup.sh`. GPU acceleration (Embed
   only) works with **NVIDIA, AMD, Intel and Apple silicon**; see [AMD GPUs](#amd-gpus)
   for the one platform that needs care. Deleted files go to the
-  Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively, never a
-  permanent delete on any of them.
-- **Python 3.9+** (tested on 3.14). No admin rights, no installer.
-  Current PyTorch releases need Python 3.10 or newer, so on 3.9 setup
-  may find no GPU build for Embed, and it says so rather than guessing.
+  Recycle Bin, the freedesktop Trash, or `~/.Trash` respectively. The one
+  way to a permanent delete is Windows asking first, where its Recycle Bin
+  cannot take a file, and you answering yes.
+- **Python 3.11 or newer** (tested on 3.14; Collect and Analyze also on
+  3.15). No admin rights, no installer. The Embed stage cannot be
+  installed on 3.15 yet: transformers needs PyYAML, which had no 3.15
+  build on 2026-11-12, so keep a 3.11 to 3.14 beside it for Embed. Each
+  stage picks its own interpreter. 3.9 and 3.10 still run every stage,
+  but both are end-of-life and get no fixed Pillow: 13.0.0, which closed
+  41 published vulnerabilities in the image decoders, needs 3.11. Current
+  PyTorch needs 3.11 too. On 3.10 setup installs PyTorch 2.14, and on 3.9
+  it may find no GPU build for Embed, and it says so rather than guessing.
 - Packages, by stage:
 
 | Stage | Needs |
@@ -137,20 +144,24 @@ your hardware; pick one, then `pip install transformers` either way:
 | CPU only | `pip install torch --index-url https://download.pytorch.org/whl/cpu` |
 | NVIDIA (CUDA) | `pip install torch --index-url https://download.pytorch.org/whl/cu132` |
 | NVIDIA before Turing: GTX 9xx/10xx, Titan X/Xp/V, Quadro M/P | `pip install torch --index-url https://download.pytorch.org/whl/cu126` |
-| AMD on **Linux** (ROCm) | `pip install torch --index-url https://download.pytorch.org/whl/rocm7.2` |
+| AMD on **Linux** (ROCm) | `pip install torch --index-url https://download.pytorch.org/whl/rocm10.0` |
+| AMD Vega and Radeon VII on Linux | `pip install torch --index-url https://download.pytorch.org/whl/rocm7.2` |
 | Intel (XPU) | `pip install torch --index-url https://download.pytorch.org/whl/xpu` |
 | Apple silicon (Metal) | `pip install torch` — the stock wheel includes MPS |
 | AMD on **Windows** | not from PyPI — see [AMD GPUs](#amd-gpus) |
 
-> Those suffixes **move**: `cu128` became `cu132`, `rocm6.4` became
-> `rocm7.2`. Setup reads the current list from download.pytorch.org rather
-> than trusting a number printed in a README, so prefer it to copying these.
+> Those suffixes **move**: `cu128` became `cu132`, and `rocm7.2` became
+> `rocm7.14` and `rocm10.0`. Setup reads the current list from
+> download.pytorch.org rather than trusting a number printed in a README,
+> so prefer it to copying these.
 > (It also sorts them numerically — `rocm7.14` is *newer* than `rocm7.2`,
 > which string and float comparison both get backwards — and it checks that
-> the index it picks actually carries a torch 2.4 or newer wheel for your
+> the index it picks actually carries a torch 2.6 or newer wheel for your
 > Python and platform. A directory can exist with nothing usable in it:
-> `cu134` did, and its torch 2.0 wheels are older than transformers 5
-> accepts.)
+> `cu134` first appeared holding only torch 2.0 wheels, and `rocm10.1`
+> does today. Torch 2.0 is older than the current transformers accepts.)
+> PyTorch 2.15 publishes two CUDA builds, `cu132`, its default, and
+> `cu134`. Setup takes the newer index when both carry the same PyTorch.
 
 > **Older NVIDIA cards.** PyTorch's CUDA 12.8 and newer builds carry no
 > kernels for cards before Turing (compute capability 7.5). The card is
@@ -158,6 +169,8 @@ your hardware; pick one, then `pip install transformers` either way:
 > image is available". Setup recognises these cards, by `nvidia-smi` when
 > the driver is in and by model name before that, and installs from
 > `cu126` or older. The doctor and the embedder name the same fix.
+> PyTorch 2.15 stopped building for CUDA 12, so `cu126` ends at PyTorch
+> 2.14.1, the last release these cards get.
 
 > **Setup replaces a wrong build.** Some installed builds can never use
 > the GPU here: a CPU build, a build for another vendor's GPU, or a CUDA
@@ -166,22 +179,45 @@ your hardware; pick one, then `pip install transformers` either way:
 > every other step, because pip treats an installed torch as done and
 > would otherwise install nothing from the new index.
 
-> **Python 3.14 note:** the old `cu121` index has no 3.14 wheels at all.
+> **Setup upgrades an old Pillow.** Every scanned picture goes through
+> Pillow's decoders, and 13.0.0 closed 41 published vulnerabilities in
+> them. The doctor marks an older Pillow `[OLD]`, and setup offers the
+> upgrade and asks first. On a Python older than 3.11 neither can: Pillow
+> 13 does not install there. On a system-managed Python the system's
+> package manager does it. Pillow 13 also resamples tall, narrow pictures
+> slightly differently, so an inventory resumed across the upgrade holds
+> thumbnails of both kinds. Answering no when Collect asks to reuse the
+> previous inventory (`--no-resume`) makes it uniform.
+
+> **Python 3.14 and 3.15 note:** the old `cu121` index has wheels for
+> neither.
 
 ### AMD GPUs
 
-**Linux is straightforward.** The ROCm index above carries cp310–cp315
-wheels, so any supported Python works. You need the amdgpu/ROCm kernel
+**Linux is straightforward.** `rocm10.0` carries cp311–cp315 wheels, and
+`rocm7.14` and `rocm7.2` serve Python 3.10 with PyTorch 2.14.1. You need
+the amdgpu/ROCm kernel
 driver. Setup takes `rocm-smi` running, or `/dev/kfd` existing, as the
 sign it is there. One thing that looks wrong but isn't: a ROCm build
 still reports its device as `cuda`, because HIP deliberately reuses that
 namespace. `Device: cuda (Radeon …)` is correct.
 
-**Windows is awkward, and not because of this tool.** AMD publishes
-ROCm-for-Windows wheels only at `repo.radeon.com`, only for **Python 3.12**,
-and only as full-ABI `cp312` builds. Python 3.13/3.14 cannot load them. That is a wheel-ABI fact, not a flag: `--ignore-requires-python` skips the
-check and the import then fails anyway. Upstream PyTorch ships no ROCm
-wheels for Windows at all.
+**Windows is awkward, and not because of this tool.** The wheels setup
+installs are AMD's ROCm 7.2.1 set at `repo.radeon.com`: only for
+**Python 3.12**, and only as full-ABI `cp312` builds, which no other
+Python can load. That is a wheel-ABI fact, not a flag:
+`--ignore-requires-python` skips the check and the import then fails
+anyway. Upstream PyTorch ships no ROCm wheels for Windows at all.
+
+AMD has since moved on. From ROCm 7.13 it publishes Windows builds of
+PyTorch for more Pythons (3.11 to 3.14 on its install page) through a
+pip index of its own: `stable.repo.amd.com/rocm/whl-next/` held PyTorch
+2.11 to 2.14 for ROCm 10 on 2026-11-12. AMD's
+[PyTorch install page](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html)
+has the commands. **Setup does not install those.** This toolkit has not
+been run on them, and setup prints no command it has not seen work. If
+you install one by hand, the doctor reports what the Embed stage can do
+with it.
 
 Three honest options:
 
@@ -192,7 +228,8 @@ Three honest options:
 2. **Use the CPU build.** Embedding a few thousand images is a coffee, and
    it is resumable, a perfectly reasonable choice.
 3. Not recommended: `torch-directml`. In maintenance mode, last release
-   2024, hard-pins `torch==2.4.1`, is *also* cp312-or-older, and is not a
+   2024, hard-pins `torch==2.4.1` (older than the current transformers
+   accepts), is *also* cp312-or-older, and is not a
    drop-in `cuda` device, so it costs the same Python constraint while
    adding an incompatible device API.
 
@@ -447,7 +484,7 @@ pixels alone, and byte-identical files are always clustered:
 | Tier | Meaning | Evidence required | Pre-set |
 |------|---------|-------------------|---------|
 | **A — duplicate** | Same picture: re-encoded, resized, format-converted | mean pixel difference ≤ 4/255 **and** (when embeddings exist) CLIP cosine ≥ 0.99 — two independent measures must agree. The pictures' structure must agree too (luma correlation ≥ 0.90), no 8×8 tile may differ by 20 or more, or by 12 or more when that is five times the mean (that is an edit: a changed expression, people erased from a street, a watermark), and neither thumbnail may be blank; a pair that fails one of these is shown for review or as weaker evidence, unmarked. Borderline pairs (thumbnail difference above 2, not byte-identical) are re-scored at 512 px from the original files, at most 64 per run, and demoted to review when that disagrees. The cluster is then rebuilt without that pair, so copies that still match each other stay in Tier A under a keeper of their own | `X` |
-| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, local edits, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or luma/orientation match at duplicate level with the brightness layouts correlated, or a local edit: at least 75% of the detailed 16×16 tiles agree while one differs by 24 or more. A rotated copy may score up to 8 when the difference is thumbnail noise, gone at a quarter of the resolution. An image is in a dense pocket when 16 or more other pictures reach CLIP 0.90 with it, whatever `--clip-neighbors` is set to; copies that pass the Tier A test count as one picture. A local edit is refused in a dense pocket, or under CLIP 0.90: that shape is two screenshots of one app, the same frame with other content, and goes to C | `.` always |
+| **B — crop / variant** | Structurally the same, genuinely different pixels: crops, rotations, recolours, local edits, re-rolls — plus pixel-identical pairs that CLIP disputes | CLIP ≥ 0.995 **and** pixel difference ≤ 12 (refused in dense screenshot pockets and when PNG generation text disagrees), or containment ≥ 0.90 with CLIP ≥ 0.90 outside dense/dark pockets, or containment ≥ 0.95 alone for an image's two nearest neighbours with CLIP between 0.80 and 0.90 that are not the same framing (the crop band), or luma/orientation match at duplicate level with the brightness layouts correlated, or a local edit: at least 75% of the detailed 16×16 tiles agree while one differs by 24 or more. A rotated copy may score up to 8 when the difference is thumbnail noise, gone at a quarter of the resolution. An image is in a dense pocket when 16 or more other pictures reach CLIP 0.90 with it, whatever `--clip-neighbors` is set to; copies that pass the Tier A test count as one picture. A local edit is refused in a dense pocket, or under CLIP 0.90: that shape is two screenshots of one app, the same frame with other content, and goes to C | `.` always |
 | **C — weaker evidence** | Related according to CLIP, but the pixel match is cheap chrome, near-black noise, or a high cosine with no crop confirm; or pixels that agree only because there is little in either picture. Components larger than 16 are omitted (weak-edge chaining, not a reviewable set) | containment ≥ 0.95 **in** a dense CLIP pocket or on two near-black thumbs, or CLIP ≥ 0.97 after luma/orientation also missed, or a containment pass where a quarter of the detailed 8×8 tiles at the matched window, four at least, do not correlate (one app's frame around other content, one view under another sky), or a pair inside the Tier A gate that is blank, whose layouts do not correlate, or whose difference sits in one region while CLIP is under 0.90 or the pocket is dense (one frame, other content) | `.` always, **no suggested keeper**. You may still mark `X`; as everywhere, a file is deleted only while a copy it was matched with stays |
 
 Within a cluster the **keeper** is chosen by, in order:
@@ -566,7 +603,8 @@ This is what makes keeper-swapping safe: whichever copy you leave unmarked
 becomes the witness, and no edit, deliberate or accidental, can make a
 picture lose its last verified copy. The script names the image folder,
 shows the count and total size, asks `y/N`, and moves files to the OS
-trash, never a permanent delete. The exit code is the number of
+trash. Rule 7 above is the one case where Windows may ask to delete a
+file for good. The exit code is the number of
 failures, capped at 255 so that 256 failures cannot read as success.
 
 The list may be saved as UTF-8, with or without a BOM, or as UTF-16,
@@ -653,7 +691,7 @@ Python scripts offer more:
 | `--tier-a-mad N` | 4.0 | pixel-difference ceiling for Tier A |
 | `--tier-a-cos N` | 0.99 | CLIP floor for Tier A |
 | `--tier-b-mad N` | 4.0 | pixel floor for the review tier |
-| `--tier-b-cos N` | 0.90 | CLIP floor before a pair may enter Tier B. Matches the floor that nominates neighbours, so no pair is scored and then discarded on it. Raise to 0.94 for a shorter review list that misses about half of all moderate crops |
+| `--tier-b-cos N` | 0.90 | CLIP floor before a pair may enter Tier B. Matches the floor that nominates neighbours, so no pair is scored and then discarded on it. The crop band (CLIP 0.80 to 0.90, containment ≥ 0.95) is admitted whatever this is set to. Raise to 0.94 for a shorter review list that misses about half of all moderate crops |
 | `--sig-cut N` | 8.0 | signature prefilter ceiling (default auto-raises to 2× `--tier-a-mad`; an explicit value is used verbatim) |
 | `--clip-neighbors N` | 16 | nearest neighbours each image contributes from the embeddings; bounds the candidate set on large libraries (a binding cap is reported). Cannot cost a Tier A candidate — the cut line never approaches the 0.99 that tier needs |
 | `--no-orient` | off | skip rotation/mirror matching — a little faster, but rotated and mirrored copies are missed |
@@ -661,8 +699,8 @@ Python scripts offer more:
 | `--self-test` | — | run the invariant + sweep-equality tests and exit |
 
 **Interpreter choice.** The `.bat` launchers call `_pick-python.bat`,
-which tries `py -V:3.14` … `3.9`, then `py -3`, then a `.venv` beside the
-toolkit, then `python`; `imgdedup.sh` probes `.venv`, `python3.14` …
+which tries `py -3.15` … `py -3.9`, then `py -3`, then a `.venv` beside the
+toolkit, then `python`; `imgdedup.sh` probes `.venv`, `python3.15` …
 `python3.9`, then `python3`/`python`. Both try `IMGDEDUP_PYTHON` first (it
 wins whenever it passes the probe; a failing override is reported and the
 search continues) and probe *functionally*: the candidate must actually
@@ -721,7 +759,7 @@ machine.
   a Quadro M/P, or fails with "no kernel image is available".** PyTorch's
   CUDA 12.8 and newer builds carry no kernels for cards before Turing.
   Run setup: it recognises the card and installs from `cu126`, which
-  still supports it.
+  holds PyTorch 2.14.1, the last release built for it.
 - **Embedding runs on the CPU although I have an Nvidia GPU.** Almost
   always the installed torch is the CPU-only wheel. The version says so
   (`2.x.y+cpu`), and no setting can route a `+cpu` build to a GPU. The
@@ -742,8 +780,15 @@ machine.
 - **Analyze found 0 duplicates and wrote "only" a report.** Intended on a
   clean folder. If the run lists stale `Recycle-Duplicates.*` / list files
   from an earlier pass, delete them; they no longer describe reality.
-- **`pip install torch` says "no matching distribution" on Python 3.14.**
-  You are on the `cu121` index; it has no 3.14 wheels. Use `cu132` (or
+- **Setup cannot install transformers on Python 3.15.** pip stops at
+  PyYAML, which transformers needs: it had no Python 3.15 build on
+  2026-11-12, and compiling it needs a C compiler. Setup installs Pillow,
+  numpy and OpenCV first, so Collect and Analyze work. For Embed, install
+  Python 3.11 to 3.14 beside it and run setup with that one:
+  `py -3.14 _setup.py`. `Embed-Images.bat` then finds it by itself.
+- **`pip install torch` says "no matching distribution" on Python 3.14
+  or 3.15.** You are on the `cu121` index; it has wheels for neither.
+  Use `cu132` (or
   `/cpu`). These suffixes move, `cu128` became `cu132`, so prefer the
   setup helper, which reads the current list from the index instead of
   trusting a number written here.
@@ -898,7 +943,7 @@ the toolkit through an AI agent, with its own README.
 
 ## Version
 
-**v4.4.4** (2026-10-21). Full history, including every bug and what it
+**v4.4.4f** (2026-11-12). Full history, including every bug and what it
 taught the tool, lives in [CHANGES.md](CHANGES.md).
 
 Changing it? [CONTRIBUTING.md](CONTRIBUTING.md) has the standard a change

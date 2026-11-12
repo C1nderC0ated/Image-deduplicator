@@ -2,10 +2,10 @@
 rem ----------------------------------------------------------------------
 rem  _offer-setup.bat  -  shared "you are missing something" handler
 rem
-rem  Every launcher calls THIS when _pick-python.bat found no interpreter
-rem  that can actually run its stage. One place, so the three launchers
-rem  cannot drift apart again - and the thing that CHANGES the machine is
-rem  the last place to allow that.
+rem  Every stage launcher calls THIS when _pick-python.bat found no
+rem  interpreter that can actually run its stage. One place, so the four
+rem  of them cannot drift apart again - and the thing that CHANGES the
+rem  machine is the last place to allow that.
 rem
 rem  It never installs anything itself: it finds a Python and hands off to
 rem  _setup.py, which detects the GPU, asks which PyTorch build you want,

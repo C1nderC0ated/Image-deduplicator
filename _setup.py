@@ -15,6 +15,7 @@ is numpy, so "CPU" there is correct, not a compromise.
 
     python _setup.py              interactive: report, then offer to fix
     python _setup.py --check      report only, exit 1 if something is missing
+                                  or below the safe floor (SAFE_FLOOR)
     python _setup.py --yes        assume yes (for scripted use)
     python _setup.py --offline    skip index discovery, use the pinned suffixes
 """
@@ -42,7 +43,9 @@ PCI_VENDORS = {0x1002: 'AMD', 0x10DE: 'NVIDIA', 0x8086: 'Intel'}
 
 # Fallbacks only. The real versions are discovered from the PyTorch index at
 # run time (see newest_index) because they move: the stable ROCm index went
-# 6.4 -> 7.0 -> 7.1 -> 7.2 within a few releases.
+# 6.4 -> 7.0 -> 7.1 -> 7.2 within a few releases, and PyTorch 2.15 left 7.2
+# for 7.14 and 10.0 together. cu132 is the build PyTorch 2.15 calls its
+# default; cu134 is published beside it.
 FALLBACK_CUDA = 'cu132'
 
 # PyTorch's CUDA 12.8 and newer builds carry kernels for Turing (compute
@@ -50,15 +53,25 @@ FALLBACK_CUDA = 'cu132'
 # GTX 9xx or 10xx, a Titan X/Xp/V or a Quadro M/P, torch.cuda.is_available()
 # still says True and the first kernel then fails with "no kernel image is
 # available". Such a card gets the newest index at or below CUDA 12.6.
+# PyTorch 2.15 stopped building CUDA 12 altogether, so that index ends at
+# 2.14.1, the last PyTorch these cards get. It has wheels up to Python 3.15.
 LEGACY_CUDA_MAX = (126,)
 FALLBACK_CUDA_LEGACY = 'cu126'
 _LEGACY_NVIDIA = re.compile(
     r'GTX\s*(9\d\d|10\d\d)|\bGT\s*10\d\d|TITAN\s*(X|XP|V)\b|'
     r'QUADRO\s*[KMP]\d|TESLA\s*[KMPV]\d|\bMX\s*[1-3]\d\d', re.I)
+# Not the newest on purpose. rocm7.2 ends at PyTorch 2.14.1, but it has a
+# wheel for every Python from 3.10 to 3.15 and is the last index with
+# kernels for Vega and Radeon VII cards, so with no listing to read it is
+# the one least likely to fail.
 FALLBACK_ROCM = 'rocm7.2'
 
-# AMD's ROCm-on-Windows wheels. Pinned URLs, not an index, and cp312 ONLY -
-# a full-ABI wheel that no other Python can load (see the caveat below).
+# AMD's ROCm 7.2.1 wheels for Windows. Pinned URLs, not an index, and cp312
+# ONLY - a full-ABI wheel that no other Python can load (see the caveat
+# below). This is AMD's older release line, and the one setup installs.
+# From ROCm 7.13 AMD also publishes Windows builds of PyTorch for several
+# Pythons through an index of its own (README, "AMD GPUs"). Setup does not
+# install those: this toolkit has not been run on them.
 ROCM_WIN_REL = '7.2.1'
 ROCM_WIN_DRIVER = '26.2.2'
 ROCM_WIN_BASE = 'https://repo.radeon.com/rocm/windows/rocm-rel-' + ROCM_WIN_REL
@@ -203,9 +216,11 @@ def _wheel_tags():
     return py, plat
 
 
-# transformers 5 switches torch off below this ("PyTorch >= 2.4 is
-# required"), so an older wheel installs cleanly and then does nothing.
-MIN_TORCH = (2, 4)
+# The current transformers switches torch off below this ("PyTorch >= 2.6
+# is required"), so an older wheel installs cleanly and then does nothing.
+# The line moves with transformers: 2.2 in 5.0, 2.4 in 5.10 to 5.14, 2.5 in
+# 5.17 and 5.18, 2.6 in 5.22.
+MIN_TORCH = (2, 6)
 
 
 def _index_best_torch(idx, timeout=15):
@@ -262,9 +277,9 @@ def no_wheel_note():
     return ('the newest indexes on download.pytorch.org have no PyTorch %d.%d+ '
             'build for Python %d.%d on this platform%s'
             % (MIN_TORCH[0], MIN_TORCH[1], pv[0], pv[1],
-                                    ' (current PyTorch releases need Python 3.10'
+                                    ' (current PyTorch releases need Python 3.11'
                                     ' or newer)'
-                                    if pv < (3, 10) else ''))
+                                    if pv < (3, 11) else ''))
 
 
 # --------------------------------------------------------------- backends --
@@ -321,12 +336,15 @@ def backends_for(vendors, online=True, names=()):
             else:
                 out.append(Backend(
                     'rocm-win', 'AMD GPU (ROCm for Windows)', [],
-                    blocked=('AMD ships Windows wheels for Python 3.12 only '
-                             '(you are on %d.%d). Install Python 3.12 '
-                             'alongside, run this setup with it, then point '
-                             'the Embed stage at it with IMGDEDUP_PYTHON - '
-                             'the other stages can stay on %d.%d.'
-                             % (pv[0], pv[1], pv[0], pv[1]))))
+                    blocked=("setup installs AMD's ROCm %s wheels, which "
+                             'are for Python 3.12 only (you are on %d.%d). '
+                             'Install Python 3.12 alongside, run this setup '
+                             'with it, then point the Embed stage at it with '
+                             'IMGDEDUP_PYTHON - the other stages can stay on '
+                             "%d.%d. AMD's newer builds for other Pythons "
+                             'are not installed by setup: see "AMD GPUs" in '
+                             'the README.'
+                             % (ROCM_WIN_REL, pv[0], pv[1], pv[0], pv[1]))))
         elif IS_MAC:
             out.append(Backend('rocm', 'AMD GPU (ROCm)', [],
                                blocked='ROCm is Linux-only.'))
@@ -458,17 +476,17 @@ def build_name(desc):
 def torch_too_old(st):
     """Why the installed torch cannot run the Embed stage for its AGE, or ''.
 
-    transformers 5 ignores a torch older than 2.4 and then says PyTorch
-    "was not found": setup printed "Everything the toolkit needs is
-    present" over a torch 2.3 install, and the embedder died in a traceback
-    telling the user to install the package they had."""
+    transformers ignores a torch older than its floor (MIN_TORCH) and then
+    says PyTorch "was not found": setup printed "Everything the toolkit
+    needs is present" over a torch 2.3 install, and the embedder died in a
+    traceback telling the user to install the package they had."""
     ver = st.get('torch', 'ERR')
     if ver in ('ERR', 'EMPTY'):
         return ''
     m = re.match(r'(\d+)\.(\d+)', ver)
     if m and (int(m.group(1)), int(m.group(2))) < MIN_TORCH:
-        return ('torch %s is older than %d.%d, the oldest the Embed stage runs on.'
-                % (ver, MIN_TORCH[0], MIN_TORCH[1]))
+        return ('torch %s is older than %d.%d, the oldest the current '
+                'transformers loads.' % (ver, MIN_TORCH[0], MIN_TORCH[1]))
     if st.get('tf_torch') is False:
         return ('torch %s is too old for the installed transformers %s, which '
                 'refuses to load it.' % (ver, st.get('transformers', '?')))
@@ -505,6 +523,50 @@ def wrong_build(flav, st, vendors):
                              for b in backends_for(gpu, online=False)):
         return 'which can never use the %s GPU here.' % ', '.join(sorted(gpu))
     return ''
+
+
+# Releases below these have published vulnerabilities in code the toolkit
+# runs on files it did not make: every picture in a scanned folder goes
+# through Pillow's decoders. (floor, the oldest Python the floor installs
+# on). Read from the OSV database on 2026-11-12: 41 advisories were open in
+# Pillow 12.3.0, a heap overflow in the JPEG decoder among them, all fixed
+# in 13.0.0 and none backported. A floor goes stale in the safe direction:
+# a fix newer than it is simply not asked for.
+#
+# Only Pillow is here. OpenCV decodes nothing but the thumbnails the
+# collector made itself, and torch and transformers load one model.
+SAFE_FLOOR = {'pillow': ((13, 0, 0), (3, 11))}
+
+
+def _ver_tuple(s, n=3):
+    """The leading numeric fields of a version: '12.3.0' -> (12, 3, 0), and
+    '13.0' -> (13, 0, 0), so that tuples of one length are compared."""
+    out = []
+    for part in re.split(r'[.+-]', s or '')[:n]:
+        m = re.match(r'[0-9]+', part)
+        if not m:
+            break
+        out.append(int(m.group(0)))
+    return tuple(out + [0] * (n - len(out))) if out else ()
+
+
+def outdated_packages(st, pv=None):
+    """[(key, installed, fixed_in, why_not)] for each installed package
+    below SAFE_FLOOR. why_not is '' when the Python PV (this one unless
+    given) can install the fixed release, else the reason it cannot."""
+    pv = tuple(pv or sys.version_info[:2])
+    out = []
+    for key in sorted(SAFE_FLOOR):
+        floor, need_py = SAFE_FLOOR[key]
+        v = _ver_tuple(st.get(key) or '')
+        if not v or v >= floor:
+            continue                  # missing, unreadable or new enough
+        fixed = '.'.join(str(x) for x in floor)
+        why_not = '' if pv >= need_py else (
+            '%s %s needs Python %d.%d or newer, and this is %d.%d.'
+            % (key, fixed, need_py[0], need_py[1], pv[0], pv[1]))
+        out.append((key, st[key], fixed, why_not))
+    return out
 
 
 def missing_packages(st, want_embed=True):
@@ -1009,9 +1071,10 @@ def create_venv_and_rerun(args):
         A stub venv is worse than none at all: `python -m venv` writes the
         interpreter and pyvenv.cfg BEFORE provisioning pip, so an aborted
         run leaves something that looks like a working environment and has
-        no way to install anything. The launchers prefer a .venv beside
-        them over any Python on PATH, so leaving it would let one failed
-        setup capture every later run - including the setup meant to fix
+        no way to install anything. imgdedup.sh prefers a .venv beside it
+        over every other Python, and _pick-python.bat over bare `python`
+        once the py launcher has found nothing, so leaving it would let one
+        failed setup capture later runs - including the setup meant to fix
         it. Only ever remove what this call created."""
         print('')
         print('  ' + msg)
@@ -1117,12 +1180,36 @@ def main():
         print('')
         print('  ' + old)
         need.append('torch')
-    if not need:
+    # Present, but below SAFE_FLOOR. pip is the only route setup takes for
+    # that: a distro-managed Python gets its Pillow from the distro, and a
+    # Python with no pip is reported for that below, when something is
+    # missing as well.
+    stale = outdated_packages(st)
+    upgrades = []
+    for key, have, fixed, why_not in stale:
         print('')
-        print('  Everything the toolkit needs is present. Nothing to do.')
+        print('  %s %s is older than %s, which fixes published vulnerabilities'
+              % (key, have, fixed))
+        print('  in the image decoders. Every scanned picture goes through them.')
+        if why_not:
+            print('  Setup cannot upgrade it here: ' + why_not)
+        elif pipv is None:
+            print('  Setup cannot upgrade it here: this Python has no pip.')
+        elif em_marker():
+            print('  This Python is managed by the system, so upgrade %s with'
+                  % key)
+            print("  the system's package manager.")
+        else:
+            upgrades.append(key)
+    if not need and not upgrades:
+        print('')
+        print('  Nothing is missing, and nothing here is for setup to upgrade.'
+              if stale else
+              '  Everything the toolkit needs is present. Nothing to do.')
         return 0
-    print('')
-    print('  Missing: ' + ', '.join(need))
+    if need:
+        print('')
+        print('  Missing: ' + ', '.join(need))
     if args.check:
         return 1
 
@@ -1154,12 +1241,38 @@ def main():
             return rc
         breaksys = True
 
-    plain = [p for p in need if p != 'torch']
+    plain = [p for p in need if p not in ('torch', 'transformers')]
     # The return value used to be discarded, so a refused install still fell
     # through to "return 0" below and the launcher reported success having
     # installed nothing - which is how Arch failed silently.
     if plain and not show_and_run(pip_base(break_system=breaksys) + plain,
                                   args.yes, ', '.join(plain)):
+        return 1
+
+    # --upgrade and a bare name, not "pillow>=13": the newest release this
+    # Python can install is the one wanted, and a ">" in a command that is
+    # printed to be read is a redirection to whoever pastes it.
+    if upgrades and not show_and_run(
+            pip_base(break_system=breaksys) + ['--upgrade'] + upgrades,
+            args.yes, ', '.join(upgrades), verb='upgrade'):
+        return 1
+
+    # transformers in a command of its own, and before torch. pip installs
+    # all of a command or none of it, so in one command with the rest a
+    # transformers that cannot install took Pillow, numpy and OpenCV down
+    # with it: on Python 3.15, where PyYAML (which transformers needs) had
+    # no wheel yet, setup installed nothing and Collect could not run
+    # either. Before torch, so that gigabytes are not downloaded for a stage
+    # that cannot run.
+    if 'transformers' in need and not show_and_run(
+            pip_base(break_system=breaksys) + ['transformers'],
+            args.yes, 'transformers'):
+        print('  Without transformers the Embed stage cannot run in this Python.')
+        print('  Collect and Analyze do not need it.')
+        if sys.version_info[:2] >= (3, 15):
+            print('  If pip stopped at PyYAML: transformers needs it, and PyYAML had')
+            print('  no build for Python 3.15 on 2026-11-12. Until it has one, Embed')
+            print('  needs Python 3.11 to 3.14, or a C compiler for pip to use.')
         return 1
 
     if 'torch' not in need:
@@ -1216,7 +1329,7 @@ def main():
                         'torch (%s)' % pick.key):
         return 1
     if st.get('transformers', 'ERR') in ('ERR', 'EMPTY') \
-            and 'transformers' not in plain:
+            and 'transformers' not in need:
         show_and_run(pip_base(break_system=breaksys) + ['transformers'],
                      args.yes, 'transformers')
 

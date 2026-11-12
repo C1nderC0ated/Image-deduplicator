@@ -30,7 +30,8 @@ cd /d "%~dp0"
 rem ----------------------------------------------------------------------
 rem  Collect-Image-Inventory.bat
 rem  Scans the folder this .bat sits in, or drag a folder onto it.
-rem  READ-ONLY: writes image-inventory.jsonl and touches nothing else.
+rem  READ-ONLY for your pictures: it writes its own image-inventory*.jsonl
+rem  files and changes nothing else.
 rem  Interpreter choice is delegated to _pick-python.bat so that every
 rem  launcher in this folder agrees on which Python to use.
 rem ----------------------------------------------------------------------
